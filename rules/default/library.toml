@@ -1,0 +1,43 @@
+# Rules Pack 1.0 (Embedded Default)
+# Target: ~/Library/Caches, Logs, Containers
+#
+# Strategy: "Conservative Hygiene"
+# We prioritize SAFETY over disk space.
+# - Missing metadata (size/mtime) -> Keep
+# - Directory thresholds -> Age only (size for dirs is unreliable/expensive)
+# - Symlinks -> Never followed (handled by Validator/Scanner)
+
+# --- Caches ---
+# Safe to delete if old or large, as they are regeneratable.
+
+[[rules]]
+name = "Caches: Old"
+scopes = ["~/Library/Caches"]
+older_than_days = 30
+recommended_action = "Quarantine"
+description = "Cache files older than 30 days"
+
+[[rules]]
+name = "Caches: Large"
+scopes = ["~/Library/Caches"]
+min_size_bytes = 104857600 # 100MB
+recommended_action = "Quarantine"
+description = "Cache files larger than 100MB"
+
+# --- Logs ---
+# Logs are historical records. We keep recent ones for debugging.
+
+[[rules]]
+name = "Logs: Old"
+scopes = ["~/Library/Logs"]
+older_than_days = 14
+recommended_action = "Quarantine"
+description = "Log files older than 14 days"
+
+[[rules]]
+name = "Logs: Large"
+scopes = ["~/Library/Logs"]
+min_size_bytes = 52428800 # 50MB
+recommended_action = "Quarantine"
+description = "Log files larger than 50MB"
+

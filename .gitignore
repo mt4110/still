@@ -1,0 +1,30 @@
+# --- Secrets / local env ---
+.env
+.env.*
+.envrc
+
+# --- Rust ---
+/target/
+/**/*.rs.bk
+
+# --- Nix / direnv ---
+/result
+/result-*
+/.direnv/
+
+# --- macOS ---
+.DS_Store
+
+# --- Editors ---
+*.swp
+*.swo
+*.tmp
+.vscode/
+.idea/
+
+# --- still: local artifacts (repo-root only) ---
+/plan.json
+/plan.jsonl
+/dryrun_plan.json
+/checklist_plan.json
+/.still_smoke/
