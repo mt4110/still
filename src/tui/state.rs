@@ -131,8 +131,7 @@ impl AppState {
     
     pub fn current_entry_mut(&mut self) -> Option<&mut Entry> {
         self.table_state.selected()
-            .and_then(|i| self.view_indices.get(i))
-            .map(|&real_idx| real_idx) // copy index to avoid borrow
+            .and_then(|i| self.view_indices.get(i)).copied() // copy index to avoid borrow
             .and_then(|real_idx| self.plan.entries.get_mut(real_idx))
     }
     

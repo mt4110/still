@@ -109,10 +109,9 @@ fn main() -> Result<()> {
             // Load rules
             let rules_path = if let Some(path) = &args.rules {
                 Some(path.clone())
-            } else if let Some(proj_dirs) = directories::ProjectDirs::from("com", "antigravity", "still") {
-                Some(proj_dirs.config_dir().join("rules.toml"))
             } else {
-                None
+                directories::ProjectDirs::from("com", "antigravity", "still")
+                    .map(|proj_dirs| proj_dirs.config_dir().join("rules.toml"))
             };
 
             let rules = if let Some(path) = rules_path {

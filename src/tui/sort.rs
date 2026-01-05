@@ -1,16 +1,11 @@
 use crate::plan::Entry;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SortCriteria {
+    #[default]
     SizeDesc,
     AgeOldestFirst,
     PathAsc,
-}
-
-impl Default for SortCriteria {
-    fn default() -> Self {
-        SortCriteria::SizeDesc
-    }
 }
 
 impl SortCriteria {

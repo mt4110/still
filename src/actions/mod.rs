@@ -62,7 +62,7 @@ pub fn execute_plan(plan: &Plan, yes: bool, vault_dir: Option<PathBuf>) -> Resul
 
         // JIT Safety Check: Symlinks and Special Files
         let jit_check = || -> Result<(), AppError> {
-            let md = std::fs::symlink_metadata(&entry.path).map_err(|e| AppError::Io(e))?;
+            let md = std::fs::symlink_metadata(&entry.path).map_err(AppError::Io)?;
             if md.is_symlink() {
                 return Err(AppError::Io(std::io::Error::new(std::io::ErrorKind::Other, "Security: Symlink rejected")));
             }

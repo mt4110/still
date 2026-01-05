@@ -141,7 +141,7 @@ impl Scanner {
             let add = if md.is_file() { md.len() } else { 0 };
             let modified = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
-            let slot = agg.entry(group_path).or_insert_with(Agg::default);
+            let slot = agg.entry(group_path).or_default();
             slot.size = slot.size.saturating_add(add);
             if modified > slot.modified {
                 slot.modified = modified;
