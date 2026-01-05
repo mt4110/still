@@ -17,12 +17,7 @@ pub fn execute_plan(plan: &Plan, yes: bool, vault_dir: Option<PathBuf>) -> Resul
     } else {
         quarantine::Vault::new()
     }
-    .map_err(|e| {
-        AppError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            e.to_string(),
-        ))
-    })?;
+    .map_err(|e| AppError::Io(std::io::Error::other(e.to_string())))?;
 
     crate::journal::writer::log(
         "apply_start",
