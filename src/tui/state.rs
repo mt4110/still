@@ -1,7 +1,7 @@
-use ratatui::widgets::TableState;
-use crate::plan::{Plan, Entry, ActionType};
+use crate::plan::{ActionType, Entry, Plan};
 use crate::tui::filter::FilterState;
 use crate::tui::sort::SortCriteria;
+use ratatui::widgets::TableState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
@@ -14,7 +14,7 @@ pub struct AppState {
     pub plan: Plan,
     pub table_state: TableState,
     pub should_quit: bool,
-    
+
     // Phase 4 additions
     pub mode: AppMode,
     pub filter: FilterState,
@@ -30,7 +30,7 @@ impl AppState {
         if !plan.entries.is_empty() {
             table_state.select(Some(0));
         }
-        
+
         let mut state = Self {
             plan,
             table_state,
@@ -50,7 +50,11 @@ impl AppState {
     /// Call this whenever filter or sort changes, or bulk edits happen.
     pub fn update_view(&mut self) {
         // 1. Filter
-        self.view_indices = self.plan.entries.iter().enumerate()
+        self.view_indices = self
+            .plan
+            .entries
+            .iter()
+            .enumerate()
             .filter(|(_, entry)| self.filter.matches(entry))
             .map(|(i, _)| i)
             .collect();
@@ -65,10 +69,10 @@ impl AppState {
         // BUT if we reorder `plan.entries`, we lose the ability to easily map back if we cared about original scan order.
         // For MVP, actually sorting `plan.entries` is simpler than maintaining an index map for sort.
         // However, invalidates `view_indices` logic if we mutate in place.
-        
+
         // Let's stick to View Mapping to keep Plan stable? No, sorting the Plan is fine.
         // IF we sort the Plan, then view_indices is just 0..len if no filter.
-        
+
         // Actually, let's sort the VIEW indices only.
         let entries = &self.plan.entries;
         let sort = self.sort;
@@ -77,22 +81,25 @@ impl AppState {
             let entry_b = &entries[b];
             sort.compare(entry_a, entry_b)
         });
-        
+
         // Safety: Ensure selection is valid
         if self.view_indices.is_empty() {
             self.table_state.select(None);
         } else if let Some(i) = self.table_state.selected() {
             if i >= self.view_indices.len() {
-                self.table_state.select(Some(self.view_indices.len().saturating_sub(1)));
+                self.table_state
+                    .select(Some(self.view_indices.len().saturating_sub(1)));
             }
         } else {
-             self.table_state.select(Some(0));
+            self.table_state.select(Some(0));
         }
     }
 
     pub fn next(&mut self) {
-        if self.view_indices.is_empty() { return; }
-        
+        if self.view_indices.is_empty() {
+            return;
+        }
+
         let i = match self.table_state.selected() {
             Some(i) => {
                 if i >= self.view_indices.len() - 1 {
@@ -107,12 +114,14 @@ impl AppState {
     }
 
     pub fn previous(&mut self) {
-        if self.view_indices.is_empty() { return; }
-        
+        if self.view_indices.is_empty() {
+            return;
+        }
+
         let i = match self.table_state.selected() {
             Some(i) => {
                 if i == 0 {
-                   self.view_indices.len() - 1
+                    self.view_indices.len() - 1
                 } else {
                     i - 1
                 }
@@ -124,18 +133,20 @@ impl AppState {
 
     // Get current entry via view index -> plan index
     pub fn current_entry(&self) -> Option<&Entry> {
-        self.table_state.selected()
+        self.table_state
+            .selected()
             .and_then(|i| self.view_indices.get(i))
             .and_then(|&real_idx| self.plan.entries.get(real_idx))
     }
-    
+
     pub fn current_entry_mut(&mut self) -> Option<&mut Entry> {
-        self.table_state.selected()
+        self.table_state
+            .selected()
             .and_then(|i| self.view_indices.get(i))
-            .map(|&real_idx| real_idx) // copy index to avoid borrow
+            .copied() // copy index to avoid borrow
             .and_then(|real_idx| self.plan.entries.get_mut(real_idx))
     }
-    
+
     pub fn cycle_action(&mut self) {
         if let Some(entry) = self.current_entry_mut() {
             entry.selected_action = match entry.selected_action {
@@ -148,7 +159,9 @@ impl AppState {
     }
 
     pub fn set_current_action(&mut self, action: ActionType) {
-        if action == ActionType::Purge { return; } // Safety
+        if action == ActionType::Purge {
+            return;
+        } // Safety
         if let Some(entry) = self.current_entry_mut() {
             entry.selected_action = action;
         }
@@ -169,12 +182,12 @@ impl AppState {
             }
         }
     }
-    
+
     // Iterator for rendering (only filtered items)
     pub fn view_entries(&self) -> impl Iterator<Item = &Entry> {
         self.view_indices.iter().map(|&i| &self.plan.entries[i])
     }
-    
+
     pub fn view_len(&self) -> usize {
         self.view_indices.len()
     }
@@ -183,8 +196,8 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{Plan, Entry, EntryType, PlanOrigin};
     use crate::plan::ActionType;
+    use crate::plan::{Entry, EntryType, Plan, PlanOrigin};
     use std::path::PathBuf;
     use std::time::SystemTime;
 
@@ -214,15 +227,24 @@ mod tests {
 
         // Keep -> Quarantine
         state.cycle_action();
-        assert_eq!(state.current_entry().unwrap().selected_action, ActionType::Quarantine);
+        assert_eq!(
+            state.current_entry().unwrap().selected_action,
+            ActionType::Quarantine
+        );
 
         // Quarantine -> Trash
         state.cycle_action();
-        assert_eq!(state.current_entry().unwrap().selected_action, ActionType::Trash);
+        assert_eq!(
+            state.current_entry().unwrap().selected_action,
+            ActionType::Trash
+        );
 
         // Trash -> Keep (SKIP PURGE)
         state.cycle_action();
-        assert_eq!(state.current_entry().unwrap().selected_action, ActionType::Keep);
+        assert_eq!(
+            state.current_entry().unwrap().selected_action,
+            ActionType::Keep
+        );
     }
 
     #[test]
@@ -236,21 +258,21 @@ mod tests {
             entries: vec![entry1, entry2],
         };
         let mut state = AppState::new(plan);
-        
+
         state.bulk_apply(ActionType::Purge);
-        
+
         // Verify no change
         assert_eq!(state.plan.entries[0].selected_action, ActionType::Keep);
         assert_eq!(state.plan.entries[1].selected_action, ActionType::Keep);
     }
-    
+
     #[test]
     fn test_filter_view_updates() {
         let mut e1 = make_entry("/tmp/cache", ActionType::Keep);
         e1.reason = "cache".to_string();
         let mut e2 = make_entry("/tmp/log", ActionType::Keep);
         e2.reason = "log".to_string();
-        
+
         let plan = Plan {
             schema_version: "2.0".to_string(),
             generated_by: "test".to_string(),
@@ -258,20 +280,23 @@ mod tests {
             entries: vec![e1, e2],
         };
         let mut state = AppState::new(plan);
-        
+
         assert_eq!(state.view_len(), 2);
-        
+
         state.filter.text = "cache".to_string();
         state.update_view();
-        
+
         assert_eq!(state.view_len(), 1);
-        assert_eq!(state.current_entry().unwrap().path.to_string_lossy(), "/tmp/cache");
+        assert_eq!(
+            state.current_entry().unwrap().path.to_string_lossy(),
+            "/tmp/cache"
+        );
     }
     #[test]
     fn test_bulk_apply_filtered_only() {
         let mut e1 = make_entry("/tmp/1", ActionType::Keep);
-        e1.reason = "include me".to_string(); 
-        
+        e1.reason = "include me".to_string();
+
         let mut e2 = make_entry("/tmp/2", ActionType::Keep);
         e2.reason = "exclude me".to_string();
 
@@ -282,15 +307,15 @@ mod tests {
             entries: vec![e1, e2],
         };
         let mut state = AppState::new(plan);
-        
+
         // Apply filter
         state.filter.text = "include".to_string();
         state.update_view();
         assert_eq!(state.view_len(), 1);
-        
+
         // Bulk apply Trash
         state.bulk_apply(ActionType::Trash);
-        
+
         // Verify e1 (visible) is Trashed
         assert_eq!(state.plan.entries[0].selected_action, ActionType::Trash);
         // Verify e2 (hidden) is Unchanged (Keep)

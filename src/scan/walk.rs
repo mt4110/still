@@ -24,8 +24,7 @@ use crate::scan::classify::determine_entry_type;
 ///   ~/Library/Caches/com.apple.dt.Xcode
 ///
 /// Later we can add modes (raw / depth=N / rule-driven).
-
-use crate::config::rules::{Rule, expand_path};
+use crate::config::rules::{expand_path, Rule};
 use globset::{Glob, GlobSetBuilder};
 
 pub struct Scanner {
@@ -93,13 +92,13 @@ impl Scanner {
         let mut agg: HashMap<PathBuf, Agg> = HashMap::new();
 
         let walker = WalkBuilder::new(&self.base_path)
-            .standard_filters(false) 
+            .standard_filters(false)
             .hidden(false)
             .follow_links(false)
             .filter_entry(move |entry| {
                 if let Some(set) = &exclude_set {
                     if set.is_match(entry.path()) {
-                        return false; 
+                        return false;
                     }
                 }
                 true
@@ -141,7 +140,7 @@ impl Scanner {
             let add = if md.is_file() { md.len() } else { 0 };
             let modified = md.modified().unwrap_or(SystemTime::UNIX_EPOCH);
 
-            let slot = agg.entry(group_path).or_insert_with(Agg::default);
+            let slot = agg.entry(group_path).or_default();
             slot.size = slot.size.saturating_add(add);
             if modified > slot.modified {
                 slot.modified = modified;
@@ -159,12 +158,13 @@ impl Scanner {
             let entry_type: EntryType = determine_entry_type(&group_path, &md);
 
             let (recommended_action, reason) = if entry_type == EntryType::Symlink {
-                (ActionType::Keep, "Symlinks are skipped in Phase 2".to_string())
+                (
+                    ActionType::Keep,
+                    "Symlinks are skipped in Phase 2".to_string(),
+                )
             } else {
                 recommend(&group_path, a.size, a.modified, &self.rules)
             };
-
-
 
             out.push(Entry {
                 path: group_path,
@@ -183,7 +183,12 @@ impl Scanner {
     }
 }
 
-pub(crate) fn recommend(path: &Path, size: u64, modified: SystemTime, rules: &[Rule]) -> (ActionType, String) {
+pub(crate) fn recommend(
+    path: &Path,
+    size: u64,
+    modified: SystemTime,
+    rules: &[Rule],
+) -> (ActionType, String) {
     // 0. Safety First: Missing metadata? Matches nothing -> Keep.
     // In this MVP 'size' and 'modified' are passed in. If they were default (UNIX_EPOCH or 0),
     // strictly speaking we should treat it as "unknown".
@@ -202,7 +207,9 @@ pub(crate) fn recommend(path: &Path, size: u64, modified: SystemTime, rules: &[R
                 false
             }
         });
-        if !in_scope { continue; }
+        if !in_scope {
+            continue;
+        }
 
         // Check excludes (Global override for this rule)
         if let Some(excludes) = &rule.excludes {
@@ -216,7 +223,9 @@ pub(crate) fn recommend(path: &Path, size: u64, modified: SystemTime, rules: &[R
                     }
                 }
             }
-            if matched_exclude { continue; }
+            if matched_exclude {
+                continue;
+            }
         }
 
         // Check includes (If defined, MUST match one)
@@ -230,7 +239,9 @@ pub(crate) fn recommend(path: &Path, size: u64, modified: SystemTime, rules: &[R
                     }
                 }
             }
-            if !matched_include { continue; }
+            if !matched_include {
+                continue;
+            }
         }
 
         // Check thresholds
@@ -263,18 +274,18 @@ pub(crate) fn recommend(path: &Path, size: u64, modified: SystemTime, rules: &[R
     // 2. Default Heuristics (Fallback)
     // “Old” threshold: default from policy
     let old_threshold = SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(crate::policy::RULES_FALLBACK_OLD_DAYS * 24 * 60 * 60))
+        .checked_sub(std::time::Duration::from_secs(
+            crate::policy::RULES_FALLBACK_OLD_DAYS * 24 * 60 * 60,
+        ))
         .unwrap_or(SystemTime::UNIX_EPOCH);
 
     // “Large” threshold: default from policy
     let large_threshold: u64 = crate::policy::RULES_FALLBACK_LARGE_BYTES;
 
-    let _base_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    
-    let parent_name = path.parent()
+    let _base_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
+    let parent_name = path
+        .parent()
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
         .unwrap_or("");
@@ -292,14 +303,23 @@ pub(crate) fn recommend(path: &Path, size: u64, modified: SystemTime, rules: &[R
                 format!("Fallback: {} group (policy default)", parent_name),
             );
         }
-        return (ActionType::Keep, format!("{} group; recent/small", parent_name));
+        return (
+            ActionType::Keep,
+            format!("{} group; recent/small", parent_name),
+        );
     }
 
     if is_container_like {
         if is_old && is_large {
-            return (ActionType::Quarantine, "Fallback: Containers group (policy default)".to_string());
+            return (
+                ActionType::Quarantine,
+                "Fallback: Containers group (policy default)".to_string(),
+            );
         }
-        return (ActionType::Keep, "Containers group; keep by default".to_string());
+        return (
+            ActionType::Keep,
+            "Containers group; keep by default".to_string(),
+        );
     }
 
     (ActionType::Keep, "Detected".to_string())

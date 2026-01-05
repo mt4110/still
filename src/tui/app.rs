@@ -10,8 +10,8 @@ use std::io::{self, Stdout};
 use std::path::PathBuf;
 
 use crate::plan::io::{load_plan, save_plan};
-use crate::tui::state::AppState;
 use crate::tui::render::ui;
+use crate::tui::state::AppState;
 
 pub struct App {
     plan_path: PathBuf,
@@ -65,74 +65,71 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: &mut AppState) -> Resu
     while !state.should_quit {
         terminal.draw(|f| ui(f, state))?;
 
-        if event::poll(std::time::Duration::from_millis(crate::policy::TUI_REFRESH_MS))? {
+        if event::poll(std::time::Duration::from_millis(
+            crate::policy::TUI_REFRESH_MS,
+        ))? {
             if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                match state.mode {
-                    AppMode::Normal => {
-                        match key.code {
+                if key.kind == KeyEventKind::Press {
+                    match state.mode {
+                        AppMode::Normal => match key.code {
                             KeyCode::Char('q') => state.should_quit = true,
                             KeyCode::Down | KeyCode::Char('j') => state.next(),
                             KeyCode::Up | KeyCode::Char('k') => state.previous(),
                             KeyCode::Char(' ') => state.cycle_action(),
                             KeyCode::Char('/') => {
                                 state.mode = AppMode::Filtering;
-                            },
+                            }
                             KeyCode::Char('s') => {
                                 state.sort = state.sort.next();
                                 state.update_view();
-                            },
+                            }
                             KeyCode::Char('b') => {
                                 state.mode = AppMode::BulkConfirm;
-                            },
+                            }
                             KeyCode::Char('K') => state.set_current_action(ActionType::Keep),
                             KeyCode::Char('Q') => state.set_current_action(ActionType::Quarantine),
                             KeyCode::Char('T') => state.set_current_action(ActionType::Trash),
                             _ => {}
-                        }
-                    },
-                    AppMode::Filtering => {
-                        match key.code {
+                        },
+                        AppMode::Filtering => match key.code {
                             KeyCode::Esc | KeyCode::Enter => {
                                 state.mode = AppMode::Normal;
-                            },
+                            }
                             KeyCode::Backspace => {
                                 state.filter.text.pop();
                                 state.update_view();
-                            },
+                            }
                             KeyCode::Char(c) => {
-                                if state.filter.text.len() < crate::policy::TUI_FILTER_QUERY_MAX_LEN {
+                                if state.filter.text.len() < crate::policy::TUI_FILTER_QUERY_MAX_LEN
+                                {
                                     state.filter.text.push(c);
                                     state.update_view();
                                 }
-                            },
+                            }
                             _ => {}
-                        }
-                    },
-                    AppMode::BulkConfirm => {
-                         match key.code {
+                        },
+                        AppMode::BulkConfirm => match key.code {
                             KeyCode::Esc | KeyCode::Char('q') => {
                                 state.mode = AppMode::Normal;
-                            },
+                            }
                             KeyCode::Char('K') => {
                                 state.bulk_apply(ActionType::Keep);
                                 state.mode = AppMode::Normal;
-                            },
+                            }
                             KeyCode::Char('Q') => {
                                 state.bulk_apply(ActionType::Quarantine);
                                 state.mode = AppMode::Normal;
-                            },
+                            }
                             KeyCode::Char('T') => {
                                 state.bulk_apply(ActionType::Trash);
                                 state.mode = AppMode::Normal;
-                            },
+                            }
                             _ => {}
-                         }
+                        },
                     }
                 }
             }
         }
-    }
     }
     Ok(())
 }

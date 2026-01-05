@@ -1,7 +1,7 @@
+use crate::plan::ActionType;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use crate::plan::ActionType;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Rule {
@@ -24,8 +24,8 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<Vec<Rule>> {
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read rules file: {:?}", path.as_ref()))?;
 
-    let rule_set: RuleSet = toml::from_str(&content)
-        .with_context(|| "Failed to parse rules TOML")?;
+    let rule_set: RuleSet =
+        toml::from_str(&content).with_context(|| "Failed to parse rules TOML")?;
 
     validate_rules(&rule_set.rules)?;
 
@@ -73,11 +73,17 @@ fn validate_scope(scope_str: &str) -> Result<()> {
     if let Some(user_dirs) = directories::UserDirs::new() {
         let home = user_dirs.home_dir();
         if scope_path == home {
-             return Err(anyhow!("Scope '{}' is the home directory, which is too broad", scope_str));
+            return Err(anyhow!(
+                "Scope '{}' is the home directory, which is too broad",
+                scope_str
+            ));
         }
         // Also check if it's a parent of home (unlikely but possible)
         if home.starts_with(&scope_path) && home != scope_path {
-             return Err(anyhow!("Scope '{}' contains home directory, which is too broad", scope_str));
+            return Err(anyhow!(
+                "Scope '{}' contains home directory, which is too broad",
+                scope_str
+            ));
         }
     }
 
@@ -90,7 +96,9 @@ pub fn expand_path(path_str: &str) -> Result<PathBuf> {
             let home = user_dirs.home_dir();
             let without_tilde = path_str.strip_prefix("~").unwrap_or(path_str);
             // Handle ~/.foo vs ~/foo
-            let suffix = without_tilde.strip_prefix(std::path::MAIN_SEPARATOR_STR).unwrap_or(without_tilde);
+            let suffix = without_tilde
+                .strip_prefix(std::path::MAIN_SEPARATOR_STR)
+                .unwrap_or(without_tilde);
             return Ok(home.join(suffix));
         }
     }
@@ -143,7 +151,7 @@ mod tests {
         assert_eq!(rules[0].recommended_action, Some(ActionType::Trash));
     }
 
-     #[test]
+    #[test]
     fn test_load_rules_invalid_scope() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("bad_rules.toml");
@@ -161,15 +169,23 @@ mod tests {
     #[test]
     fn test_embedded_rules_parsing() {
         let content = crate::policy::DEFAULT_RULES_TOML;
-        let rule_set: RuleSet = toml::from_str(content).expect("Default rules TOML should be valid");
-        assert!(!rule_set.rules.is_empty(), "Default rules should not be empty");
+        let rule_set: RuleSet =
+            toml::from_str(content).expect("Default rules TOML should be valid");
+        assert!(
+            !rule_set.rules.is_empty(),
+            "Default rules should not be empty"
+        );
         for rule in rule_set.rules {
-             assert!(!rule.scopes.is_empty());
-             assert!(!rule.name.is_empty());
-             // Ensure at least one threshold is set if recommended_action is set
-             if rule.recommended_action.is_some() {
-                 assert!(rule.older_than_days.is_some() || rule.min_size_bytes.is_some() || rule.includes.is_some());
-             }
+            assert!(!rule.scopes.is_empty());
+            assert!(!rule.name.is_empty());
+            // Ensure at least one threshold is set if recommended_action is set
+            if rule.recommended_action.is_some() {
+                assert!(
+                    rule.older_than_days.is_some()
+                        || rule.min_size_bytes.is_some()
+                        || rule.includes.is_some()
+                );
+            }
         }
     }
 }

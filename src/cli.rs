@@ -68,7 +68,7 @@ pub struct TuiArgs {
 pub struct ApplyArgs {
     #[arg(default_value = "./plan.json", help = crate::lang::text().apply_plan)]
     pub plan: PathBuf,
-    
+
     #[arg(long, short, help = crate::lang::text().apply_yes)]
     pub yes: bool,
 
@@ -93,7 +93,8 @@ pub struct VaultArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum VaultCommands {
-    #[command(about = "List vault items")] // Fallback or add to lang if strictly needed, user didn't ask for full coverage but good practice.
+    #[command(about = "List vault items")]
+    // Fallback or add to lang if strictly needed, user didn't ask for full coverage but good practice.
     List {
         #[arg(long, help = crate::lang::text().vault_list_expired)]
         expired: bool,
@@ -107,7 +108,7 @@ pub enum VaultCommands {
     Purge {
         #[arg(help = crate::lang::text().vault_purge_target)]
         target: Option<String>,
-        
+
         #[arg(long, help = crate::lang::text().vault_purge_expired)]
         expired: bool,
     },

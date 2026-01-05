@@ -45,17 +45,29 @@ fn main() -> Result<()> {
                         for s in scopes {
                             let safety_label = format!("[{}]", s.safety);
                             let default_label = if s.default { " (default)" } else { "" };
-                            let alias_label = if !s.aliases.is_empty() { 
+                            let alias_label = if !s.aliases.is_empty() {
                                 format!(" (alias -> {})", s.name) // Simplified visual for alias
-                            } else { "".to_string() };
-                            
-                            println!("* {}{}{} {}", s.name, default_label, alias_label, safety_label);
+                            } else {
+                                "".to_string()
+                            };
+
+                            println!(
+                                "* {}{}{} {}",
+                                s.name, default_label, alias_label, safety_label
+                            );
                             println!("  - {}", s.description);
                             println!("  - roots:");
                             for r in &s.roots {
                                 println!("    - {}", r);
                             }
-                            println!("  - apply_compatible_by_default: {}", if s.apply_compatible_by_default { "yes" } else { "no" });
+                            println!(
+                                "  - apply_compatible_by_default: {}",
+                                if s.apply_compatible_by_default {
+                                    "yes"
+                                } else {
+                                    "no"
+                                }
+                            );
                             if let Some(w) = &s.warning {
                                 println!("  - warning: {}", w);
                             }
@@ -71,10 +83,12 @@ fn main() -> Result<()> {
 
             let target_paths = match args.scope {
                 cli::Scope::LibrarySafe => {
-                    let dirs = directories::UserDirs::new().ok_or(anyhow::anyhow!("Could not find user home"))?;
+                    let dirs = directories::UserDirs::new()
+                        .ok_or(anyhow::anyhow!("Could not find user home"))?;
                     let library_path = dirs.home_dir().join("Library");
                     // We specifically want Caches, Logs for MVP (Containers excluded in v0.1.0)
-                    crate::policy::DEFAULT_ALLOWED_SCOPES_SUBDIRS.iter()
+                    crate::policy::DEFAULT_ALLOWED_SCOPES_SUBDIRS
+                        .iter()
                         .map(|subdir| library_path.join(subdir))
                         .collect()
                 }
@@ -82,7 +96,7 @@ fn main() -> Result<()> {
                     // Fetch official warning from Source of Truth
                     let scopes = crate::scope::all_scopes();
                     let unsafe_spec = scopes.iter().find(|s| s.name == "library-unsafe");
-                    
+
                     if let Some(spec) = unsafe_spec {
                         eprintln!("WARNING: scope={}", spec.name);
                         if let Some(w) = &spec.warning {
@@ -92,13 +106,16 @@ fn main() -> Result<()> {
                         // Fallback purely for safety if spec missing (should not happen)
                         eprintln!("WARNING: scope=library-unsafe scans the entire ~/Library. Use with caution.");
                     }
-                    
-                    let dirs = directories::UserDirs::new().ok_or(anyhow::anyhow!("Could not find user home"))?;
+
+                    let dirs = directories::UserDirs::new()
+                        .ok_or(anyhow::anyhow!("Could not find user home"))?;
                     vec![dirs.home_dir().join("Library")]
                 }
                 cli::Scope::Custom => {
                     // For MVP custom not implemented via argument yet except just Library
-                    println!("Custom scope not fully supported in MVP, scanning current dir for demo");
+                    println!(
+                        "Custom scope not fully supported in MVP, scanning current dir for demo"
+                    );
                     vec![std::env::current_dir()?]
                 }
             };
@@ -109,10 +126,9 @@ fn main() -> Result<()> {
             // Load rules
             let rules_path = if let Some(path) = &args.rules {
                 Some(path.clone())
-            } else if let Some(proj_dirs) = directories::ProjectDirs::from("com", "antigravity", "still") {
-                Some(proj_dirs.config_dir().join("rules.toml"))
             } else {
-                None
+                directories::ProjectDirs::from("com", "antigravity", "still")
+                    .map(|proj_dirs| proj_dirs.config_dir().join("rules.toml"))
             };
 
             let rules = if let Some(path) = rules_path {
@@ -126,7 +142,7 @@ fn main() -> Result<()> {
                         }
                     }
                 } else if args.rules.is_some() {
-                     // If explicit path given but not found, error out
+                    // If explicit path given but not found, error out
                     eprintln!("Error: Rules file not found at {:?}", path);
                     std::process::exit(1);
                 } else {
@@ -136,8 +152,8 @@ fn main() -> Result<()> {
                     match toml::from_str::<config::rules::RuleSet>(content) {
                         Ok(rs) => rs.rules,
                         Err(e) => {
-                             eprintln!("Critical: Failed to parse embedded rules: {}", e);
-                             std::process::exit(1);
+                            eprintln!("Critical: Failed to parse embedded rules: {}", e);
+                            std::process::exit(1);
                         }
                     }
                 }
@@ -225,7 +241,7 @@ fn main() -> Result<()> {
         Some(Commands::Vault(args)) => {
             use cli::VaultCommands;
             // Logic moved to actions::vault
-            
+
             match &args.command {
                 VaultCommands::List { expired } => {
                     actions::vault::list(args.vault_dir.clone(), *expired)?;
@@ -247,14 +263,14 @@ fn main() -> Result<()> {
             if let Some(proj_dirs) = directories::ProjectDirs::from("com", "antigravity", "still") {
                 let config_dir = proj_dirs.config_dir();
                 if !config_dir.exists() {
-                     std::fs::create_dir_all(config_dir)?;
+                    std::fs::create_dir_all(config_dir)?;
                 }
                 let rules_path = config_dir.join("rules.toml");
                 if rules_path.exists() {
                     eprintln!("Config already exists at {:?}. Skipping init.", rules_path);
                     return Ok(());
                 }
-                
+
                 std::fs::write(&rules_path, crate::policy::DEFAULT_RULES_TOML)?;
                 println!("Initialized default rules at {:?}", rules_path);
             } else {
@@ -273,7 +289,9 @@ fn print_plan_summary(plan: &crate::plan::Plan) {
     let mut sizes = std::collections::HashMap::new();
 
     for entry in &plan.entries {
-        if entry.selected_action == ActionType::Keep { continue; }
+        if entry.selected_action == ActionType::Keep {
+            continue;
+        }
         *counts.entry(entry.selected_action).or_insert(0) += 1;
         *sizes.entry(entry.selected_action).or_insert(0) += entry.size;
     }
@@ -284,7 +302,12 @@ fn print_plan_summary(plan: &crate::plan::Plan) {
     for action in [ActionType::Quarantine, ActionType::Trash] {
         if let Some(count) = counts.get(&action) {
             let size = sizes.get(&action).unwrap_or(&0);
-            println!("{:?}: {} items ({})", action, count, humansize::format_size(*size, humansize::DECIMAL));
+            println!(
+                "{:?}: {} items ({})",
+                action,
+                count,
+                humansize::format_size(*size, humansize::DECIMAL)
+            );
         }
     }
     // Also print total scanned? Or just actions?

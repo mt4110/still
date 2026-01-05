@@ -16,8 +16,12 @@ pub struct Plan {
     pub entries: Vec<Entry>,
 }
 
-fn default_schema_version() -> String { "2.0".to_string() }
-fn default_generated_by() -> String { "still".to_string() }
+fn default_schema_version() -> String {
+    "2.0".to_string()
+}
+fn default_generated_by() -> String {
+    "still".to_string()
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Entry {
