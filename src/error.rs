@@ -12,17 +12,17 @@ pub enum AppError {
     #[error("Rule error: {0}")]
     #[allow(dead_code)]
     Rule(String),
-    
+
     #[error("Scan error: {0}")]
     Scan(String),
 
     #[error("Plan error: {0}")]
     Plan(String),
-    
+
     #[error("Action aborted by user")]
     #[allow(dead_code)]
     Aborted,
-    
+
     #[error(transparent)]
     Anyhow(#[from] anyhow::Error),
 }

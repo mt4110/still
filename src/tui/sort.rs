@@ -28,12 +28,11 @@ impl SortCriteria {
                 // Secondary sort by path for stability
                 b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path))
             }
-            SortCriteria::AgeOldestFirst => {
-                a.modified.cmp(&b.modified).then_with(|| a.path.cmp(&b.path))
-            }
-            SortCriteria::PathAsc => {
-                a.path.cmp(&b.path)
-            }
+            SortCriteria::AgeOldestFirst => a
+                .modified
+                .cmp(&b.modified)
+                .then_with(|| a.path.cmp(&b.path)),
+            SortCriteria::PathAsc => a.path.cmp(&b.path),
         }
     }
 }
@@ -41,9 +40,9 @@ impl SortCriteria {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::{ActionType, EntryType, PlanOrigin};
     use std::path::PathBuf;
-    use std::time::{SystemTime, Duration};
-    use crate::plan::{EntryType, PlanOrigin, ActionType};
+    use std::time::{Duration, SystemTime};
 
     fn make_entry(path: &str, size: u64, age_secs: u64) -> Entry {
         Entry {
@@ -74,20 +73,20 @@ mod tests {
     #[test]
     fn test_sort_age_oldest_first() {
         // age_secs: bigger number = older
-        // modified = now - age_secs. 
+        // modified = now - age_secs.
         // So bigger age_secs -> smaller modified timestamp
         // OldestFirst means sorting by modified ASC?
-        // e.g. T1 (old) < T2 (new). 
+        // e.g. T1 (old) < T2 (new).
         // a.modified.cmp(b.modified) -> [oldest, ..., newest]
-        
+
         let mut entries = vec![
-            make_entry("new", 0, 10),     // modified = now - 10
-            make_entry("old", 0, 1000),   // modified = now - 1000
-            make_entry("mid", 0, 100),    // modified = now - 100
+            make_entry("new", 0, 10),   // modified = now - 10
+            make_entry("old", 0, 1000), // modified = now - 1000
+            make_entry("mid", 0, 100),  // modified = now - 100
         ];
-        
+
         SortCriteria::AgeOldestFirst.sort(&mut entries);
-        
+
         // Expected: old, mid, new
         assert_eq!(entries[0].path.to_string_lossy(), "old");
         assert_eq!(entries[1].path.to_string_lossy(), "mid");
@@ -96,10 +95,7 @@ mod tests {
 
     #[test]
     fn test_sort_stability_secondary() {
-        let mut entries = vec![
-            make_entry("b", 100, 0),
-            make_entry("a", 100, 0),
-        ];
+        let mut entries = vec![make_entry("b", 100, 0), make_entry("a", 100, 0)];
         // Size match, should fallback to Path Asc
         SortCriteria::SizeDesc.sort(&mut entries);
         assert_eq!(entries[0].path.to_string_lossy(), "a");

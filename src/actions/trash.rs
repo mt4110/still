@@ -1,4 +1,4 @@
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use std::path::Path;
 
 pub fn trash_path(path: &Path) -> Result<()> {

@@ -1,9 +1,9 @@
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
 use anyhow::Result;
 use chrono::Utc;
 use serde::Serialize;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use uuid;
 
@@ -20,7 +20,7 @@ pub fn init() -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     let mut lock = JOURNAL_PATH.lock().unwrap();
     *lock = Some(path);
     // Force RUN_ID initialization or just let it happen on first log
@@ -54,6 +54,10 @@ pub fn log<T: Serialize>(action: &str, data: T) {
         }
     } else {
         // Journal not initialized?
-        eprintln!("Journal not initialized, dropping log: {} {:?}", action, std::any::type_name::<T>());
+        eprintln!(
+            "Journal not initialized, dropping log: {} {:?}",
+            action,
+            std::any::type_name::<T>()
+        );
     }
 }

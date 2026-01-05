@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -28,7 +28,7 @@ impl Vault {
         let dirs = directories::ProjectDirs::from("com", "antigravity", "still")
             .or_else(|| directories::ProjectDirs::from("com", "user", "still"))
             .ok_or(anyhow::anyhow!("Could not determine data directory"))?;
-        
+
         let root = dirs.data_local_dir().join("vault");
         Self::new_with_root(root)
     }
@@ -45,12 +45,12 @@ impl Vault {
 
         let uuid = Uuid::new_v4();
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
-        
+
         // Simpler for MVP: vault/uuid/filename
         let file_name = path.file_name().unwrap_or_default();
         let vault_dir = self.root.join(uuid.to_string());
         fs::create_dir_all(&vault_dir)?;
-        
+
         let target_path = vault_dir.join(file_name);
 
         // Move (rename) with EXDEV fallback (cross-device)
@@ -64,7 +64,9 @@ impl Vault {
             batch_id: timestamp,
             stored_name: file_name.to_string_lossy().to_string(),
             // Default TTL from policy
-            expires_at: Some(Utc::now() + chrono::Duration::days(crate::policy::DEFAULT_VAULT_TTL_DAYS)),
+            expires_at: Some(
+                Utc::now() + chrono::Duration::days(crate::policy::DEFAULT_VAULT_TTL_DAYS),
+            ),
         };
 
         let meta_path = vault_dir.join("still_meta.json");
@@ -105,14 +107,18 @@ impl Vault {
         let vault_dir = self.root.join(id);
         let meta_path = vault_dir.join("still_meta.json");
         if !meta_path.exists() {
-            return Err(anyhow::anyhow!("Vault item not found or missing meta: {id}"));
+            return Err(anyhow::anyhow!(
+                "Vault item not found or missing meta: {id}"
+            ));
         }
         let f = fs::File::open(&meta_path)?;
         let meta: VaultMeta = serde_json::from_reader(f)?;
 
         let stored = vault_dir.join(&meta.stored_name);
         if !stored.exists() {
-            return Err(anyhow::anyhow!("Stored content missing for vault item: {id}"));
+            return Err(anyhow::anyhow!(
+                "Stored content missing for vault item: {id}"
+            ));
         }
 
         let dest = meta.original_path;
@@ -150,13 +156,13 @@ impl Vault {
     pub fn purge_expired(&self) -> Result<Vec<String>> {
         let mut purged = Vec::new();
         let now = Utc::now();
-        
+
         // Iterate all items, check expiry
         for (id, meta) in self.list()? {
             if let Some(expires) = meta.expires_at {
                 if now > expires {
-                     self.purge(&id)?;
-                     purged.push(id);
+                    self.purge(&id)?;
+                    purged.push(id);
                 }
             }
         }

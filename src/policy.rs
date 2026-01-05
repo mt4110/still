@@ -1,8 +1,8 @@
-/// Quantitative Policy Constants for `still`.
-///
-/// This file centralizes all "tuning knobs" and quantitative policies.
-/// Any number that affects behavior (TTL, Fallback thresholds, Safety limits)
-/// MUST be defined here with a clear rationale comment.
+//! Quantitative Policy Constants for `still`.
+//!
+//! This file centralizes all "tuning knobs" and quantitative policies.
+//! Any number that affects behavior (TTL, Fallback thresholds, Safety limits)
+//! MUST be defined here with a clear rationale comment.
 
 // --- Vault Policies ---
 
@@ -17,10 +17,7 @@ pub const PURGE_RITUAL_PHRASE: &str = "PURGE STILL";
 
 /// Default approved subdirectories in ~/Library to scan.
 /// Stricter scopes can be defined in rules, but this is the hardcoded safety net.
-pub const DEFAULT_ALLOWED_SCOPES_SUBDIRS: &[&str] = &[
-    "Caches",
-    "Logs",
-];
+pub const DEFAULT_ALLOWED_SCOPES_SUBDIRS: &[&str] = &["Caches", "Logs"];
 
 // --- Fallback Policies (Emergency Use Only) ---
 
