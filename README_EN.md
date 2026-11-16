@@ -1,15 +1,13 @@
 # still
 
-**Non-destructive, safety-first disk cleaner for macOS**
+**Local storage explorer and review-first developer cleanup tool**
 
-Designed as an "Observation + Quarantine Device" rather than a simple cleaner. It never deletes files without your explicit permission.
-By default, it operates in Dry-run mode (creating plans), executing only the actions you have confirmed.
+Browse directory sizes, search local paths, and review generated outputs, merged Git worktrees, and unused Docker resources. Cleanup actions require explicit confirmation.
 
 ## Features
-- **Non-destructive Defaults**: Always starts with a Dry-run plan.
-- **Quarantine First**: Moves files to a dedicated Vault instead of deleting them immediately.
-- **TUI Interface**: Visually review and select candidates for deletion.
-- **Local Only**: No network communication.
+- **Parallel storage scan**: Browse by total size or largest file and search recursively.
+- **Library quarantine**: Move selected Library items to a restorable Vault.
+- **Local by default**: GitHub PR lookup runs when explicitly requested with `--github-pr`.
 
 ## Installation
 
@@ -23,6 +21,20 @@ cargo install --path .
 ```
 
 ## Usage: 3-Step Workflow
+
+### Developer storage explorer
+
+```sh
+still review --root ~/projects
+still review --cleanup-root ~/projects
+still review --root ~/projects --search target --format json
+```
+
+Press Enter to open a directory, `/` to search, or `o` to choose another root. With a cleanup root configured, Tab shows generated outputs. Space checks and selects an output. `D` opens the deletion preview, and `y` confirms permanent removal. Use `--output` to declare a dedicated reproducible script output directory.
+
+`still worktrees --help` and `still docker --help` show the options for the other cleanup sources.
+
+### Library workflow
 
 The standard workflow for safe cleanup.
 

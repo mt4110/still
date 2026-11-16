@@ -27,7 +27,7 @@ pub struct HelpText {
 }
 
 pub const EN: HelpText = HelpText {
-    about: "Non-destructive, safety-first disk cleaner for macOS",
+    about: "Explore local storage and review developer cleanup candidates",
     scan: "Scan directories and generate a cleanup plan",
     tui: "Open the Text User Interface to review plans",
     apply: "Apply a plan (Quarantine/Trash) - Permanent deletion is still vault purge only",
@@ -53,7 +53,7 @@ pub const EN: HelpText = HelpText {
 };
 
 pub const JP: HelpText = HelpText {
-    about: "macOS用の非破壊的・安全第一のディスククリーナー",
+    about: "ローカルストレージを調べ、開発時の掃除候補を確認するツール",
     scan: "ディレクトリをスキャンしてクリーンアップ計画（plan.json）を作成します",
     tui: "TUI（テキストUI）を開いて計画を確認・編集します",
     apply: "計画を適用します（隔離/ゴミ箱へ移動）。完全削除は vault purge でのみ行われます",

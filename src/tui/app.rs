@@ -42,18 +42,29 @@ impl App {
     }
 }
 
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+pub(crate) fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    if let Err(err) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(err.into());
+    }
     let backend = CrosstermBackend::new(stdout);
-    let terminal = Terminal::new(backend)?;
-    Ok(terminal)
+    match Terminal::new(backend) {
+        Ok(terminal) => Ok(terminal),
+        Err(err) => {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            Err(err.into())
+        }
+    }
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+pub(crate) fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    let raw = disable_raw_mode();
+    let screen = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    raw?;
+    screen?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -99,12 +110,12 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: &mut AppState) -> Resu
                                 state.filter.text.pop();
                                 state.update_view();
                             }
-                            KeyCode::Char(c) => {
-                                if state.filter.text.len() < crate::policy::TUI_FILTER_QUERY_MAX_LEN
-                                {
-                                    state.filter.text.push(c);
-                                    state.update_view();
-                                }
+                            KeyCode::Char(c)
+                                if state.filter.text.len()
+                                    < crate::policy::TUI_FILTER_QUERY_MAX_LEN =>
+                            {
+                                state.filter.text.push(c);
+                                state.update_view();
                             }
                             _ => {}
                         },

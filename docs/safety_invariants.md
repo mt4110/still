@@ -2,6 +2,12 @@
 
 `still` is designed around strict safety invariants. These are not just guidelines but hard constraints enforced by the system structure.
 
+The invariants below cover the Library scan and Plan workflow. The development storage
+explorer uses a separate `review` workflow. An inspection root grants read access only.
+Permanent removal requires a configured `--cleanup-root`, verification of the selected
+output tree, and explicit confirmation in the explorer. Before removal, still checks the
+same evidence again and stages the output beside its original path on the same filesystem.
+
 ## 1. Purge Separation (The "Two-Key" Rule)
 
 **Invariant**: Permanent deletion (Purge) is structurally impossible during the standard `apply` workflow.
