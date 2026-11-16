@@ -2,16 +2,14 @@
 
 [README_EN](./README_EN.md) 
 
-**macOS用の非破壊的・安全第一のディスククリーナー**
+**ローカルストレージの容量調査と開発生成物の掃除**
 
-「掃除機」ではなく「観測＋隔離装置」としての立ち位置を取り、決して勝手にファイルを削除しません。
-初期状態では Dry-run（計画作成）のみを行い、ユーザーが確認した操作のみを実行します。
+容量順のツリーを開いて調査し、生成物やマージ済みワークツリー、Docker 資産を確認できます。削除は選択した対象を明示的に確認してから実行します。
 
 ## 特徴
-- **非破壊的デフォルト**: 基本は常に Dry-run（計画作成）です。
-- **Quarantine First**: いきなり削除せず、まずは専用の保管庫（Vault）へ隔離します。
-- **TUI搭載**: 削除候補を視覚的に確認・選別できます。
-- **完全ローカル**: ネットワーク通信を一切行いません。
+- **容量順の探索と再帰検索**: 指定したディレクトリを Rust で並列走査します。
+- **Library の隔離**: 保管庫（Vault）へ移した項目を復元できます。
+- **ローカル優先**: GitHub の PR 照合は `--github-pr` を指定した時に実行します。
 
 ## インストール
 
@@ -25,6 +23,53 @@ cargo install --path .
 ```
 
 ## 使い方：3ステップ・ワークフロー
+
+### 開発ディレクトリの容量調査と掃除
+
+```sh
+# 容量を調べる
+still review --root ~/_workspace
+
+# 指定した開発ルートで生成物の掃除も有効にする
+still review --cleanup-root ~/_workspace
+
+# 独自スクリプト専用の出力先を登録する
+still review --cleanup-root ~/_workspace --output ~/_workspace/my-project/generated
+
+# 再帰検索を構造化出力で取得する
+still review --root ~/_workspace --search .next --format json
+```
+
+`Enter` でディレクトリを開き、`←` で親に戻ります。`/` で現在地以下を検索し、`o` で別の調査先を開きます。`s` で合計容量順と最大ファイル順を切り替えます。
+
+`Tab` に Cargo、Next.js、Vite の生成物候補が出ます。`Space` で選ぶと、Git の追跡状態と配下のファイルを確認します。`D` で実際に削除する対象を確認し、`y` で実行します。削除はゴミ箱を経由しません。`--output` は再生成できる専用出力先に指定してください。
+
+選択後に中身が変わった出力、リンクや保護対象を含む出力は保留されます。エラーで `.still-stage-*` が残った場合、`original-path.txt` が元の場所、`payload` が残ったデータです。空き容量の増減はストレージ全体の観測値です。
+
+`--docker-context colima` などを追加すると、指定したローカルの Docker 接続先にあるコンテナの bind mount と重なる出力を保護します。
+
+### マージ済み Git ワークツリー
+
+```sh
+still worktrees --repo ~/projects/app --root ~/projects/app-worktrees
+still worktrees --repo ~/projects/app --root ~/projects/app-worktrees \\
+  --base refs/remotes/origin/main --github-pr 42
+still worktrees --repo ~/projects/app --root ~/projects/app-worktrees \\
+  --remove ~/projects/app-worktrees/task-done
+```
+
+`--base` の既定はローカルの `refs/heads/main` です。`--github-pr` は `gh` を使って `origin` の PR を照合します。削除時も、確認したときと同じ `--base` と `--github-pr` を指定してください。未コミット・未追跡・ignored ファイルのあるワークツリーは保留されます。生成物だけを掃除するときは `still review` を使えます。Codex が管理するワークツリーの全体削除は、そのチャットの管理画面から行います。
+
+### Docker の掃除候補
+
+```sh
+still docker --context colima --include-cache
+still docker --context colima --remove 'image:sha256:表示された完全なID'
+```
+
+停止中も含むコンテナから参照されていない、取得元の digest があるイメージを表示します。一時用途のコンテナは作成時の `still.disposable=true` ラベルで識別します。`--include-cache` はローカルの組み込みビルダーの古いキャッシュを表示します。削除は表示された個別 ID を対象にします。サイズは Docker 内の値です。
+
+### Library の既存ワークフロー
 
 安全にクリーンアップを行うための基本的な3ステップです。
 

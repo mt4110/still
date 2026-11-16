@@ -99,7 +99,7 @@ impl Vault {
                 .with_context(|| format!("Failed to parse meta for vault item: {}", id))?;
             out.push((id, meta));
         }
-        out.sort_by(|a, b| b.1.quarantined_at.cmp(&a.1.quarantined_at));
+        out.sort_by_key(|item| std::cmp::Reverse(item.1.quarantined_at));
         Ok(out)
     }
 
@@ -220,11 +220,14 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn copy_symlink(src: &Path, dest: &Path) -> Result<()> {
     let target = fs::read_link(src)?;
-    #[cfg(unix)]
     std::os::unix::fs::symlink(target, dest)?;
-    #[cfg(not(unix))]
-    anyhow::bail!("Symlink copy not supported on non-unix");
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(_src: &Path, _dest: &Path) -> Result<()> {
+    anyhow::bail!("Symlink copy not supported on non-unix")
 }

@@ -6,6 +6,7 @@ mod journal;
 mod lang;
 mod plan;
 mod policy;
+mod review;
 mod scan;
 mod scope;
 mod tui;
@@ -191,6 +192,9 @@ fn main() -> Result<()> {
             plan::io::save_plan(&plan, &args.out)?;
             println!("Plan saved to {:?}", args.out);
         }
+        Some(Commands::Review(args)) => review::run(args)?,
+        Some(Commands::Worktrees(args)) => review::worktrees::run(args)?,
+        Some(Commands::Docker(args)) => review::docker::run(args)?,
         Some(Commands::Tui(args)) => {
             println!("Starting TUI with plan: {:?}", args.plan);
             let mut app = tui::app::App::new(args.plan.clone())?;

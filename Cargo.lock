@@ -993,7 +993,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "still"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1006,6 +1006,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "ratatui",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -1013,6 +1014,7 @@ dependencies = [
  "toml",
  "trash",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
