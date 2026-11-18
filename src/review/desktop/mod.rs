@@ -51,6 +51,10 @@ fn configure_ui(ctx: &egui::Context) {
     visuals.selection.bg_fill = Color32::from_rgb(201, 234, 226);
     ctx.set_visuals(visuals);
     ctx.global_style_mut(|style| {
+        for font in style.text_styles.values_mut() {
+            font.size = (font.size + 2.0).max(14.0);
+        }
+        style.spacing.interact_size.y = 30.0;
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
         style.spacing.button_padding = egui::vec2(10.0, 6.0);
     });
@@ -71,6 +75,53 @@ fn configure_ui(ctx: &egui::Context) {
         }
         ctx.set_fonts(fonts);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn open_in_finder(path: &Path) -> Result<()> {
+    anyhow::ensure!(path.is_absolute(), "Expected an absolute path");
+    let metadata = std::fs::symlink_metadata(path)?;
+    let mut command = std::process::Command::new("/usr/bin/open");
+    if !metadata.is_dir() {
+        command.arg("-R");
+    }
+    anyhow::ensure!(
+        command.arg(path).status()?.success(),
+        "Finder could not open {}",
+        display(path)
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn finder_breadcrumb(ui: &mut egui::Ui, path: &Path, japanese: bool) -> Option<String> {
+    let mut error = None;
+    ui.horizontal_wrapped(|ui| {
+        let mut ancestors: Vec<_> = path
+            .ancestors()
+            .filter(|part| part.file_name().is_some())
+            .collect();
+        ancestors.reverse();
+        for (index, part) in ancestors.into_iter().enumerate() {
+            if index > 0 {
+                ui.label("/");
+            }
+            let name = part.file_name().unwrap_or_default().to_string_lossy();
+            let action = if japanese {
+                "Finder で開く"
+            } else {
+                "Open in Finder"
+            };
+            if ui
+                .link(name)
+                .on_hover_text(format!("{action} · {}", display(part)))
+                .clicked()
+            {
+                error = open_in_finder(part).err().map(|err| err.to_string());
+            }
+        }
+    });
+    error
 }
 
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
@@ -122,6 +173,7 @@ enum Outcome {
     #[cfg(target_os = "macos")]
     SdkRemoval(Result<super::sdk_cleanup::Receipt>),
     Review(Result<Confirmation>),
+    Inspection(Vec<String>),
     Removal(Vec<String>),
 }
 
@@ -132,6 +184,7 @@ struct Job {
 }
 
 struct StaleFiles {
+    sort: crate::cli::StaleSort,
     root: Option<PathBuf>,
     days: u16,
     mib: u64,
@@ -143,6 +196,7 @@ struct StaleFiles {
 impl Default for StaleFiles {
     fn default() -> Self {
         Self {
+            sort: crate::cli::StaleSort::Size,
             root: None,
             days: 90,
             mib: 100,
@@ -174,6 +228,9 @@ struct App {
     rows: Vec<TableRow>,
     focused: Option<usize>,
     marked: BTreeSet<PathBuf>,
+    candidate_filter: String,
+    inspection: Option<Vec<String>>,
+    next_presence_check: Option<std::time::Instant>,
     confirmation: Option<Confirmation>,
     job: Option<Job>,
     save_as: Option<String>,
@@ -248,6 +305,7 @@ impl App {
             #[cfg(target_os = "macos")]
             Outcome::SdkRemoval(result) => self.sdk.receipt = Some(result),
             Outcome::Review(Ok(confirmation)) => self.confirmation = Some(confirmation),
+            Outcome::Inspection(report) => self.inspection = Some(report),
             Outcome::Removal(results) => {
                 self.removal_results = results;
                 self.refresh(ctx, false);
@@ -473,6 +531,11 @@ impl App {
                 }
             }
         }
+        if self.view == View::Candidates && !self.candidate_filter.is_empty() {
+            let needle = self.candidate_filter.to_lowercase();
+            self.rows
+                .retain(|row| row.name.to_lowercase().contains(&needle));
+        }
         self.rows
             .sort_by(|a, b| b.order.cmp(&a.order).then(a.name.cmp(&b.name)));
     }
@@ -482,14 +545,14 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("still").size(28.0).strong().color(ACCENT));
             ui.separator();
-            if ui.button("Find old files…").clicked() {
+            if ui.button("Find old files…").on_hover_text(if self.japanese_reasons { "ホーム内の古い大容量ファイルを探します。" } else { "Find large, older files in your home folder." }).clicked() {
                 self.show_stale_files = true;
             }
             #[cfg(target_os = "macos")]
-            if ui.button("App storage…").clicked() {
+            if ui.button("App storage…").on_hover_text(if self.japanese_reasons { "アプリのデータ・キャッシュ・SDK の版ごとの容量を確認します。" } else { "Inspect app data, caches, and installed SDK versions." }).clicked() {
                 self.show_app_storage = true;
             }
-            if ui.button("Add workspace…").clicked() {
+            if ui.button("Add workspace…").on_hover_text(if self.japanese_reasons { "調査する開発フォルダを選び、容量と掃除候補を表示します。" } else { "Choose a development folder to scan by size and review cleanup candidates." }).clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_folder() {
                     self.add_workspace(&ctx, path);
                 }
@@ -513,10 +576,12 @@ impl App {
                         self.open_profile(&ctx, name);
                     }
                 },
-            );
+            ).response.on_hover_text(if self.japanese_reasons { "保存した週次プロファイルを開いて、同じ範囲をスキャンします。" } else { "Open a saved weekly profile and scan its folders." });
             let scanned = self.scan.is_some();
             if ui
                 .add_enabled(scanned, egui::Button::new("Save as…"))
+                .on_disabled_hover_text(if self.japanese_reasons { "先に調査するフォルダを追加してください。" } else { "Add a workspace first." })
+                .on_hover_text(if self.japanese_reasons { "現在のフォルダと候補の設定を週次プロファイルとして保存します。" } else { "Save these folders and candidate sources as a weekly profile." })
                 .clicked()
             {
                 self.save_as = Some(String::new());
@@ -729,15 +794,34 @@ impl App {
                 self.rebuild();
             }
             ui.separator();
-            let input =
-                ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search paths"));
-            if ui.button("Search").clicked()
-                || (input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-            {
-                self.search(&ctx);
+            if self.view == View::Candidates {
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.candidate_filter)
+                            .hint_text("Filter candidates"),
+                    )
+                    .changed()
+                {
+                    self.marked.clear();
+                    self.rebuild();
+                }
+            } else {
+                let input =
+                    ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search paths"));
+                if ui.button("Search").clicked()
+                    || (input.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                {
+                    self.search(&ctx);
+                }
             }
         });
-        ui.horizontal(|ui| {
+        #[cfg(target_os = "macos")]
+        if self.view == View::Folders {
+            if let Some(error) = finder_breadcrumb(ui, &self.location, self.japanese_reasons) {
+                self.status = error;
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
             if self.view == View::Folders {
                 if let Some(parent) = self
                     .location
@@ -749,6 +833,7 @@ impl App {
                         self.rebuild();
                     }
                 }
+                #[cfg(not(target_os = "macos"))]
                 ui.label(display(&self.location));
             } else if self.view == View::Candidates {
                 ui.label(format!(
@@ -756,6 +841,22 @@ impl App {
                     self.rows.len(),
                     self.marked.len()
                 ));
+                if ui.button("Select all eligible")
+                    .on_hover_text("Select eligible folders matching this filter. An enclosing folder includes its nested candidates.")
+                    .clicked() {
+                    let paths: BTreeSet<_> = self.rows.iter().filter(|row| row.removable)
+                        .filter_map(|row| row.path.clone()).collect();
+                    self.marked = paths.iter().filter(|path|
+                        !path.ancestors().skip(1).any(|ancestor| paths.contains(ancestor)))
+                        .cloned().collect();
+                    let nested = paths.len() - self.marked.len();
+                    self.status = if nested > 0 {
+                        format!("{nested} nested candidates included in their selected folders")
+                    } else { String::new() };
+                }
+                if ui.add_enabled(!self.marked.is_empty(), egui::Button::new("Clear selection")).clicked() {
+                    self.marked.clear();
+                }
             } else if self.omitted_matches > 0 {
                 ui.label(format!(
                     "{} more matches. Narrow the search to see them.",
@@ -798,14 +899,55 @@ impl App {
         }
         self.table(ui);
         if self.view == View::Candidates {
-            let button = egui::Button::new(format!("Review {} selected…", self.marked.len()));
-            if ui.add_enabled(!self.marked.is_empty(), button).clicked() {
-                let paths = self.marked.iter().cloned().collect();
-                let policy = self.scan.as_ref().unwrap().policy.clone();
-                self.spawn(&ctx, "Checking selected outputs…", false, move || {
-                    Outcome::Review(Confirmation::prepare(policy, paths))
-                });
-            }
+            ui.horizontal_wrapped(|ui| self.candidate_actions(ui, &ctx));
+        }
+    }
+
+    fn candidate_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let focused = self
+            .focused
+            .and_then(|index| self.rows.get(index))
+            .and_then(|row| row.path.as_ref());
+        let inspect_count = if self.marked.is_empty() {
+            usize::from(focused.is_some())
+        } else {
+            self.marked.len()
+        };
+        let inspect = egui::Button::new(format!("Scan {inspect_count} selected…"));
+        if ui.add_enabled(inspect_count > 0, inspect)
+            .on_hover_text("Inspect selected folders for tracked files, protected content and build output. Read only.")
+            .clicked()
+        {
+            let paths: Vec<_> = if self.marked.is_empty() {
+                focused.cloned().into_iter().collect()
+            } else {
+                self.marked.iter().cloned().collect()
+            };
+            let policy = self.scan.as_ref().unwrap().policy.clone();
+            let japanese = self.japanese_reasons;
+            self.spawn(ctx, "Inspecting selected folders…", false, move || {
+                let mut report = Vec::with_capacity(paths.len());
+                for path in paths {
+                    let detail = match policy.prepare(&path) {
+                        Ok(item) => {
+                            let (en, ja) = item.producer.explanation();
+                            let reason = if japanese { ja } else { en };
+                            format!("{} files · {} logical · {reason}", item.files(), bytes(item.logical_bytes()))
+                        }
+                        Err(err) => Message::from_error(&err).text(japanese).to_owned(),
+                    };
+                    report.push(format!("{} · {detail}", display(&path)));
+                }
+                Outcome::Inspection(report)
+            });
+        }
+        let review = egui::Button::new(format!("Review {} selected…", self.marked.len()));
+        if ui.add_enabled(!self.marked.is_empty(), review).clicked() {
+            let paths = self.marked.iter().cloned().collect();
+            let policy = self.scan.as_ref().unwrap().policy.clone();
+            self.spawn(ctx, "Checking selected outputs…", false, move || {
+                Outcome::Review(Confirmation::prepare(policy, paths))
+            });
         }
     }
 
@@ -849,12 +991,43 @@ impl App {
         });
         ui.separator();
         let mut enter = None;
+        let mut missing = BTreeSet::new();
+        let check_active = candidates
+            && self.job.is_none()
+            && self.confirmation.is_none()
+            && self.inspection.is_none()
+            && !self.show_app_storage
+            && !self.show_stale_files
+            && ui.ctx().input(|input| input.focused);
+        let now = std::time::Instant::now();
+        let check_visible = if check_active {
+            let interval = std::time::Duration::from_secs(10);
+            let deadline = self.next_presence_check.get_or_insert(now);
+            let due = *deadline <= now;
+            if due {
+                *deadline = now + interval;
+            }
+            ui.ctx()
+                .request_repaint_after(deadline.saturating_duration_since(now));
+            due
+        } else {
+            false
+        };
         egui::ScrollArea::vertical()
             .id_salt("workspace-rows")
             .max_height((ui.available_height() - 132.0).max(110.0))
             .show_rows(ui, 26.0, self.rows.len(), |ui, range| {
                 for index in range {
                     let row = &self.rows[index];
+                    if check_visible {
+                        if let Some(path) = &row.path {
+                            if std::fs::symlink_metadata(path)
+                                .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+                            {
+                                missing.insert(path.clone());
+                            }
+                        }
+                    }
                     ui.horizontal(|ui| {
                         if candidates {
                             if let Some(path) = row.path.as_ref().filter(|_| row.removable) {
@@ -905,10 +1078,31 @@ impl App {
                     });
                 }
             });
+        if !missing.is_empty() {
+            if let Some(scan) = &mut self.scan {
+                scan.files.retain(|file| !missing.contains(&file.row.path));
+            }
+            self.marked.retain(|path| !missing.contains(path));
+            self.rebuild();
+            ui.ctx().request_repaint();
+        }
         if let Some(row) = self.focused.and_then(|i| self.rows.get(i)) {
             ui.separator();
             if let Some(path) = &row.path {
                 ui.label(display(path));
+                #[cfg(target_os = "macos")]
+                if ui
+                    .button(if self.japanese_reasons {
+                        "Finder で開く"
+                    } else {
+                        "Open in Finder"
+                    })
+                    .clicked()
+                {
+                    if let Err(error) = open_in_finder(path) {
+                        self.status = error.to_string();
+                    }
+                }
             } else {
                 ui.label(&row.name);
             }
@@ -981,18 +1175,47 @@ impl App {
                 }
             }
         }
+        if let Some(report) = &self.inspection {
+            let mut close = false;
+            let dialog = egui::Modal::new(egui::Id::new("inspection")).show(ctx, |ui| {
+                ui.set_width((ctx.content_rect().width() - 80.0).clamp(560.0, 940.0));
+                ui.heading("Selected folder scan");
+                egui::ScrollArea::vertical().max_height(320.0).show_rows(
+                    ui,
+                    28.0,
+                    report.len(),
+                    |ui, range| {
+                        for line in &report[range] {
+                            ui.add(egui::Label::new(line).truncate())
+                                .on_hover_text(line);
+                        }
+                    },
+                );
+                close = ui.button("Close").clicked();
+            });
+            if close || dialog.should_close() {
+                self.inspection = None;
+            }
+        }
         if let Some(confirmation) = &self.confirmation {
             let mut delete = false;
             let mut close = false;
             let dialog = egui::Modal::new(egui::Id::new("delete-review")).show(ctx, |ui| {
                 ui.set_min_width(500.0);
-                ui.heading("Delete these folders permanently?");
+                ui.heading(format!(
+                    "Delete {} folders permanently?",
+                    confirmation.items().len()
+                ));
                 ui.label("These folders will be removed immediately when you confirm.");
-                egui::ScrollArea::vertical()
-                    .max_height(235.0)
-                    .show(ui, |ui| {
-                        for item in confirmation.items() {
-                            ui.label(display(&item.path));
+                egui::ScrollArea::vertical().max_height(235.0).show_rows(
+                    ui,
+                    58.0,
+                    confirmation.items().len(),
+                    |ui, range| {
+                        for item in &confirmation.items()[range] {
+                            let path = display(&item.path);
+                            ui.add(egui::Label::new(&path).truncate())
+                                .on_hover_text(path);
                             ui.label(format!(
                                 "{} files · {} logical · {}",
                                 item.files(),
@@ -1001,7 +1224,8 @@ impl App {
                             ));
                             ui.separator();
                         }
-                    });
+                    },
+                );
                 ui.horizontal(|ui| {
                     close = ui.button("Cancel").clicked();
                     delete = ui
@@ -1140,6 +1364,17 @@ impl App {
                     ui.add(egui::DragValue::new(&mut state.mib).range(1..=1_000_000));
                     start = ui.button("Scan").clicked();
                 });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Sort by");
+                    use crate::cli::StaleSort;
+                    for (order, label) in [(StaleSort::Size, "Largest"), (StaleSort::Modified, "Oldest modified"), (StaleSort::Created, "Oldest created")] {
+                        if ui.selectable_value(&mut state.sort, order, label).changed() {
+                            if let Some(report) = &mut state.report {
+                                report.set_order(order);
+                            }
+                        }
+                    }
+                });
             });
             if busy {
                 ui.spinner();
@@ -1153,7 +1388,7 @@ impl App {
                     report.root, report.candidates.len() + report.omitted, report.unknown_age, report.skipped
                 ));
                 if report.omitted > 0 {
-                    ui.label("Showing the 100 largest results. Choose a smaller folder to narrow the scan.");
+                    ui.label("Showing the first 100 matches in the selected order.");
                 }
                 if !report.candidates.is_empty() {
                     ui.add(egui::TextEdit::singleline(&mut state.query).hint_text("Filter results by path"));
@@ -1163,7 +1398,7 @@ impl App {
                             query.is_empty() || row.path.to_lowercase().contains(&query)
                         }) {
                             ui.label(RichText::new(&row.path).strong());
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 let open = match row.open_state {
                                     "currently_open" => "Open in a process",
                                     "not_seen_open" => "No open process found",
@@ -1171,14 +1406,21 @@ impl App {
                                     _ => "Open processes unchecked",
                                 };
                                 ui.label(format!(
-                                    "{} logical  ·  Latest activity {}  ·  Modified {}  ·  Accessed {}  ·  {}",
+                                    "{} logical  ·  Latest activity {}  ·  Modified {}  ·  Created {}  ·  Accessed {}  ·  {}",
                                     bytes(row.logical_bytes),
                                     stale::date(Some(row.last_activity_at)),
                                     stale::date(row.modified_at),
+                                    stale::date(row.created_at),
                                     stale::date(row.accessed_at),
                                     open
                                 ));
-                                if ui.small_button("Copy path").clicked() {
+                                #[cfg(target_os = "macos")]
+                                if ui.button(if self.japanese_reasons { "Finder で表示" } else { "Show in Finder" }).clicked() {
+                                    if let Err(err) = open_in_finder(&row.native_path) {
+                                        state.error = err.to_string();
+                                    }
+                                }
+                                if ui.button("Copy path").clicked() {
                                     ctx.copy_text(row.path.clone());
                                 }
                             });
@@ -1194,12 +1436,12 @@ impl App {
             self.show_stale_files = false;
         }
         if start {
-            let (root, days, mib) = (state.root.clone(), state.days, state.mib);
+            let (root, days, mib, sort) = (state.root.clone(), state.days, state.mib, state.sort);
             state.report = None;
             state.error.clear();
             state.query.clear();
             self.spawn(ctx, "Looking for old files…", false, move || {
-                Outcome::Stale(stale::scan(root.as_deref(), days, mib))
+                Outcome::Stale(stale::scan(root.as_deref(), days, mib, sort))
             });
         }
     }

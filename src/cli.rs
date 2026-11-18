@@ -47,6 +47,14 @@ pub struct AppStorageArgs {
     pub format: ListFormat,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Default, Debug, Eq, PartialEq)]
+pub enum StaleSort {
+    #[default]
+    Size,
+    Modified,
+    Created,
+}
+
 #[derive(Args, Debug)]
 pub struct StaleArgs {
     /// Directory to inspect (defaults to your home directory).
@@ -56,6 +64,9 @@ pub struct StaleArgs {
     pub older_than_days: u16,
     #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
     pub min_mib: u64,
+    /// Rank matches by largest size or oldest modification or creation date.
+    #[arg(long, value_enum, default_value_t = StaleSort::Size)]
+    pub sort: StaleSort,
     #[arg(long, value_enum, default_value_t = ListFormat::Text)]
     pub format: ListFormat,
 }

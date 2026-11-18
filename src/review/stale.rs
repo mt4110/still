@@ -1,10 +1,10 @@
 use super::{bytes, inventory};
-use crate::cli::{ListFormat, StaleArgs};
+use crate::cli::{ListFormat, StaleArgs, StaleSort};
 use anyhow::{bail, Context, Result};
 use ignore::{WalkBuilder, WalkState};
 use serde::Serialize;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Serialize)]
 pub(super) struct Candidate {
     pub path: String,
+    #[cfg(all(feature = "desktop", target_os = "macos"))]
+    #[serde(skip)]
+    pub native_path: PathBuf,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub modified_at: Option<chrono::DateTime<chrono::Utc>>,
     pub accessed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_activity_at: chrono::DateTime<chrono::Utc>,
@@ -25,14 +29,48 @@ pub(super) struct Candidate {
 pub(super) struct Report {
     pub root: String,
     pub candidates: Vec<Candidate>,
+    #[serde(skip)]
+    alternate_orders: [Vec<Candidate>; 3],
+    #[serde(skip)]
+    order: StaleSort,
     pub omitted: usize,
     pub skipped: usize,
     pub unknown_age: usize,
 }
 
-type Match = (Reverse<u64>, SystemTime, PathBuf, Dates);
+impl Report {
+    pub(super) fn set_order(&mut self, order: StaleSort) {
+        if order != self.order {
+            self.alternate_orders[self.order as usize] = std::mem::take(&mut self.candidates);
+            self.candidates = std::mem::take(&mut self.alternate_orders[order as usize]);
+            self.order = order;
+        }
+    }
+}
 
-#[derive(Eq, Ord, PartialEq, PartialOrd)]
+const ORDERS: [StaleSort; 3] = [StaleSort::Size, StaleSort::Modified, StaleSort::Created];
+
+// The heap evicts its greatest entry. Unknown dates sort after all known dates.
+type Match = (
+    (bool, Option<SystemTime>),
+    Reverse<u64>,
+    SystemTime,
+    PathBuf,
+    Dates,
+);
+
+impl StaleSort {
+    fn key(self, dates: &Dates) -> (bool, Option<SystemTime>) {
+        let date = match self {
+            Self::Size => return (false, None),
+            Self::Modified => dates.modified,
+            Self::Created => dates.created,
+        };
+        (date.is_none(), date)
+    }
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 struct Dates {
     modified: Option<SystemTime>,
     accessed: Option<SystemTime>,
@@ -58,20 +96,31 @@ fn meaningful_date(value: std::io::Result<SystemTime>) -> Option<SystemTime> {
 
 #[derive(Default)]
 struct Matches {
-    largest: BinaryHeap<Match>,
+    ranked: [BinaryHeap<Match>; 3],
     total: usize,
     skipped: usize,
     unknown_age: usize,
 }
 
-pub(super) fn scan(root: Option<&Path>, older_than_days: u16, min_mib: u64) -> Result<Report> {
+pub(super) fn scan(
+    root: Option<&Path>,
+    older_than_days: u16,
+    min_mib: u64,
+    sort: StaleSort,
+) -> Result<Report> {
     let home = directories::BaseDirs::new().context("Could not locate your home directory")?;
     let home = home.home_dir().canonicalize()?;
     let cutoff = SystemTime::now() - Duration::from_secs(u64::from(older_than_days) * 86_400);
-    scan_under(&home, root.unwrap_or(&home), cutoff, min_mib)
+    scan_under(&home, root.unwrap_or(&home), cutoff, min_mib, sort)
 }
 
-fn scan_under(home: &Path, root: &Path, cutoff: SystemTime, min_mib: u64) -> Result<Report> {
+fn scan_under(
+    home: &Path,
+    root: &Path,
+    cutoff: SystemTime,
+    min_mib: u64,
+    sort: StaleSort,
+) -> Result<Report> {
     let root = inventory::home_scan_dir(home, root)?;
     if root.strip_prefix(home)?.iter().any(excluded) {
         bail!("Choose a folder under your home directory outside hidden or Library directories");
@@ -125,53 +174,76 @@ fn scan_under(home: &Path, root: &Path, cutoff: SystemTime, min_mib: u64) -> Res
                 return WalkState::Continue;
             };
             if activity <= cutoff {
-                let row = (Reverse(metadata.len()), activity, entry.into_path(), dates);
                 let mut result = matches.lock().unwrap();
                 result.total += 1;
-                result.largest.push(row);
-                if result.largest.len() > 100 {
-                    result.largest.pop();
+                for (heap, order) in result.ranked.iter_mut().zip(ORDERS) {
+                    let key = order.key(&dates);
+                    let row = (
+                        key,
+                        Reverse(metadata.len()),
+                        activity,
+                        entry.path().to_owned(),
+                        dates,
+                    );
+                    if heap.len() < 100 {
+                        heap.push(row);
+                    } else if let Some(mut worst) = heap.peek_mut() {
+                        if row < *worst {
+                            *worst = row;
+                        }
+                    }
                 }
             }
             WalkState::Continue
         })
     });
     let Matches {
-        largest,
+        ranked,
         total,
         skipped,
         unknown_age,
     } = matches.into_inner().unwrap();
-    let candidates: Vec<_> = largest
-        .into_sorted_vec()
-        .into_iter()
-        .enumerate()
-        .map(
-            |(index, (Reverse(size), activity, path, dates))| Candidate {
+    let ranked = ranked.map(BinaryHeap::into_sorted_vec);
+    let open_states: HashMap<_, _> = ranked[sort as usize]
+        .iter()
+        .take(20)
+        .map(|(_, _, _, path, _)| (path.clone(), open_state(path.clone())))
+        .collect();
+    let mut alternate_orders = ranked.map(|rows| {
+        rows.into_iter()
+            .map(|(_, Reverse(size), activity, path, dates)| Candidate {
                 path: inventory::display(&path),
+                created_at: dates.created.map(Into::into),
                 modified_at: dates.modified.map(Into::into),
                 accessed_at: dates.accessed.map(Into::into),
                 last_activity_at: activity.into(),
                 logical_bytes: size,
-                open_state: if index < 20 {
-                    open_state(path)
-                } else {
-                    "not_checked"
-                },
-            },
-        )
-        .collect();
-    Ok(Report {
+                open_state: open_states.get(&path).copied().unwrap_or("not_checked"),
+                #[cfg(all(feature = "desktop", target_os = "macos"))]
+                native_path: path,
+            })
+            .collect()
+    });
+    let mut report = Report {
         root: inventory::display(&root),
-        omitted: total - candidates.len(),
-        candidates,
+        omitted: total.saturating_sub(100),
+        candidates: std::mem::take(&mut alternate_orders[StaleSort::Size as usize]),
+        alternate_orders,
+        order: StaleSort::Size,
         skipped,
         unknown_age,
-    })
+    };
+    report.set_order(sort);
+    Ok(report)
 }
 
 pub fn run(args: &StaleArgs) -> Result<()> {
-    let report = scan(args.root.as_deref(), args.older_than_days, args.min_mib)?;
+    let report = scan(
+        args.root.as_deref(),
+        args.older_than_days,
+        args.min_mib,
+        args.sort,
+    )?;
     match args.format {
         ListFormat::Json => println!("{}", serde_json::to_string(&report)?),
         ListFormat::Text => {
@@ -180,13 +252,14 @@ pub fn run(args: &StaleArgs) -> Result<()> {
                 report.root,
                 report.candidates.len() + report.omitted
             );
-            println!("        Size  Activity    Modified    Last access  Open check          Path");
+            println!("        Size  Activity    Modified    Created     Last access  Open check          Path");
             for row in &report.candidates {
                 println!(
-                    "{:>12}  {}  {:10}  {:11}  {:18}  {}",
+                    "{:>12}  {}  {:10}  {:10}  {:11}  {:18}  {}",
                     bytes(row.logical_bytes),
                     date(Some(row.last_activity_at)),
                     date(row.modified_at),
+                    date(row.created_at),
                     date(row.accessed_at),
                     row.open_state,
                     row.path
@@ -252,6 +325,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn date_sort_includes_matches_outside_the_largest_hundred() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let home = tmp.path().canonicalize()?;
+        for index in 0..101 {
+            let file = fs::File::create(home.join(format!("file-{index}")))?;
+            file.set_len(index + 1)?;
+            file.set_modified(UNIX_EPOCH + Duration::from_secs(86_400 * (index + 2)))?;
+        }
+        let mut report = scan_under(
+            &home,
+            &home,
+            SystemTime::now() + Duration::from_secs(60),
+            0,
+            StaleSort::Size,
+        )?;
+        assert_eq!(report.omitted, 1);
+        assert_eq!(report.candidates[0].logical_bytes, 101);
+        report.set_order(StaleSort::Modified);
+        assert_eq!(report.candidates[0].logical_bytes, 1);
+        report.set_order(StaleSort::Created);
+        assert_eq!(report.candidates.len(), 100);
+        let dates: Vec<_> = report
+            .candidates
+            .iter()
+            .filter_map(|row| row.created_at)
+            .collect();
+        assert!(dates.windows(2).all(|pair| pair[0] <= pair[1]));
+        report.set_order(StaleSort::Size);
+        assert_eq!(report.candidates[0].logical_bytes, 101);
+        Ok(())
+    }
+
+    #[test]
     fn scans_only_old_visible_files_in_scope_and_keeps_largest_first() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let home = tmp.path().canonicalize()?.join("home");
@@ -278,11 +384,11 @@ mod tests {
                 file.set_times(fs::FileTimes::new().set_accessed(new))?;
             }
         }
-        let report = scan_under(&home, &home, cutoff, 1)?;
+        let report = scan_under(&home, &home, cutoff, 1, StaleSort::Size)?;
         let sizes: Vec<_> = report.candidates.iter().map(|r| r.logical_bytes).collect();
         assert_eq!(sizes, [3 * 1024 * 1024, 2 * 1024 * 1024]);
-        assert!(scan_under(&home, tmp.path(), cutoff, 1).is_err());
-        assert!(scan_under(&home, &home.join("Library"), cutoff, 1).is_err());
+        assert!(scan_under(&home, tmp.path(), cutoff, 1, StaleSort::Size).is_err());
+        assert!(scan_under(&home, &home.join("Library"), cutoff, 1, StaleSort::Size).is_err());
         assert_eq!(meaningful_date(Ok(UNIX_EPOCH)), None);
         assert_eq!(
             meaningful_date(Ok(UNIX_EPOCH + Duration::from_secs(1))),

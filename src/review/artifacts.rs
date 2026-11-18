@@ -465,16 +465,25 @@ fn walk_tree(
 }
 
 pub fn verify_staged(tree: &Tree, payload: &Path) -> Result<()> {
-    let mut expected_entries = tree.entries.clone();
-    let mut staged = stamp_tree(payload)?.entries;
-    // Same-volume rename can change the directory's ctime, while child stamps must agree.
-    let root = Path::new("");
-    if let (Some(expected), Some(actual)) = (expected_entries.get_mut(root), staged.get_mut(root)) {
-        expected.changed = (0, 0);
-        actual.changed = (0, 0);
-    }
-    if expected_entries != staged {
-        bail!("The staged output differs from what was reviewed");
+    let mut seen = 0;
+    walk_tree(payload, |entry, relative, metadata| {
+        let expected = tree
+            .entries
+            .get(relative)
+            .context("An unreviewed entry appeared in staging")?;
+        let mut actual = filesystem::stamp(entry, metadata)?;
+        if relative.as_os_str().is_empty() {
+            // Moving the root into staging can change its ctime.
+            actual.changed = expected.changed;
+        }
+        if actual != *expected {
+            bail!("The staged output differs from what was reviewed");
+        }
+        seen += 1;
+        Ok(())
+    })?;
+    if seen != tree.entries.len() {
+        bail!("A reviewed entry is missing from staging");
     }
     Ok(())
 }

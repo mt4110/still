@@ -93,20 +93,18 @@ impl Confirmation {
         if paths.is_empty() {
             bail!("Choose a generated folder to review.");
         }
-        let mut items: Vec<artifacts::Prepared> = Vec::new();
-        for path in paths {
-            let item = policy
-                .prepare(&path)
-                .map_err(|err| anyhow::anyhow!("{}: {err:#}", display(&path)))?;
-            if items.iter().any(|existing| {
-                item.path.starts_with(&existing.path) || existing.path.starts_with(&item.path)
-            }) {
-                bail!(
-                    "Select one folder when candidates overlap: {}",
-                    display(&item.path)
-                );
-            }
-            items.push(item);
+        let items = run_in_pairs(&paths, |path| {
+            policy.prepare(path).with_context(|| display(path))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+        let mut ordered: Vec<_> = items.iter().map(|item| &item.path).collect();
+        ordered.sort_unstable();
+        if let Some(pair) = ordered.windows(2).find(|pair| pair[1].starts_with(pair[0])) {
+            bail!(
+                "Select one folder when candidates overlap: {}",
+                display(pair[1])
+            );
         }
         Ok(Self { policy, items })
     }
@@ -116,17 +114,29 @@ impl Confirmation {
     }
 
     pub fn remove(self) -> Vec<String> {
-        self.items
-            .into_iter()
-            .map(|item| {
-                let label = display(&item.path);
-                match self.policy.remove(&item) {
-                    Ok(()) => format!("Deleted {label}"),
-                    Err(err) => format!("{label}: {err:#}"),
-                }
-            })
-            .collect()
+        run_in_pairs(&self.items, |item| {
+            let label = display(&item.path);
+            match self.policy.remove(item) {
+                Ok(()) => format!("Deleted {label}"),
+                Err(err) => format!("{label}: {err:#}"),
+            }
+        })
     }
+}
+
+// The calling thread already runs off the UI thread. Add at most one more I/O
+// worker, and keep receipts in selection order even if the second half finishes first.
+fn run_in_pairs<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if items.len() < 2 {
+        return items.iter().map(work).collect();
+    }
+    let (left, right) = items.split_at(items.len().div_ceil(2));
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| right.iter().map(&work).collect::<Vec<_>>());
+        let mut results: Vec<_> = left.iter().map(&work).collect();
+        results.extend(worker.join().expect("cleanup worker"));
+        results
+    })
 }
 
 pub(super) fn display(path: &Path) -> String {
@@ -155,6 +165,34 @@ pub(super) fn usage(usage: &inventory::Usage) -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn bulk_removal_rechecks_each_output_and_keeps_result_order() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let outputs = ["a", "b", "c"].map(|name| root.join(name));
+        for output in &outputs {
+            fs::create_dir(output)?;
+            fs::write(output.join("artifact.bin"), b"generated")?;
+        }
+        let policy = Arc::new(artifacts::Policy {
+            roots: vec![root],
+            outputs: outputs.to_vec(),
+            docker_context: None,
+        });
+        let confirmation = Confirmation::prepare(policy, outputs.to_vec())?;
+        fs::write(outputs[1].join("artifact.bin"), b"changed after approval")?;
+        let results = confirmation.remove();
+        assert!(results[0].starts_with("Deleted "));
+        assert!(results[1].contains("changed after review"));
+        assert!(results[2].starts_with("Deleted "));
+        assert!(!outputs[0].exists() && !outputs[2].exists());
+        assert_eq!(
+            fs::read(outputs[1].join("artifact.bin"))?,
+            b"changed after approval"
+        );
+        Ok(())
+    }
 
     #[test]
     fn preview_leaves_files_intact_and_stale_review_blocks_deletion() -> Result<()> {
