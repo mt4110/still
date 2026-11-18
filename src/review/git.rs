@@ -71,7 +71,13 @@ pub fn protect_tracked(path: &Path, explicitly_declared: bool) -> Result<()> {
     let relative = path.strip_prefix(&repo)?;
     // A case-insensitive filesystem can resolve a tracked path under a different spelling.
     let mut pathspec = OsString::from(":(top,icase,literal)");
-    pathspec.push(relative);
+    // Git pathspecs use forward slashes, including on Windows.
+    for (index, component) in relative.components().enumerate() {
+        if index > 0 {
+            pathspec.push("/");
+        }
+        pathspec.push(component.as_os_str());
+    }
     let args = [OsStr::new("ls-files"), OsStr::new("-z"), OsStr::new("--")];
     if !check(
         run(&repo, args.into_iter().chain([pathspec.as_os_str()]))?,
