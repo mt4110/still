@@ -11,15 +11,36 @@ env:
 
 jobs:
   build:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
-    - name: Run clippy
-      run: cargo clippy -- -D warnings
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy, rustfmt
     - name: Check format
-      run: cargo fmt -- --check
+      run: cargo fmt --all -- --check
+    - name: Test CLI
+      run: cargo test --locked --verbose
+    - name: Build
+      run: cargo build --locked --release --features desktop --bins
+    - name: Run tests
+      run: cargo test --locked --features desktop --verbose
+    - name: Run clippy
+      run: cargo clippy --locked --all-targets --features desktop -- -D warnings
+    - name: Package Apple Silicon app
+      if: runner.os == 'macOS'
+      run: |
+        scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.2.0 target/still.app
+        ditto -c -k --sequesterRsrc --keepParent target/still.app target/still-macos-arm64.zip
+    - name: Upload Apple Silicon app
+      if: runner.os == 'macOS'
+      uses: actions/upload-artifact@v4
+      with:
+        name: still-macos-arm64
+        path: target/still-macos-arm64.zip
+        if-no-files-found: error

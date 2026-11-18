@@ -14,10 +14,20 @@ pub enum Commands {
     Scan(ScanArgs),
     #[command(about = "Explore storage and review generated output for cleanup")]
     Review(ReviewArgs),
+    #[command(about = "Open the desktop workspace explorer")]
+    Gui(DesktopArgs),
     #[command(about = "Review disposable Git worktrees integrated into the main branch")]
     Worktrees(WorktreeArgs),
     #[command(about = "Review unused Docker resources on an explicitly selected local context")]
     Docker(DockerArgs),
+    #[command(
+        about = "Review finished Jobs and Pods on an explicitly selected local Kubernetes or K3s context"
+    )]
+    Kube(KubeArgs),
+    #[command(about = "Find large, unmodified files under your home directory for manual review")]
+    Stale(StaleArgs),
+    #[command(about = "Review Mac app storage, SDK versions, caches, and protected data")]
+    AppStorage(AppStorageArgs),
     #[command(about = crate::lang::text().tui)]
     Tui(TuiArgs),
     #[command(about = crate::lang::text().apply)]
@@ -26,6 +36,47 @@ pub enum Commands {
     Vault(VaultArgs),
     #[command(about = crate::lang::text().init)]
     Init,
+}
+
+#[derive(Args, Debug)]
+pub struct AppStorageArgs {
+    /// Also ask Xcode for its installed simulator runtime inventory.
+    #[arg(long)]
+    pub xcode_runtimes: bool,
+    #[arg(long, value_enum, default_value_t = ListFormat::Text)]
+    pub format: ListFormat,
+}
+
+#[derive(Args, Debug)]
+pub struct StaleArgs {
+    /// Directory to inspect (defaults to your home directory).
+    #[arg(long)]
+    pub root: Option<PathBuf>,
+    #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u16).range(1..=3650))]
+    pub older_than_days: u16,
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
+    pub min_mib: u64,
+    #[arg(long, value_enum, default_value_t = ListFormat::Text)]
+    pub format: ListFormat,
+}
+
+#[derive(Args, Debug)]
+pub struct KubeArgs {
+    #[arg(long)]
+    pub kubeconfig: PathBuf,
+    #[arg(long)]
+    pub context: String,
+    #[arg(long)]
+    pub namespace: String,
+    #[arg(long, value_enum, default_value_t = ListFormat::Text)]
+    pub format: ListFormat,
+}
+
+#[derive(Args, Debug)]
+pub struct DesktopArgs {
+    /// Open a saved weekly review profile.
+    #[arg(long, value_name = "NAME")]
+    pub profile: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -77,7 +128,16 @@ pub struct WorktreeArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("review_roots").args(["roots", "cleanup_roots"]).multiple(true)))]
 pub struct ReviewArgs {
+    /// Load saved review roots and cleanup settings.
+    #[arg(long, value_name = "NAME", conflicts_with_all = ["save_profile", "roots", "cleanup_roots", "outputs", "docker_context", "docker_cache", "git_repos", "git_base", "kubeconfig", "kube_context", "kube_namespace"])]
+    pub profile: Option<String>,
+
+    /// Save the specified roots and cleanup settings as a named profile.
+    #[arg(long, value_name = "NAME", requires = "review_roots")]
+    pub save_profile: Option<String>,
+
     /// Directory to explore. Defaults to the cleanup roots or the current directory.
     #[arg(long = "root")]
     pub roots: Vec<PathBuf>,
@@ -90,9 +150,29 @@ pub struct ReviewArgs {
     #[arg(long = "output", requires = "cleanup_roots")]
     pub outputs: Vec<PathBuf>,
 
-    /// Protect bind mounts referenced by containers on this local Docker context.
+    /// Show Docker candidates and protect bind mounts on this local context.
     #[arg(long, requires = "cleanup_roots")]
     pub docker_context: Option<String>,
+
+    /// Include the selected Docker context's local BuildKit cache in the review.
+    #[arg(long, requires = "docker_context")]
+    pub docker_cache: bool,
+
+    /// Primary Git checkout whose linked worktrees should appear in the review.
+    #[arg(long = "git-repo", requires = "cleanup_roots")]
+    pub git_repos: Vec<PathBuf>,
+
+    /// Integration ref for the selected Git repositories (default: refs/heads/main).
+    #[arg(long, requires = "git_repos")]
+    pub git_base: Option<String>,
+
+    /// Read-only Kubernetes source, with an explicit context and namespace.
+    #[arg(long, requires_all = ["kube_context", "kube_namespace"])]
+    pub kubeconfig: Option<PathBuf>,
+    #[arg(long, requires = "kubeconfig")]
+    pub kube_context: Option<String>,
+    #[arg(long, requires = "kubeconfig")]
+    pub kube_namespace: Option<String>,
 
     /// Search recursively for a case-insensitive substring of a path.
     #[arg(long)]
@@ -197,4 +277,45 @@ pub enum VaultCommands {
         #[arg(long, help = crate::lang::text().vault_purge_expired)]
         expired: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::{error::ErrorKind, Parser};
+
+    #[test]
+    fn saving_review_profile_requires_an_explicit_scope() {
+        let error =
+            Cli::try_parse_from(["still", "review", "--save-profile", "weekly"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+
+        assert!(Cli::try_parse_from([
+            "still",
+            "review",
+            "--save-profile",
+            "weekly",
+            "--root",
+            "source",
+            "--cleanup-root",
+            "builds",
+            "--format",
+            "json",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn review_profile_scope_cannot_be_overridden() {
+        let error = Cli::try_parse_from([
+            "still",
+            "review",
+            "--profile",
+            "weekly",
+            "--cleanup-root",
+            "somewhere-else",
+        ])
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+    }
 }

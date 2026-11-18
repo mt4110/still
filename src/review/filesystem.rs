@@ -20,12 +20,16 @@ pub fn identity(_: &Path, metadata: &Metadata) -> Result<Identity> {
 
 #[cfg(windows)]
 pub fn identity(path: &Path, _: &Metadata) -> Result<Identity> {
+    windows_identity(&open_windows(path, true, false)?)
+}
+
+#[cfg(windows)]
+fn windows_identity(handle: &std::fs::File) -> Result<Identity> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
     };
 
-    let handle = open_windows(path, true)?;
     let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
     // The handle stays open and the API initializes the struct on success.
     if unsafe { GetFileInformationByHandle(handle.as_raw_handle(), info.as_mut_ptr()) } == 0 {
@@ -38,42 +42,135 @@ pub fn identity(path: &Path, _: &Metadata) -> Result<Identity> {
     })
 }
 
-#[cfg(unix)]
-pub fn changed(metadata: &Metadata) -> (i64, i64) {
-    use std::os::unix::fs::MetadataExt;
-    (metadata.ctime(), metadata.ctime_nsec())
+pub fn stamp(path: &Path, metadata: &Metadata) -> Result<artifacts::Stamp> {
+    #[cfg(unix)]
+    let (identity, changed) = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            identity(path, metadata)?,
+            (metadata.ctime(), metadata.ctime_nsec()),
+        )
+    };
+
+    #[cfg(windows)]
+    let (metadata, identity, changed, contents) = {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+        };
+
+        let mut handle = open_windows(path, true, metadata.is_file())?;
+        let current = handle.metadata()?;
+        if current.is_dir() != metadata.is_dir() || current.is_file() != metadata.is_file() {
+            bail!("Entry type changed after inspection: {path:?}");
+        }
+        let mut basic = std::mem::MaybeUninit::<FILE_BASIC_INFO>::uninit();
+        // The handle stays open and a successful query initializes the buffer.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                handle.as_raw_handle(),
+                FileBasicInfo,
+                basic.as_mut_ptr().cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let basic = unsafe { basic.assume_init() };
+        // NTFS can report identical timestamps for successive same-size writes.
+        // Hash regular files only when reviewing or applying a selection.
+        let contents = if current.is_file() {
+            Some(windows_contents(&mut handle, current.len())?)
+        } else {
+            None
+        };
+        (
+            current,
+            windows_identity(&handle)?,
+            (basic.ChangeTime, i64::from(basic.FileAttributes)),
+            contents,
+        )
+    };
+
+    Ok(artifacts::Stamp {
+        identity,
+        is_dir: metadata.is_dir(),
+        len: metadata.len(),
+        modified: metadata.modified()?,
+        changed,
+        #[cfg(windows)]
+        contents,
+    })
 }
 
 #[cfg(windows)]
-pub fn changed(metadata: &Metadata) -> (i64, i64) {
-    use std::os::windows::fs::MetadataExt;
-    (
-        metadata.creation_time() as i64,
-        i64::from(metadata.file_attributes()),
-    )
+fn windows_contents(file: &mut std::fs::File, mut len: u64) -> Result<u64> {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+    use std::io::Read;
+    use std::sync::LazyLock;
+
+    // Review stamps are compared only within the process that created them.
+    static KEY: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+    let mut hash = KEY.build_hasher();
+    let mut buffer = [0u8; 64 * 1024];
+    while len != 0 {
+        let count = len.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..count])?;
+        hash.write(&buffer[..count]);
+        len -= count as u64;
+    }
+    Ok(hash.finish())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn ensure_not_open(path: &Path) -> Result<()> {
     use std::process::{Command, Stdio};
-    let output = Command::new("/usr/sbin/lsof")
+    #[cfg(target_os = "macos")]
+    let lsof = "/usr/sbin/lsof";
+    #[cfg(target_os = "linux")]
+    let lsof = "lsof";
+    let output = Command::new(lsof)
         .args(["-nP", "-t", "+D"])
         .arg(path)
         .stdin(Stdio::null())
-        .output()?;
+        .output()
+        .context(super::message::Message::new(
+            "Could not check for open files with lsof",
+            "ファイルが使用中か確認できませんでした。",
+        ))?;
     if !output.stdout.is_empty() {
-        bail!("A process has files open in this output");
+        return Err(super::message::Message::new(
+            "A process has files open in this output",
+            "別のアプリや処理がフォルダ内のファイルを使用中です。終了してから再確認してください。",
+        )
+        .into());
     }
     if output.status.code() != Some(1) || !output.stderr.is_empty() {
-        bail!("Could not verify open files with lsof");
+        return Err(super::message::Message::new(
+            "Could not verify open files with lsof",
+            "ファイルが使用中か確認できませんでした。",
+        )
+        .into());
     }
     Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn ensure_not_open(_: &Path) -> Result<()> {
     // Windows additionally enforces file sharing modes during move and removal.
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub fn mount_id(path: &Path) -> Result<u64> {
+    use rustix::fs::{statx, AtFlags, StatxFlags, CWD};
+
+    let stat = statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::MNT_ID)?;
+    if stat.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+        bail!("Could not verify the Linux mount boundary: {path:?}");
+    }
+    Ok(stat.stx_mnt_id)
 }
 
 #[cfg(unix)]
@@ -201,6 +298,15 @@ fn remove_tree(
     }
     let kind = FileType::from_raw_mode(stat.st_mode);
     if expected.is_dir && kind == FileType::Directory {
+        #[cfg(target_os = "linux")]
+        let directory = fs::openat2(
+            parent,
+            name,
+            flags,
+            Mode::empty(),
+            fs::ResolveFlags::NO_XDEV | fs::ResolveFlags::NO_SYMLINKS,
+        )?;
+        #[cfg(not(target_os = "linux"))]
         let directory = fs::openat(parent, name, flags, Mode::empty())?;
         if stat_identity(&fs::fstat(&directory)?) != expected.identity {
             bail!("Staged directory was replaced: {relative:?}");
@@ -248,17 +354,17 @@ fn remove_tree(
 }
 
 #[cfg(windows)]
-fn open_windows(path: &Path, allow_move: bool) -> Result<std::fs::File> {
+fn open_windows(path: &Path, allow_move: bool, read_contents: bool) -> Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_DATA,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
+    let write = if read_contents { 0 } else { FILE_SHARE_WRITE };
+    let delete = if allow_move { FILE_SHARE_DELETE } else { 0 };
     let handle = std::fs::OpenOptions::new()
-        .access_mode(0)
-        .share_mode(
-            FILE_SHARE_READ | FILE_SHARE_WRITE | if allow_move { FILE_SHARE_DELETE } else { 0 },
-        )
+        .access_mode(if read_contents { FILE_READ_DATA } else { 0 })
+        .share_mode(FILE_SHARE_READ | write | delete)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     if inventory::is_link(&handle.metadata()?) {
@@ -275,7 +381,7 @@ pub fn remove_output(path: &Path, tree: &artifacts::Tree) -> Result<()> {
     // Keep every ancestor open without delete sharing during the operation.
     let _ancestors = parent
         .ancestors()
-        .map(|p| open_windows(p, false))
+        .map(|p| open_windows(p, false, false))
         .collect::<Result<Vec<_>>>()?;
     if identity(parent, &fs::symlink_metadata(parent)?)? != tree.parent {
         bail!("Output parent changed after review");
@@ -285,7 +391,7 @@ pub fn remove_output(path: &Path, tree: &artifacts::Tree) -> Result<()> {
     }
     let stage = parent.join(format!(".still-stage-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&stage)?;
-    let stage_guard = open_windows(&stage, false)?;
+    let stage_guard = open_windows(&stage, false, false)?;
     let note_path = stage.join("original-path.txt");
     let mut note = fs::OpenOptions::new()
         .create_new(true)

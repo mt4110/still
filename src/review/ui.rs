@@ -1,4 +1,4 @@
-use super::{artifacts, bytes, candidate_rows, filesystem, inventory};
+use super::{artifacts, bytes, candidates, filesystem, history, inventory};
 use crate::tui::app::{restore_terminal, setup_terminal};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -8,6 +8,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as TableRow, Table, TableState, Wrap};
 use ratatui::Terminal;
+use std::collections::{hash_map::Entry, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -25,16 +26,46 @@ enum Input {
     Search,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Sort {
+    Total,
+    Largest,
+    Growth,
+}
+
+struct ScanHistory {
+    store: history::History,
+    previous: HashMap<PathBuf, Option<history::Snapshot>>,
+}
+
+impl ScanHistory {
+    fn visit(&mut self, root: &Path, inventory: &Inventory, record: bool) -> Result<()> {
+        if let Entry::Vacant(entry) = self.previous.entry(root.to_owned()) {
+            entry.insert(self.store.previous(root)?);
+        }
+        if record {
+            self.store.record(root, inventory)?;
+        }
+        Ok(())
+    }
+}
+
 struct Explorer {
     roots: Vec<PathBuf>,
+    saved_roots: usize,
     root: usize,
     location: PathBuf,
     inventory: Inventory,
     policy: artifacts::Policy,
+    sources: candidates::Sources,
+    findings: Option<candidates::Findings>,
+    file_candidates: Option<Vec<artifacts::FileCandidate>>,
+    external_rows: Vec<candidates::DisplayRow>,
     threads: u16,
     view: View,
     input: Option<(Input, String)>,
-    largest: bool,
+    sort: Sort,
+    history: Option<ScanHistory>,
     rows: Vec<Row>,
     selection: TableState,
     approved: Vec<artifacts::Prepared>,
@@ -47,16 +78,23 @@ pub fn run(
     threads: u16,
     query: Option<String>,
     policy: artifacts::Policy,
+    history: Option<history::History>,
+    sources: candidates::Sources,
 ) -> Result<()> {
     let location = roots[0].clone();
     eprintln!("Scanning {}", display(&location));
     let inventory = inventory::scan(&location, threads, query.as_deref())?;
     let mut explorer = Explorer {
+        saved_roots: roots.len(),
         roots,
         root: 0,
         location,
         inventory,
         policy,
+        sources,
+        findings: None,
+        file_candidates: None,
+        external_rows: Vec::new(),
         threads,
         view: if query.is_some() {
             View::Search
@@ -64,15 +102,24 @@ pub fn run(
             View::Tree
         },
         input: None,
-        largest: false,
+        sort: Sort::Total,
+        history: history.map(|store| ScanHistory {
+            store,
+            previous: HashMap::new(),
+        }),
         rows: Vec::new(),
         selection: TableState::default(),
         approved: Vec::new(),
         results: Vec::new(),
         message: String::new(),
     };
-    explorer.update_rows();
     let mut terminal = setup_terminal()?;
+    if let Some(history) = &mut explorer.history {
+        if let Err(err) = history.visit(&explorer.location, &explorer.inventory, query.is_none()) {
+            explorer.message = format!("Scan history unavailable: {err:#}");
+        }
+    }
+    explorer.update_rows();
     let res = explorer.event_loop(&mut terminal);
     let restored = restore_terminal(&mut terminal);
     res.and(restored)
@@ -80,7 +127,7 @@ pub fn run(
 
 impl Explorer {
     fn update_rows(&mut self) {
-        self.rows = match self.view {
+        let mut rows = match self.view {
             View::Tree => self
                 .inventory
                 .directories
@@ -89,20 +136,81 @@ impl Explorer {
                 .cloned()
                 .collect(),
             View::Search => self.inventory.matches.clone(),
-            View::Candidates => candidate_rows(&self.inventory, &self.policy),
+            View::Candidates => self
+                .file_candidates
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|candidate| candidate.row.clone())
+                .collect(),
             View::Confirm | View::Results => Vec::new(),
         };
-        inventory::sort_rows(&mut self.rows, self.largest);
+        if self.sort == Sort::Growth && self.previous_scan().is_none() {
+            self.sort = Sort::Total;
+        }
+        if self.view == View::Candidates {
+            self.external_rows = self
+                .findings
+                .as_ref()
+                .map(|findings| findings.rows(&self.inventory))
+                .unwrap_or_default();
+        } else {
+            match self.sort {
+                Sort::Total | Sort::Largest => {
+                    inventory::sort_rows(&mut rows, self.sort == Sort::Largest)
+                }
+                Sort::Growth => rows.sort_unstable_by(|a, b| {
+                    let size = |row| self.delta(row).map(history::Delta::signed_bytes);
+                    size(b)
+                        .cmp(&size(a))
+                        .then_with(|| b.usage.size().cmp(&a.usage.size()))
+                        .then_with(|| a.path.cmp(&b.path))
+                }),
+            }
+        }
+        self.rows = rows;
         self.selection = TableState::default();
         if self.row_count() > 0 {
             self.selection.select(Some(0));
         }
     }
 
+    fn tracks_history(&self) -> bool {
+        self.root < self.saved_roots && self.history.is_some()
+    }
+
+    fn previous_scan(&self) -> Option<&history::Snapshot> {
+        if !self.tracks_history() {
+            return None;
+        }
+        self.history
+            .as_ref()?
+            .previous
+            .get(&self.roots[self.root])?
+            .as_ref()
+    }
+
+    fn delta(&self, row: &Row) -> Option<history::Delta> {
+        let previous = self.previous_scan()?;
+        let row = if self.view == View::Search && row.is_dir {
+            // Use the root-level inventory so hard-link attribution uses the same root.
+            let index = self
+                .inventory
+                .directories
+                .binary_search_by(|dir| dir.path.cmp(&row.path))
+                .ok()?;
+            &self.inventory.directories[index]
+        } else {
+            row
+        };
+        previous.delta(row)
+    }
+
     fn row_count(&self) -> usize {
         match self.view {
             View::Confirm => self.approved.len(),
             View::Results => self.results.len(),
+            View::Candidates => self.rows.len() + self.external_rows.len(),
             _ => self.rows.len(),
         }
     }
@@ -112,11 +220,19 @@ impl Explorer {
         self.update_rows();
     }
 
-    fn reload(&mut self, root: PathBuf) -> Result<()> {
+    fn reload(&mut self, root: PathBuf, saved_root: bool) -> Result<()> {
         let new_inventory = inventory::scan(&root, self.threads, None)?;
+        self.message.clear();
+        if saved_root {
+            if let Some(history) = &mut self.history {
+                if let Err(err) = history.visit(&root, &new_inventory, true) {
+                    self.message = format!("Scan history unavailable: {err:#}");
+                }
+            }
+        }
         self.location = root;
         self.inventory = new_inventory;
-        self.switch(View::Tree);
+        self.file_candidates = None;
         Ok(())
     }
 
@@ -143,6 +259,9 @@ impl Explorer {
                 KeyCode::PageUp => self.move_selection(-10),
                 KeyCode::PageDown => self.move_selection(10),
                 KeyCode::Esc if self.view != View::Tree => self.switch(View::Tree),
+                KeyCode::Char('r') if self.view == View::Candidates => {
+                    self.open_candidates(terminal, true)?;
+                }
                 KeyCode::Char('r') if self.view != View::Confirm => {
                     self.refresh(terminal, self.root)?;
                 }
@@ -152,11 +271,8 @@ impl Explorer {
                     self.apply();
                 }
                 _ if matches!(self.view, View::Confirm | View::Results) => {}
-                KeyCode::Tab => self.switch(if self.view == View::Candidates {
-                    View::Tree
-                } else {
-                    View::Candidates
-                }),
+                KeyCode::Tab if self.view == View::Candidates => self.switch(View::Tree),
+                KeyCode::Tab => self.open_candidates(terminal, false)?,
                 KeyCode::Enter => {
                     if let Some(row) = self.selected() {
                         self.location = if row.is_dir {
@@ -176,9 +292,29 @@ impl Explorer {
                 KeyCode::Char(']') => {
                     self.refresh(terminal, (self.root + 1) % self.roots.len())?;
                 }
-                KeyCode::Char('s') => {
-                    self.largest = !self.largest;
+                KeyCode::Char('s') if self.view != View::Candidates => {
+                    self.sort = match self.sort {
+                        Sort::Total => Sort::Largest,
+                        Sort::Largest if self.previous_scan().is_some() => Sort::Growth,
+                        Sort::Largest | Sort::Growth => Sort::Total,
+                    };
                     self.update_rows();
+                }
+                KeyCode::Char('f') if self.view == View::Candidates && !self.rows.is_empty() => {
+                    self.selection.select(Some(0));
+                }
+                KeyCode::Char(key @ ('g' | 'd' | 'K')) if self.view == View::Candidates => {
+                    let kind = match key {
+                        'g' => "Git",
+                        'K' => "Kubernetes",
+                        _ => "Docker",
+                    };
+                    if let Some(index) = self.external_rows.iter().position(|row| row.kind == kind)
+                    {
+                        self.selection.select(Some(self.rows.len() + index));
+                    } else {
+                        self.message = format!("No {kind} entries available");
+                    }
                 }
                 KeyCode::Char('o') => self.input = Some((Input::Root, String::new())),
                 KeyCode::Char('/') => self.input = Some((Input::Search, String::new())),
@@ -191,6 +327,24 @@ impl Explorer {
                 _ => {}
             }
         }
+    }
+
+    fn open_candidates<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        refresh: bool,
+    ) -> Result<()> {
+        if refresh || self.file_candidates.is_none() {
+            self.message = "Checking cleanup candidates…".into();
+            self.draw(terminal)?;
+            self.file_candidates = Some(artifacts::file_candidates(&self.inventory, &self.policy));
+            if self.sources.configured(&self.policy) && (refresh || self.findings.is_none()) {
+                self.findings = Some(self.sources.collect(&self.policy));
+            }
+        }
+        self.message.clear();
+        self.switch(View::Candidates);
+        Ok(())
     }
 
     fn handle_input<B: Backend>(&mut self, terminal: &mut Terminal<B>, key: KeyCode) -> Result<()> {
@@ -208,15 +362,15 @@ impl Explorer {
                 let value = std::mem::take(buffer);
                 self.input = None;
                 match mode {
-                    Input::Root => match std::fs::canonicalize(&value) {
+                    Input::Root => match inventory::workspace_dir(Path::new(&value)) {
                         Ok(root) => {
                             self.message = format!("Scanning {}", display(&root));
                             self.draw(terminal)?;
-                            match self.reload(root.clone()) {
+                            match self.reload(root.clone(), false) {
                                 Ok(()) => {
                                     self.roots.push(root);
                                     self.root = self.roots.len() - 1;
-                                    self.message.clear();
+                                    self.switch(View::Tree);
                                 }
                                 Err(err) => self.message = format!("{err:#}"),
                             }
@@ -226,7 +380,9 @@ impl Explorer {
                     Input::Search if !value.is_empty() => {
                         self.message = format!("Searching {}", display(&self.location));
                         self.draw(terminal)?;
-                        match inventory::scan(&self.location, self.threads, Some(&value)) {
+                        match inventory::workspace_dir(&self.location)
+                            .and_then(|root| inventory::scan(&root, self.threads, Some(&value)))
+                        {
                             Ok(scan) => {
                                 // The full inventory is kept for navigation back to the root.
                                 self.inventory.matches = scan.matches;
@@ -254,10 +410,10 @@ impl Explorer {
     fn refresh<B: Backend>(&mut self, terminal: &mut Terminal<B>, root: usize) -> Result<()> {
         self.message = format!("Scanning {}", display(&self.roots[root]));
         self.draw(terminal)?;
-        match self.reload(self.roots[root].clone()) {
+        match self.reload(self.roots[root].clone(), root < self.saved_roots) {
             Ok(()) => {
                 self.root = root;
-                self.message.clear();
+                self.switch(View::Tree);
             }
             Err(err) => self.message = format!("{err:#}"),
         }
@@ -266,6 +422,23 @@ impl Explorer {
 
     fn selected(&self) -> Option<&Row> {
         self.selection.selected().and_then(|i| self.rows.get(i))
+    }
+
+    fn selected_external(&self) -> Option<&candidates::DisplayRow> {
+        if self.view != View::Candidates {
+            return None;
+        }
+        let index = self.selection.selected()?.checked_sub(self.rows.len())?;
+        self.external_rows.get(index)
+    }
+
+    fn selected_file_candidate(&self) -> Option<&artifacts::FileCandidate> {
+        if self.view != View::Candidates {
+            return None;
+        }
+        self.file_candidates
+            .as_ref()?
+            .get(self.selection.selected()?)
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -278,6 +451,18 @@ impl Explorer {
     }
 
     fn toggle_selection(&mut self) {
+        if let Some(row) = self.selected_external() {
+            self.message = if !row.eligible {
+                format!("Protected: {}", row.reason)
+            } else if row.kind == "Git" {
+                "Use still worktrees --remove to review this removal".into()
+            } else if row.kind == "Kubernetes" {
+                "Use still kube to inspect this workload".into()
+            } else {
+                "Use still docker --remove to review this removal".into()
+            };
+            return;
+        }
         let Some(path) = self.selected().map(|row| row.path.clone()) else {
             self.message.clear();
             return;
@@ -285,6 +470,13 @@ impl Explorer {
         if let Some(index) = self.approved.iter().position(|item| item.path == path) {
             self.approved.remove(index);
             self.message = "Removed from the selection".into();
+            return;
+        }
+        if let Some(reason) = self
+            .selected_file_candidate()
+            .and_then(|row| row.blocked_reason.as_ref())
+        {
+            self.message = format!("Blocked: {reason}");
             return;
         }
         if self
@@ -336,12 +528,12 @@ impl Explorer {
         terminal.draw(|frame| {
             let area = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(4)])
+                .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(if self.view == View::Candidates { 7 } else { 4 })])
                 .split(frame.size());
             let title = match self.view {
                 View::Tree => "Storage",
                 View::Search => "Search results",
-                View::Candidates => "Output to review",
+                View::Candidates => "Cleanup candidates",
                 View::Confirm => "Permanently remove these outputs?",
                 View::Results => "Cleanup results",
             };
@@ -362,8 +554,28 @@ impl Explorer {
                 View::Results => self.results.iter().skip(first).take(visible)
                     .map(|result| TableRow::new([Cell::from(""), Cell::from(result.as_str())]))
                     .collect(),
+                View::Candidates => self.file_candidates.as_deref().unwrap_or_default().iter().map(|candidate| {
+                    let row = &candidate.row;
+                    let path = row.path.strip_prefix(&self.roots[self.root]).unwrap_or(&row.path);
+                    let selected = if self.approved.iter().any(|item| item.path == row.path) { "✓ " } else { "" };
+                    let size = row.usage.allocated_bytes.map_or_else(
+                        || format!("{} logical", bytes(row.usage.logical_bytes)), bytes);
+                    let label = match &candidate.blocked_reason {
+                        Some(reason) => format!("[Blocked: {reason}] {}", display(path)),
+                        None => format!("{selected}[FS] {}", display(path)),
+                    };
+                    TableRow::new([Cell::from(size), Cell::from(label)])
+                }).chain(self.external_rows.iter().map(|row| {
+                    let size = row.estimated_bytes.map_or_else(|| "—".into(), bytes);
+                    let status = if row.eligible { row.kind.to_owned() } else { format!("{} blocked: {}", row.kind, row.reason) };
+                    TableRow::new([Cell::from(size), Cell::from(format!("[{status}] {}", row.label))])
+                })).skip(first).take(visible).collect(),
                 _ => self.rows.iter().skip(first).take(visible).map(|row| {
-                    let size = if self.largest { row.usage.largest_file_bytes } else { row.usage.size() };
+                    let size = match self.sort {
+                        Sort::Total => bytes(row.usage.size()),
+                        Sort::Largest => bytes(row.usage.largest_file_bytes),
+                        Sort::Growth => self.delta(row).map_or_else(|| "—".into(), history::Delta::label),
+                    };
                     let selected = if self.approved.iter().any(|item| item.path == row.path) { "✓ " } else { "" };
                     let partial = if row.usage.skipped == 0 { "" } else { " [partial]" };
                     let path = if self.view == View::Tree {
@@ -371,13 +583,15 @@ impl Explorer {
                     } else {
                         row.path.strip_prefix(&self.roots[self.root]).unwrap_or(&row.path)
                     };
-                    TableRow::new([Cell::from(bytes(size)), Cell::from(format!("{selected}{}{partial}", display(path)))])
+                    TableRow::new([Cell::from(size), Cell::from(format!("{selected}{}{partial}", display(path)))])
                 }).collect(),
             };
             let header = match self.view {
-                View::Tree | View::Candidates | View::Search if self.largest => "Largest file",
-                View::Tree | View::Candidates | View::Search if cfg!(unix) => "Allocated",
-                View::Tree | View::Candidates | View::Search => "Logical size",
+                View::Candidates => "Observed",
+                View::Tree | View::Search if self.sort == Sort::Growth => "Change",
+                View::Tree | View::Search if self.sort == Sort::Largest => "Largest file",
+                View::Tree | View::Search if cfg!(unix) => "Allocated",
+                View::Tree | View::Search => "Logical size",
                 _ => "",
             };
             // Render the current window only, with a local index into that window.
@@ -395,12 +609,33 @@ impl Explorer {
                 "y Delete the listed outputs · Esc Back"
             } else if self.view == View::Results {
                 "r Refresh · Esc Back · q Quit"
+            } else if self.view == View::Candidates {
+                "f Files · g Git · d Docker · K Kubernetes · Space Select output · D Review · r Recheck · Tab Back"
             } else {
-                "↑↓ Move · Enter Open · ← Parent · / Search · o Root · ] Next root\nTab Candidates · s Sort · Space Select · D Review deletion · r Refresh · q Quit"
+                "↑↓ Move · Enter Open · ← Parent · / Search · o Root · ] Next root\nTab Candidates · s Sort · Space Select · D Review · r Refresh · q Quit"
             };
             let footer = if let Some((mode, value)) = &self.input {
                 let label = match mode { Input::Root => "Directory", Input::Search => "Search" };
                 format!("{label}: {value}\nEnter Continue · Esc Cancel")
+            } else if self.view == View::Candidates {
+                let detail = if let Some(row) = self.selected_external() {
+                    format!("{}\n{}", row.reason, row.estimate_basis)
+                } else if let Some(candidate) = self.selected_file_candidate() {
+                    let row = &candidate.row;
+                    let reason = candidate.producer.reason();
+                    let observed = row.usage.allocated_bytes.map_or_else(
+                        || format!("{} logical size; host reclaim estimate unavailable", bytes(row.usage.logical_bytes)),
+                        |size| format!("{} observed allocation; actual reclaim may differ", bytes(size)));
+                    match &candidate.blocked_reason {
+                        Some(blocked) => format!("{}\nBlocked: {blocked}\n{observed}", display(&row.path)),
+                        None => format!("{reason}\n{observed}"),
+                    }
+                } else {
+                    "No cleanup candidates in this view".into()
+                };
+                let notes = self.findings.as_ref().map(|findings| findings.notes.join(" · ")).unwrap_or_default();
+                [help, detail.as_str(), self.message.as_str(), notes.as_str()]
+                    .into_iter().filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n")
             } else {
                 let detail = if self.view == View::Confirm {
                     self.selection.selected().and_then(|i| self.approved.get(i))
@@ -408,7 +643,20 @@ impl Explorer {
                 } else {
                     self.message.clone()
                 };
-                format!("{help}\n{detail}")
+                let baseline = if self.tracks_history() && matches!(self.view, View::Tree | View::Candidates | View::Search) {
+                    match self.previous_scan() {
+                        Some(scan) => {
+                            let time = scan.completed_at().with_timezone(&chrono::Local);
+                            format!("Previous scan {} · * partial change", time.format("%Y-%m-%d %H:%M"))
+                        }
+                        None if self.message.starts_with("Scan history unavailable") => String::new(),
+                        None => "First scan · Changes appear on the next review".into(),
+                    }
+                } else {
+                    String::new()
+                };
+                [baseline.as_str(), detail.as_str(), help]
+                    .into_iter().filter(|line| !line.is_empty()).collect::<Vec<_>>().join("\n")
             };
             frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), area[2]);
         })?;

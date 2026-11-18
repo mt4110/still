@@ -1,7 +1,8 @@
+use super::message::Message;
 use anyhow::{bail, Context, Result};
 use ignore::{WalkBuilder, WalkState};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -57,6 +58,8 @@ pub struct Inventory {
     pub directories: Vec<Row>,
     pub matches: Vec<Row>,
     pub omitted_matches: usize,
+    #[serde(skip)]
+    pub cargo_marker_dirs: HashSet<PathBuf>,
 }
 
 #[derive(Default)]
@@ -65,6 +68,7 @@ struct Batch {
     matches: Vec<Row>,
     match_count: usize,
     skipped: u64,
+    cargo_marker_dirs: HashSet<PathBuf>,
     #[cfg(unix)]
     hardlinks: HashMap<(u64, u64), (PathBuf, u64)>,
 }
@@ -103,6 +107,7 @@ pub fn scan(root: &Path, threads: u16, query: Option<&str>) -> Result<Inventory>
         mut matches,
         match_count,
         skipped,
+        cargo_marker_dirs,
         #[cfg(unix)]
         hardlinks,
     } = result.into_inner().expect("walker results");
@@ -153,6 +158,7 @@ pub fn scan(root: &Path, threads: u16, query: Option<&str>) -> Result<Inventory>
             })
             .collect(),
         omitted_matches: (match_count + directory_matches).saturating_sub(matches.len()),
+        cargo_marker_dirs,
         matches,
     })
 }
@@ -191,6 +197,12 @@ impl Worker<'_> {
         } else if metadata.is_dir() {
             self.batch.directories.entry(path.to_owned()).or_default();
         } else if metadata.is_file() {
+            if matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some(".rustc_info.json" | "CACHEDIR.TAG")
+            ) {
+                self.batch.cargo_marker_dirs.insert(parent.to_owned());
+            }
             let stats = Usage::file(&metadata);
             let counted = stats.clone();
             #[cfg(unix)]
@@ -233,6 +245,9 @@ impl Drop for Worker<'_> {
         }
         results.match_count += self.batch.match_count;
         results.skipped += self.batch.skipped;
+        results
+            .cargo_marker_dirs
+            .extend(self.batch.cargo_marker_dirs.drain());
         results.matches.append(&mut self.batch.matches);
         #[cfg(unix)]
         for (identity, (path, blocks)) in self.batch.hardlinks.drain() {
@@ -294,14 +309,104 @@ pub fn sort_rows(rows: &mut [Row], largest_file: bool) {
 
 pub fn safe_dir(path: &Path) -> Result<PathBuf> {
     let path = std::path::absolute(path)?;
-    for ancestor in path.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor)
-            .with_context(|| format!("Cannot access {ancestor:?}"))?;
+    // Check each parent before resolving a child through that parent.
+    let ancestors: Vec<_> = path.ancestors().collect();
+    for ancestor in ancestors.into_iter().rev() {
+        let metadata = fs::symlink_metadata(ancestor).with_context(|| {
+            Message::new(
+                format!("Cannot access {ancestor:?}"),
+                format!("フォルダにアクセスできません: {}", display(ancestor)),
+            )
+        })?;
         if !metadata.is_dir() || is_link(&metadata) {
-            bail!("Expected a directory without symlinks or reparse points: {ancestor:?}");
+            return Err(Message::new(
+                format!("Expected a directory without symlinks or reparse points: {ancestor:?}"),
+                format!(
+                    "通常のフォルダとして確認できません。リンクや種類を確認してください: {}",
+                    display(ancestor)
+                ),
+            )
+            .into());
         }
     }
     Ok(fs::canonicalize(path)?)
+}
+
+pub(super) fn home_scan_dir(home: &Path, path: &Path) -> Result<PathBuf> {
+    let outside_home = || {
+        Message::new(
+            "Choose a folder inside your home directory",
+            "ホームフォルダ内のフォルダを選んでください。",
+        )
+    };
+    #[cfg(unix)]
+    {
+        let absolute = std::path::absolute(path)?;
+        let relative = absolute.strip_prefix(home).map_err(|_| outside_home())?;
+        if relative
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        {
+            return Err(outside_home().into());
+        }
+    }
+    let resolved = safe_dir(path)?;
+    if !resolved.starts_with(home) {
+        return Err(outside_home().into());
+    }
+    Ok(resolved)
+}
+
+pub(super) fn workspace_dir(path: &Path) -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let dirs = directories::BaseDirs::new().context("Could not locate your home directory")?;
+        home_scan_dir(&dirs.home_dir().canonicalize()?, path)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let root = fs::canonicalize(path)?;
+        if !root.is_dir() {
+            bail!("Expected a directory for the scan root: {root:?}");
+        }
+        Ok(root)
+    }
+}
+
+pub(super) fn safe_workspace_dir(path: &Path) -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return workspace_dir(path);
+    #[cfg(not(target_os = "macos"))]
+    safe_dir(path)
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn home_boundary_rejects_outside_roots_parent_traversal_and_links() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let fixture_path = fixture.path().canonicalize()?;
+    let home = fixture_path.join("home");
+    let project = home.join("project");
+    fs::create_dir_all(&project)?;
+    assert_eq!(home_scan_dir(&home, &home)?, home);
+    assert_eq!(home_scan_dir(&home, &project)?, project);
+    for outside in [
+        PathBuf::from("/"),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/nix/store"),
+        fixture_path.join("home-other"),
+        home.join("../home-other"),
+    ] {
+        assert!(home_scan_dir(&home, &outside)
+            .unwrap_err()
+            .to_string()
+            .contains("inside your home directory"));
+    }
+    let outside_dir = fixture_path.join("outside");
+    fs::create_dir_all(outside_dir.join("child"))?;
+    std::os::unix::fs::symlink(outside_dir, home.join("link"))?;
+    assert!(home_scan_dir(&home, &home.join("link/child")).is_err());
+    Ok(())
 }
 
 pub fn is_link(metadata: &Metadata) -> bool {
@@ -309,7 +414,7 @@ pub fn is_link(metadata: &Metadata) -> bool {
     {
         use std::os::windows::fs::MetadataExt;
         // Junctions, mounted directories and cloud reparse points also stop traversal.
-        return metadata.file_attributes() & 0x400 != 0;
+        metadata.file_attributes() & 0x400 != 0
     }
     #[cfg(not(windows))]
     metadata.is_symlink()

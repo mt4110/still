@@ -1,4 +1,4 @@
-use super::bytes;
+use super::{bytes, message::Message};
 use crate::cli::{DockerArgs, ListFormat};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
@@ -45,6 +45,26 @@ struct Mount {
     source: PathBuf,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ContainerSummary {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "ImageID")]
+    image_id: String,
+    state: String,
+    labels: Option<ContainerLabels>,
+    mounts: Option<Vec<Mount>>,
+}
+
+#[derive(Deserialize)]
+struct ContainerLabels {
+    #[serde(rename = "still.disposable")]
+    disposable: Option<String>,
+}
+
+const CONTAINER_TEMPLATE: &str = r#"{"Id":{{json .Id}},"Image":{{json .Image}},"Status":{{json .State.Status}},"Finished":{{json .State.FinishedAt}},"Disposable":{{json (index .Config.Labels "still.disposable")}}}"#;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct Cache {
@@ -75,6 +95,71 @@ struct Candidate {
     bytes: Option<u64>,
     reason: &'static str,
     evidence: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub(super) struct ReviewCandidate {
+    pub key: String,
+    pub reason: Message,
+    pub estimated_bytes: Option<u64>,
+    pub estimate_note: &'static str,
+    pub eligible: bool,
+}
+
+impl From<Candidate> for ReviewCandidate {
+    fn from(candidate: Candidate) -> Self {
+        let (estimated_bytes, estimate_note) = match candidate.kind {
+            Kind::Image => (None, "Shared image layers keep reclaim unknown"),
+            Kind::Container => (candidate.bytes, "Docker writable-layer estimate"),
+            Kind::Cache => (candidate.bytes, "Docker BuildKit storage estimate"),
+        };
+        Self {
+            key: candidate.key,
+            reason: Message::new(
+                candidate.reason,
+                match candidate.kind {
+                    Kind::Image => "コンテナから参照されていない、取得元を確認できるイメージです。",
+                    Kind::Container => "停止済みで、使い捨てと明示されたコンテナです。",
+                    Kind::Cache => "古く、共有されていない BuildKit キャッシュです。",
+                },
+            ),
+            estimated_bytes,
+            estimate_note,
+            eligible: true,
+        }
+    }
+}
+
+pub(super) struct ReviewFindings {
+    pub items: Vec<ReviewCandidate>,
+    pub cache_error: Option<String>,
+    pub volume_error: Option<String>,
+}
+
+pub(super) fn review_candidates(context: &str, include_cache: bool) -> Result<ReviewFindings> {
+    let daemon = connect(context)
+        .with_context(|| format!("Could not inspect Docker context {context:?}"))?;
+    let (buildx, setup_error) = match include_cache.then(tempfile::tempdir).transpose() {
+        Ok(state) => (state, None),
+        Err(err) => (
+            None,
+            Some(format!("Could not initialize Buildx inspection: {err}")),
+        ),
+    };
+    let (items, cache_error) = candidates(&daemon, 7, buildx.as_ref())?;
+    let mut items: Vec<_> = items.into_iter().map(ReviewCandidate::from).collect();
+    let volume_error = match protected_volumes(&daemon) {
+        Ok(volumes) => {
+            items.extend(volumes);
+            None
+        }
+        Err(err) => Some(err.to_string()),
+    };
+    Ok(ReviewFindings {
+        items,
+        cache_error: cache_error.or(setup_error),
+        volume_error,
+    })
 }
 
 impl Candidate {
@@ -139,12 +224,17 @@ pub fn run(args: &DockerArgs) -> Result<()> {
         return Ok(());
     }
 
+    let (volumes, volume_error) = match protected_volumes(&daemon) {
+        Ok(volumes) => (volumes, None),
+        Err(err) => (Vec::new(), Some(err.to_string())),
+    };
     match args.format {
         ListFormat::Json => println!(
             "{}",
             serde_json::json!({
                 "context": args.context, "daemon_id": daemon.id, "candidates": candidates,
                 "cache_error": cache_error,
+                "protected_volumes": volumes, "volume_error": volume_error,
             })
         ),
         ListFormat::Text => {
@@ -156,9 +246,46 @@ pub fn run(args: &DockerArgs) -> Result<()> {
             if let Some(error) = cache_error {
                 eprintln!("BuildKit not assessed: {error}");
             }
+            for volume in volumes {
+                println!("Protected  {}  ({})", volume.key, volume.reason);
+            }
+            if let Some(error) = volume_error {
+                eprintln!("Volumes not assessed: {error}");
+            }
         }
     }
     Ok(())
+}
+
+fn protected_volumes(daemon: &Daemon) -> Result<Vec<ReviewCandidate>> {
+    let raw = execute(
+        command_on(&daemon.endpoint).args([
+            "volume",
+            "ls",
+            "--filter",
+            "dangling=true",
+            "--format",
+            "{{json .Name}}",
+        ]),
+        "list unreferenced volumes",
+    )?;
+    std::str::from_utf8(&raw)?
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let name: String = serde_json::from_str(line)?;
+            Ok(ReviewCandidate {
+                key: format!("volume:{name}"),
+                reason: Message::new(
+                    "Unreferenced volume; may contain persistent data",
+                    "未接続のボリュームです。データが残っている可能性があるため保護しています。",
+                ),
+                estimated_bytes: None,
+                estimate_note: "Host reclaim estimate unavailable",
+                eligible: false,
+            })
+        })
+        .collect()
 }
 
 fn connect(context: &str) -> Result<Daemon> {
@@ -194,13 +321,23 @@ fn connect(context: &str) -> Result<Daemon> {
 }
 
 pub fn protect_bind_mounts(context: &str, output: &Path) -> Result<()> {
+    check_bind_mounts(output, &bind_mount_paths(context)?)
+}
+
+pub(super) fn bind_mount_paths(context: &str) -> Result<Vec<PathBuf>> {
     let daemon = connect(context)?;
     let records = inspect::<Option<Vec<Mount>>>(
         &daemon,
         "container",
         &["ls", "-aq", "--no-trunc"],
         "{{json .Mounts}}",
-    )?;
+    )
+    .or_else(|inspect_error| {
+        container_summary(&daemon)
+            .map(|summary| summary.into_iter().map(|entry| entry.mounts).collect())
+            .with_context(|| format!("{inspect_error}; Engine container summary unavailable"))
+    })?;
+    let mut sources = Vec::new();
     for mount in records.into_iter().flatten().flatten() {
         if mount.kind == "bind" {
             // Docker Desktop reports some host paths under /host_mnt.
@@ -210,11 +347,22 @@ pub fn protect_bind_mounts(context: &str, output: &Path) -> Result<()> {
                 .ok()
                 .map(|source| Path::new("/").join(source))
                 .unwrap_or(mount.source);
-            let source = source.canonicalize().unwrap_or(source);
-            if source.starts_with(output) || output.starts_with(&source) {
-                bail!("Output overlaps a container bind mount");
-            }
+            sources.push(source.canonicalize().unwrap_or(source));
         }
+    }
+    Ok(sources)
+}
+
+pub(super) fn check_bind_mounts(output: &Path, sources: &[PathBuf]) -> Result<()> {
+    if sources
+        .iter()
+        .any(|source| source.starts_with(output) || output.starts_with(source))
+    {
+        return Err(super::message::Message::new(
+            "Output overlaps a container bind mount",
+            "Docker コンテナにマウントされているフォルダと重なるため保護しています。",
+        )
+        .into());
     }
     Ok(())
 }
@@ -229,8 +377,12 @@ fn candidates(
         daemon,
         "container",
         &["ls", "-aq", "--no-trunc"],
-        r#"{"Id":{{json .Id}},"Image":{{json .Image}},"Status":{{json .State.Status}},"Finished":{{json .State.FinishedAt}},"Disposable":{{json (index .Config.Labels "still.disposable")}},"Size":{{json .SizeRw}}}"#,
-    )?;
+        CONTAINER_TEMPLATE,
+    )
+    .or_else(|inspect_error| {
+        containers_from_summary(daemon)
+            .with_context(|| format!("{inspect_error}; Engine container summary unavailable"))
+    })?;
     let images = inspect::<Image>(
         daemon,
         "image",
@@ -238,6 +390,26 @@ fn candidates(
         r#"{"Id":{{json .Id}},"Tags":{{json .RepoTags}},"Digests":{{json .RepoDigests}},"Size":{{json .Size}}}"#,
     )?;
     let mut items = engine_candidates(containers, images, cutoff);
+    for container in items
+        .iter_mut()
+        .filter(|item| item.kind == Kind::Container && item.bytes.is_none())
+    {
+        // Measuring writable layers can be expensive; only measure eligible stopped containers.
+        container.bytes = execute(
+            command_on(&daemon.endpoint).args([
+                "container",
+                "inspect",
+                "--size",
+                "--format",
+                "{{json .SizeRw}}",
+                &container.id,
+            ]),
+            "container size",
+        )
+        .ok()
+        .and_then(|output| serde_json::from_slice::<Option<u64>>(&output).ok())
+        .flatten();
+    }
 
     let cache_error = if let Some(buildx) = buildx {
         match cache_candidates(daemon, buildx, cutoff) {
@@ -254,32 +426,126 @@ fn candidates(
     Ok((items, cache_error))
 }
 
+fn container_summary(daemon: &Daemon) -> Result<Vec<ContainerSummary>> {
+    let socket = daemon
+        .endpoint
+        .strip_prefix("unix://")
+        .context("Engine summary requires a local Unix socket")?;
+    let raw = execute(
+        Command::new("curl")
+            .args([
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--noproxy",
+                "*",
+                "--unix-socket",
+                socket,
+                "--max-time",
+                "10",
+                "http://localhost/containers/json?all=1",
+            ])
+            .stdin(Stdio::null()),
+        "container summary",
+    )?;
+    Ok(serde_json::from_slice(&raw)?)
+}
+
+fn containers_from_summary(daemon: &Daemon) -> Result<Vec<Container>> {
+    container_summary(daemon)?
+        .into_iter()
+        .map(|entry| {
+            if !hex_id(&entry.id)
+                || !hex_id(
+                    entry
+                        .image_id
+                        .strip_prefix("sha256:")
+                        .unwrap_or(&entry.image_id),
+                )
+            {
+                bail!("Engine summary did not identify a container or its image");
+            }
+            let image = if entry.image_id.starts_with("sha256:") {
+                entry.image_id
+            } else {
+                format!("sha256:{}", entry.image_id)
+            };
+            let labelled =
+                entry.labels.and_then(|labels| labels.disposable).as_deref() == Some("true");
+            if entry.state == "exited" && labelled {
+                if let Ok(mut results) = inspect_ids::<Container>(
+                    daemon,
+                    "container",
+                    CONTAINER_TEMPLATE,
+                    std::slice::from_ref(&entry.id),
+                ) {
+                    if let Some(mut inspected) = results.pop() {
+                        inspected.image = image;
+                        return Ok(inspected);
+                    }
+                }
+            }
+            // Summary records remain image references even when the daemon cannot inspect them.
+            Ok(Container {
+                id: entry.id,
+                image,
+                status: entry.state,
+                finished: String::new(),
+                disposable: None,
+                size: None,
+            })
+        })
+        .collect()
+}
+
 fn inspect<T: DeserializeOwned>(
     daemon: &Daemon,
     kind: &str,
     list: &[&str],
     template: &str,
 ) -> Result<Vec<T>> {
+    let mut ids = resource_ids(daemon, kind, list)?;
+    for _ in 0..3 {
+        let observed = inspect_ids(daemon, kind, template, &ids);
+        let latest = resource_ids(daemon, kind, list)?;
+        if latest == ids {
+            return observed;
+        }
+        // An Engine may return partial output if a container disappears mid-inspection.
+        ids = latest;
+    }
+    bail!("Docker {kind} inventory kept changing during inspection; refresh to try again")
+}
+
+fn resource_ids(daemon: &Daemon, kind: &str, list: &[&str]) -> Result<Vec<String>> {
     let ids = execute(command_on(&daemon.endpoint).arg(kind).args(list), "list")?;
     let mut ids: Vec<_> = std::str::from_utf8(&ids)?
         .lines()
         .filter(|s| !s.is_empty())
+        .map(str::to_owned)
         .collect();
     ids.sort_unstable();
     ids.dedup();
     if ids
         .iter()
-        .any(|id| !hex_id(id.strip_prefix("sha256:").unwrap_or(id)))
+        .any(|id| !hex_id(id.strip_prefix("sha256:").unwrap_or(id.as_str())))
     {
         bail!("Docker returned an unexpected resource ID");
     }
+    Ok(ids)
+}
+
+fn inspect_ids<T: DeserializeOwned>(
+    daemon: &Daemon,
+    kind: &str,
+    template: &str,
+    ids: &[String],
+) -> Result<Vec<T>> {
     let mut records = Vec::new();
     for chunk in ids.chunks(64) {
         let mut cmd = command_on(&daemon.endpoint);
         cmd.args([kind, "inspect", "--format", template]);
-        if kind == "container" {
-            cmd.arg("--size");
-        }
         let inspected = json_lines::<T>(&execute(cmd.args(chunk), "inspect")?)?;
         if inspected.len() != chunk.len() {
             bail!("Docker returned an incomplete resource inventory");
@@ -369,15 +635,7 @@ fn cache_candidates(
 
 fn cache_records(daemon: &Daemon, buildx: &tempfile::TempDir) -> Result<Vec<Cache>> {
     let raw = execute(
-        buildx_command(daemon, buildx).args([
-            "du",
-            "--builder",
-            "default",
-            "--timeout",
-            "5s",
-            "--format",
-            "json",
-        ]),
+        buildx_command(daemon, buildx).args(["du", "--builder", "default", "--format", "json"]),
         "Buildx du",
     )?;
     json_lines::<Cache>(&raw)
@@ -425,8 +683,6 @@ fn remove(
                     "prune",
                     "--builder",
                     "default",
-                    "--timeout",
-                    "5s",
                     "--force",
                     "--filter",
                     &format!("id~=^{id}$"),
@@ -455,7 +711,7 @@ fn remove(
 }
 
 fn command() -> Command {
-    let mut command = Command::new("docker");
+    let mut command = super::external_command("docker");
     command
         .env_remove("DOCKER_CONTEXT")
         .env_remove("DOCKER_HOST")
@@ -490,4 +746,25 @@ fn json_lines<T: DeserializeOwned>(bytes: &[u8]) -> Result<Vec<T>> {
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_str(line).map_err(Into::into))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Candidate, Kind, ReviewCandidate};
+
+    #[test]
+    fn review_never_treats_shared_image_size_as_reclaimable() {
+        let candidate = |kind| {
+            ReviewCandidate::from(Candidate::new(
+                kind,
+                "id".into(),
+                Some(512),
+                "reason",
+                vec![],
+            ))
+        };
+        assert_eq!(candidate(Kind::Image).estimated_bytes, None);
+        assert_eq!(candidate(Kind::Container).estimated_bytes, Some(512));
+        assert_eq!(candidate(Kind::Cache).estimated_bytes, Some(512));
+    }
 }
