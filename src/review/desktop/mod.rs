@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+mod home;
+#[cfg(target_os = "macos")]
+mod projects;
 mod scan;
 #[cfg(target_os = "macos")]
 mod sdk;
@@ -11,8 +15,15 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-const INK: Color32 = Color32::from_rgb(25, 38, 46);
-const ACCENT: Color32 = Color32::from_rgb(19, 109, 99);
+const INK: Color32 = Color32::from_rgb(41, 46, 50);
+const ACCENT: Color32 = Color32::from_rgb(50, 104, 91);
+
+#[cfg(target_os = "macos")]
+const PAPER: Color32 = Color32::from_rgb(250, 249, 246);
+#[cfg(target_os = "macos")]
+const MUTED: Color32 = Color32::from_rgb(88, 99, 95);
+#[cfg(target_os = "macos")]
+const LINE: Color32 = Color32::from_rgb(223, 223, 218);
 
 pub fn run(profile: Option<String>) -> Result<()> {
     let options = eframe::NativeOptions {
@@ -46,8 +57,27 @@ pub fn run(profile: Option<String>) -> Result<()> {
 
 fn configure_ui(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::light();
-    visuals.panel_fill = Color32::from_rgb(246, 248, 247);
-    visuals.override_text_color = Some(INK);
+    let paper = Color32::from_rgb(250, 249, 246);
+    let line = Color32::from_rgb(223, 223, 218);
+    visuals.panel_fill = paper;
+    visuals.window_fill = paper;
+    visuals.weak_text_color = Some(Color32::from_rgb(88, 99, 95));
+    visuals.hyperlink_color = ACCENT;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, line);
+    visuals.widgets.inactive.weak_bg_fill = paper;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, line);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(236, 238, 232);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
+    for widget in [
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = egui::CornerRadius::same(7);
+    }
+    visuals.widgets.noninteractive.fg_stroke.color = INK;
+    visuals.widgets.inactive.fg_stroke.color = INK;
     visuals.selection.bg_fill = Color32::from_rgb(201, 234, 226);
     ctx.set_visuals(visuals);
     ctx.global_style_mut(|style| {
@@ -174,7 +204,7 @@ enum Outcome {
     SdkRemoval(Result<super::sdk_cleanup::Receipt>),
     Review(Result<Confirmation>),
     Inspection(Vec<String>),
-    Removal(Vec<String>),
+    Removal(scan::CleanupReceipt),
 }
 
 struct Job {
@@ -209,6 +239,10 @@ impl Default for StaleFiles {
 
 #[derive(Default)]
 struct App {
+    #[cfg(target_os = "macos")]
+    projects: projects::Projects,
+    #[cfg(target_os = "macos")]
+    home: home::Home,
     profile: Profile,
     names: Vec<String>,
     profile_name: Option<String>,
@@ -235,7 +269,7 @@ struct App {
     job: Option<Job>,
     save_as: Option<String>,
     status: String,
-    removal_results: Vec<String>,
+    cleanup_receipt: Option<scan::CleanupReceipt>,
     stale_files: StaleFiles,
     show_stale_files: bool,
     show_app_storage: bool,
@@ -287,7 +321,18 @@ impl App {
                 }
                 self.baseline
                     .insert(result.root.clone(), result.previous.clone());
+                #[cfg(target_os = "macos")]
+                if let Err(err) =
+                    self.home
+                        .remember(&result.root, &self.profile, self.profile_name.clone())
+                {
+                    self.status = format!("前回の場所を保存できませんでした: {err:#}");
+                }
                 self.location = result.root.clone();
+                #[cfg(target_os = "macos")]
+                {
+                    self.projects = projects::Projects::from_scan(&result);
+                }
                 self.scan = Some(result);
                 self.rebuild();
             }
@@ -307,7 +352,7 @@ impl App {
             Outcome::Review(Ok(confirmation)) => self.confirmation = Some(confirmation),
             Outcome::Inspection(report) => self.inspection = Some(report),
             Outcome::Removal(results) => {
-                self.removal_results = results;
+                self.cleanup_receipt = Some(results);
                 self.refresh(ctx, false);
             }
             Outcome::Scan(Err(err)) | Outcome::Search(Err(err)) | Outcome::Review(Err(err)) => {
@@ -341,7 +386,7 @@ impl App {
                 self.profile_name = Some(name);
                 self.index = 0;
                 self.baseline.clear();
-                self.removal_results.clear();
+                self.cleanup_receipt = None;
                 self.refresh(ctx, true);
             }
             Err(err) => self.status = format!("{err:#}"),
@@ -359,7 +404,7 @@ impl App {
                     self.index = self.profile.roots.len() - 1;
                     self.settings_changed();
                 }
-                self.removal_results.clear();
+                self.cleanup_receipt = None;
                 self.refresh(ctx, true);
             }
             Err(err) => self.status = format!("{err:#}"),
@@ -543,81 +588,41 @@ impl App {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("still").size(28.0).strong().color(ACCENT));
+            ui.label(RichText::new("still").size(27.0).strong().color(INK));
             ui.separator();
-            if ui.button("Find old files…").on_hover_text(if self.japanese_reasons { "ホーム内の古い大容量ファイルを探します。" } else { "Find large, older files in your home folder." }).clicked() {
-                self.show_stale_files = true;
+            #[cfg(target_os = "macos")]
+            if self.scan.is_some() && ui.button("ホーム").clicked() {
+                self.scan = None;
+                self.marked.clear();
+                self.cleanup_receipt = None;
+                self.home.update_capacity();
             }
             #[cfg(target_os = "macos")]
-            if ui.button("App storage…").on_hover_text(if self.japanese_reasons { "アプリのデータ・キャッシュ・SDK の版ごとの容量を確認します。" } else { "Inspect app data, caches, and installed SDK versions." }).clicked() {
-                self.show_app_storage = true;
-            }
-            if ui.button("Add workspace…").on_hover_text(if self.japanese_reasons { "調査する開発フォルダを選び、容量と掃除候補を表示します。" } else { "Choose a development folder to scan by size and review cleanup candidates." }).clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                    self.add_workspace(&ctx, path);
-                }
-            }
-            ui.menu_button(
-                self.profile_name
-                    .as_deref()
-                    .unwrap_or("Open profile")
-                    .to_owned(),
-                |ui| {
-                    if self.names.is_empty() {
-                        ui.label("No saved profiles");
-                    }
-                    if let Some(name) = self
-                        .names
-                        .iter()
-                        .find(|name| ui.button(name.as_str()).clicked())
-                        .cloned()
-                    {
-                        ui.close();
-                        self.open_profile(&ctx, name);
-                    }
-                },
-            ).response.on_hover_text(if self.japanese_reasons { "保存した週次プロファイルを開いて、同じ範囲をスキャンします。" } else { "Open a saved weekly profile and scan its folders." });
-            let scanned = self.scan.is_some();
-            if ui
-                .add_enabled(scanned, egui::Button::new("Save as…"))
-                .on_disabled_hover_text(if self.japanese_reasons { "先に調査するフォルダを追加してください。" } else { "Add a workspace first." })
-                .on_hover_text(if self.japanese_reasons { "現在のフォルダと候補の設定を週次プロファイルとして保存します。" } else { "Save these folders and candidate sources as a weekly profile." })
-                .clicked()
-            {
-                self.save_as = Some(String::new());
-            }
-            if ui
-                .add_enabled(!self.profile.roots.is_empty(), egui::Button::new("Refresh"))
-                .clicked()
-            {
-                self.removal_results.clear();
-                self.refresh(&ctx, true);
-            }
-            ui.separator();
-            egui::ComboBox::from_id_salt("reason-language")
-                .selected_text(if self.japanese_reasons {
-                    "理由: 日本語"
-                } else {
-                    "Reasons: English"
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.japanese_reasons, false, "English");
-                    ui.selectable_value(&mut self.japanese_reasons, true, "日本語");
+            if self.scan.is_none() || self.projects.active {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("その他の操作", |ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            if self.scan.is_some()
+                                && self.projects.active
+                                && ui.button("フォルダ探索・一括操作").clicked()
+                            {
+                                self.marked.clear();
+                                self.projects.active = false;
+                                self.rebuild();
+                                ui.close();
+                            }
+                            self.toolbar_actions(ui, &ctx);
+                        });
+                    });
                 });
-            ui.menu_button("Privacy", |ui| {
-                ui.set_width(365.0);
-                ui.label(RichText::new("No telemetry or usage analytics").strong());
-                ui.label("still does not send user data to its developers. Profiles and scan history stay on this device.");
-                ui.separator();
-                ui.label("Find old files scans only within your home folder.");
-                #[cfg(target_os = "macos")]
-                ui.label("Workspace scans use folders inside your home folder. macOS controls access to protected locations.");
-                #[cfg(not(target_os = "macos"))]
-                ui.label("Workspace scans use the folders you select or load from a profile.");
-                ui.label("Docker and Kubernetes use the local connections you select.");
-            });
+                return;
+            }
+            self.toolbar_actions(ui, &ctx);
         });
-        if self.profile.roots.is_empty() {
+        if self.profile.roots.is_empty()
+            || self.scan.is_none()
+            || (cfg!(target_os = "macos") && self.profile.roots.len() == 1)
+        {
             return;
         }
         ui.horizontal(|ui| {
@@ -631,10 +636,122 @@ impl App {
                 });
             if selected != self.index {
                 self.index = selected;
-                self.removal_results.clear();
+                self.cleanup_receipt = None;
                 self.refresh(&ctx, true);
             }
         });
+    }
+
+    fn toolbar_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if ui
+            .button("Find old files…")
+            .on_hover_text(if self.japanese_reasons {
+                "ホーム内の古い大容量ファイルを探します。"
+            } else {
+                "Find large, older files in your home folder."
+            })
+            .clicked()
+        {
+            self.show_stale_files = true;
+        }
+        #[cfg(target_os = "macos")]
+        if ui
+            .button("App storage…")
+            .on_hover_text(if self.japanese_reasons {
+                "アプリのデータ・キャッシュ・SDK の版ごとの容量を確認します。"
+            } else {
+                "Inspect app data, caches, and installed SDK versions."
+            })
+            .clicked()
+        {
+            self.show_app_storage = true;
+        }
+        if ui
+            .button("Add workspace…")
+            .on_hover_text(if self.japanese_reasons {
+                "調査する開発フォルダを選び、容量と掃除候補を表示します。"
+            } else {
+                "Choose a development folder to scan by size and review cleanup candidates."
+            })
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                self.add_workspace(ctx, path);
+            }
+        }
+        ui.menu_button(
+            self.profile_name
+                .as_deref()
+                .unwrap_or("Open profile")
+                .to_owned(),
+            |ui| {
+                if self.names.is_empty() {
+                    ui.label("No saved profiles");
+                }
+                if let Some(name) = self
+                    .names
+                    .iter()
+                    .find(|name| ui.button(name.as_str()).clicked())
+                    .cloned()
+                {
+                    ui.close();
+                    self.open_profile(ctx, name);
+                }
+            },
+        )
+        .response
+        .on_hover_text(if self.japanese_reasons {
+            "保存した週次プロファイルを開いて、同じ範囲をスキャンします。"
+        } else {
+            "Open a saved weekly profile and scan its folders."
+        });
+        let scanned = self.scan.is_some();
+        if ui
+            .add_enabled(scanned, egui::Button::new("Save as…"))
+            .on_disabled_hover_text(if self.japanese_reasons {
+                "先に調査するフォルダを追加してください。"
+            } else {
+                "Add a workspace first."
+            })
+            .on_hover_text(if self.japanese_reasons {
+                "現在のフォルダと候補の設定を週次プロファイルとして保存します。"
+            } else {
+                "Save these folders and candidate sources as a weekly profile."
+            })
+            .clicked()
+        {
+            self.save_as = Some(String::new());
+        }
+        if ui
+            .add_enabled(!self.profile.roots.is_empty(), egui::Button::new("Refresh"))
+            .clicked()
+        {
+            self.cleanup_receipt = None;
+            self.refresh(ctx, true);
+        }
+        ui.separator();
+        egui::ComboBox::from_id_salt("reason-language")
+            .selected_text(if self.japanese_reasons {
+                "理由: 日本語"
+            } else {
+                "Reasons: English"
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.japanese_reasons, false, "English");
+                ui.selectable_value(&mut self.japanese_reasons, true, "日本語");
+            });
+        ui.menu_button("Privacy", |ui| {
+                ui.set_width(365.0);
+                ui.label(RichText::new("No telemetry or usage analytics").strong());
+                ui.label("still does not send user data to its developers. Profiles and scan history stay on this device.");
+                ui.separator();
+                ui.label("Find old files scans only within your home folder.");
+                #[cfg(target_os = "macos")]
+                ui.label("Workspace scans use folders inside your home folder. macOS controls access to protected locations.");
+                #[cfg(not(target_os = "macos"))]
+                ui.label("Workspace scans use the folders you select or load from a profile.");
+                ui.label("Docker and Kubernetes use the local connections you select.");
+            });
     }
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
@@ -770,13 +887,26 @@ impl App {
         let ctx = ui.ctx().clone();
         if self.scan.is_none() {
             if self.job.is_none() {
-                ui.add_space(70.0);
+                #[cfg(target_os = "macos")]
+                self.show_home(ui);
+                #[cfg(not(target_os = "macos"))]
                 ui.vertical_centered(|ui| {
                     ui.heading("Choose a development workspace");
                     ui.label("Add a folder or open a saved weekly profile.");
                 });
             }
             return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if self.projects.active {
+                self.project_screen(ui);
+                return;
+            } else if ui.link("‹ プロジェクト一覧").clicked() {
+                self.marked.clear();
+                self.projects = projects::Projects::from_scan(self.scan.as_ref().unwrap());
+                return;
+            }
         }
         self.settings_panel(ui);
         if self.scan.is_none() {
@@ -1239,9 +1369,13 @@ impl App {
             if close || dialog.should_close() {
                 self.confirmation = None;
             } else if delete {
+                let Some(root) = self.scan.as_ref().map(|scan| scan.root.clone()) else {
+                    self.confirmation = None;
+                    return;
+                };
                 let confirmation = self.confirmation.take().unwrap();
                 self.spawn(ctx, "Deleting confirmed outputs…", true, move || {
-                    Outcome::Removal(confirmation.remove())
+                    Outcome::Removal(confirmation.remove(&root))
                 });
             }
         }
@@ -1459,7 +1593,12 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        egui::CentralPanel::default().show_inside(ui, |ui| {
+        let panel = egui::CentralPanel::default();
+        #[cfg(target_os = "macos")]
+        let panel = panel.frame(
+            egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(24, 14)),
+        );
+        panel.show_inside(ui, |ui| {
             ui.add_enabled_ui(self.job.is_none(), |ui| self.toolbar(ui));
             ui.separator();
             if let Some(job) = &self.job {
@@ -1471,12 +1610,50 @@ impl eframe::App for App {
             if !self.status.is_empty() {
                 ui.label(RichText::new(&self.status).color(Color32::from_rgb(155, 50, 39)));
             }
-            if !self.removal_results.is_empty() {
-                ui.collapsing("Cleanup results", |ui| {
-                    for result in &self.removal_results {
-                        ui.label(result);
-                    }
+            if let Some(receipt) = &self.cleanup_receipt {
+                let removed = receipt.outcomes.len() - receipt.held;
+                let japanese = self.japanese_reasons || cfg!(target_os = "macos");
+                let heading = if japanese {
+                    format!("削除 {removed} 件・保留 {} 件", receipt.held)
+                } else {
+                    format!("{removed} deleted · {} held", receipt.held)
+                };
+                ui.strong(heading);
+                let change = match (receipt.before, receipt.after) {
+                    (Some(before), Some(after)) => format!(
+                        "{}{}",
+                        if after >= before { "+" } else { "−" },
+                        bytes(after.abs_diff(before))
+                    ),
+                    _ if japanese => "測定できませんでした".into(),
+                    _ => "Unavailable".into(),
+                };
+                ui.label(if japanese {
+                    format!("実測したボリューム空き容量の変化　{change}")
+                } else {
+                    format!("Measured volume free-space change: {change}")
                 });
+                ui.collapsing(
+                    if japanese {
+                        "項目ごとの結果"
+                    } else {
+                        "Individual results"
+                    },
+                    |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(160.0)
+                            .show(ui, |ui| {
+                                for (path, result) in &receipt.outcomes {
+                                    match result {
+                                        Ok(()) => ui.label(path),
+                                        Err(reason) => {
+                                            ui.label(format!("{path} · {}", reason.text(japanese)))
+                                        }
+                                    };
+                                }
+                            });
+                    },
+                );
             }
             if let Some(scan) = &self.scan {
                 for note in &scan.notes {

@@ -198,13 +198,19 @@ impl Snapshot {
 impl History {
     pub fn open(name: &str) -> Result<Self> {
         profile::validate_name(name)?;
+        Self::in_directory(&format!("profile-{name}"))
+    }
+
+    #[cfg(all(feature = "desktop", target_os = "macos"))]
+    pub fn workspace() -> Result<Self> {
+        Self::in_directory("workspace")
+    }
+
+    fn in_directory(name: &str) -> Result<Self> {
         let dirs = ProjectDirs::from("com", "antigravity", "still")
             .context("Could not determine the still data directory")?;
         Ok(Self {
-            directory: dirs
-                .data_local_dir()
-                .join("review-history")
-                .join(format!("profile-{name}")),
+            directory: dirs.data_local_dir().join("review-history").join(name),
         })
     }
 

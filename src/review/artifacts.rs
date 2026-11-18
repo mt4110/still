@@ -139,6 +139,9 @@ impl Policy {
                 "対応する Cargo プロジェクトを確認できません。再生成できる専用フォルダなら、出力先として登録してください。",
             ).into());
         }
+        if let Some(evidence) = path.ancestors().find(|dir| evidence_name(dir)) {
+            return Err(evidence_reason(evidence).into());
+        }
         if std::env::current_dir()?.starts_with(&path) {
             return Err(Message::new(
                 "The current working directory is inside this output",
@@ -415,6 +418,9 @@ fn walk_tree(
             )
             .into());
         }
+        if evidence_name(&entry) {
+            return Err(evidence_reason(name).into());
+        }
         if !relative.as_os_str().is_empty() && (protected(&entry) || game_storage(&entry).is_some())
         {
             let (english, japanese) = if entry
@@ -486,6 +492,32 @@ pub fn verify_staged(tree: &Tree, payload: &Path) -> Result<()> {
         bail!("A reviewed entry is missing from staging");
     }
     Ok(())
+}
+
+fn evidence_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "logs"
+            | "test-results"
+            | "test-reports"
+            | "surefire-reports"
+            | "junit.xml"
+            | "test-results.xml"
+    ) || lower.ends_with(".log")
+        || lower.ends_with(".xcresult")
+        || lower.ends_with(".trx")
+}
+
+fn evidence_reason(path: &Path) -> Message {
+    let label = inventory::display(path);
+    Message::new(
+        format!("May contain work logs or test results: {label}"),
+        format!("作業ログ・テスト結果の可能性があるため保留: {label}"),
+    )
 }
 
 pub fn protected(path: &Path) -> bool {
@@ -702,6 +734,16 @@ mod tests {
         fs::write(output.join("build.bin"), b"new bytes").unwrap();
         assert!(policy.remove(&approved).is_err());
         assert_eq!(fs::read(output.join("build.bin")).unwrap(), b"new bytes");
+    }
+
+    #[test]
+    fn test_evidence_added_after_review_keeps_output_intact() {
+        let (_temporary, output, policy) = fixture();
+        let approved = policy.prepare(&output).unwrap();
+        fs::create_dir(output.join("test-results")).unwrap();
+        let error = policy.remove(&approved).unwrap_err();
+        assert!(error.to_string().contains("test-results"));
+        assert!(output.join("build.bin").is_file());
     }
 
     #[test]

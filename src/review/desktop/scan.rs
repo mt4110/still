@@ -39,8 +39,11 @@ impl Scan {
         let external = candidates::deduplicate(findings.rows(&inventory));
         let mut notes = findings.notes;
         let mut recorded = false;
-        let previous = if let Some(name) = profile_name {
-            match history::History::open(name) {
+        let history = profile_name.map(history::History::open);
+        #[cfg(target_os = "macos")]
+        let history = history.or_else(|| Some(history::History::workspace()));
+        let previous = if let Some(history) = history {
+            match history {
                 Ok(history) => {
                     let previous = baseline.unwrap_or_else(|| match history.previous(&root) {
                         Ok(snapshot) => snapshot.map(Arc::new),
@@ -83,6 +86,13 @@ impl Scan {
     }
 }
 
+pub(super) struct CleanupReceipt {
+    pub outcomes: Vec<(String, Result<(), super::Message>)>,
+    pub before: Option<u64>,
+    pub after: Option<u64>,
+    pub held: usize,
+}
+
 pub(super) struct Confirmation {
     policy: Arc<artifacts::Policy>,
     items: Vec<artifacts::Prepared>,
@@ -113,14 +123,26 @@ impl Confirmation {
         &self.items
     }
 
-    pub fn remove(self) -> Vec<String> {
-        run_in_pairs(&self.items, |item| {
-            let label = display(&item.path);
-            match self.policy.remove(item) {
-                Ok(()) => format!("Deleted {label}"),
-                Err(err) => format!("{label}: {err:#}"),
-            }
-        })
+    pub fn remove(self, root: &Path) -> CleanupReceipt {
+        let before = super::super::filesystem::available(root);
+        let outcomes = run_in_pairs(&self.items, |item| {
+            let result = self
+                .policy
+                .remove(item)
+                .map_err(|err| super::Message::from_error(&err));
+            (display(&item.path), result)
+        });
+        let after = super::super::filesystem::available(root);
+        let held = outcomes
+            .iter()
+            .filter(|(_, result)| result.is_err())
+            .count();
+        CleanupReceipt {
+            outcomes,
+            before,
+            after,
+            held,
+        }
     }
 }
 
@@ -176,16 +198,23 @@ mod tests {
             fs::write(output.join("artifact.bin"), b"generated")?;
         }
         let policy = Arc::new(artifacts::Policy {
-            roots: vec![root],
+            roots: vec![root.clone()],
             outputs: outputs.to_vec(),
             docker_context: None,
         });
         let confirmation = Confirmation::prepare(policy, outputs.to_vec())?;
         fs::write(outputs[1].join("artifact.bin"), b"changed after approval")?;
-        let results = confirmation.remove();
-        assert!(results[0].starts_with("Deleted "));
-        assert!(results[1].contains("changed after review"));
-        assert!(results[2].starts_with("Deleted "));
+        let receipt = confirmation.remove(&root);
+        assert_eq!(receipt.held, 1);
+        let results = receipt.outcomes;
+        assert!(results[0].1.is_ok());
+        assert!(results[1]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .text(false)
+            .contains("changed after review"));
+        assert!(results[2].1.is_ok());
         assert!(!outputs[0].exists() && !outputs[2].exists());
         assert_eq!(
             fs::read(outputs[1].join("artifact.bin"))?,
@@ -203,7 +232,7 @@ mod tests {
         let file = output.join("artifact.bin");
         fs::write(&file, b"before")?;
         let policy = Arc::new(artifacts::Policy {
-            roots: vec![root],
+            roots: vec![root.clone()],
             outputs: vec![output.clone()],
             docker_context: None,
         });
@@ -214,7 +243,12 @@ mod tests {
 
         let preview = Confirmation::prepare(policy, vec![output])?;
         fs::write(&file, b"after")?;
-        assert!(preview.remove()[0].contains("changed after review"));
+        assert!(preview.remove(&root).outcomes[0]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .text(false)
+            .contains("changed after review"));
         assert_eq!(fs::read(&file)?, b"after");
         Ok(())
     }
