@@ -293,20 +293,24 @@ impl App {
                         )
                     };
                     let title = line_rect(title_y, 30.);
-                    let size_width = 96.;
                     let mut title_ui = row.new_child(
                         egui::UiBuilder::new()
                             .max_rect(title)
                             .layout(egui::Layout::left_to_right(Align::Center)),
                     );
-                    title_ui
-                        .add_sized(
-                            egui::vec2((title.width() - size_width - 8.).max(1.), 30.),
-                            egui::Label::new(RichText::new(display(relative)).size(18.).strong())
-                                .halign(Align::Min)
+                    title_ui.allocate_ui_with_layout(
+                        egui::vec2((title.width() - 106.).max(1.), title.height()),
+                        egui::Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(display(relative)).size(18.).strong(),
+                                )
                                 .truncate(),
-                        )
-                        .on_hover_text(display(path));
+                            )
+                            .on_hover_text(display(path));
+                        },
+                    );
                     title_ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(bytes(c.row.usage.size())).strong());
                     });
