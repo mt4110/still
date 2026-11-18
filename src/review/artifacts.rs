@@ -1,3 +1,5 @@
+mod cargo_cache;
+
 use super::message::Message;
 use super::{filesystem, git, inventory};
 use anyhow::{bail, Context, Result};
@@ -12,6 +14,8 @@ use std::time::SystemTime;
 pub enum Producer {
     Cargo,
     CargoRelocated,
+    CargoIncremental,
+    CargoDependencies,
     NextJs,
     Vite,
     PythonBytecode,
@@ -31,6 +35,8 @@ impl Producer {
     pub fn explanation(self) -> (&'static str, &'static str) {
         match self {
             Self::Cargo => ("Cargo manifest and build metadata", "Cargo の設定とビルド情報を検出"),
+            Self::CargoIncremental => ("Rust compiler incremental cache; rebuilt on the next build", "Rust の差分コンパイル用キャッシュ。次のビルド時に再生成します。"),
+            Self::CargoDependencies => ("Cargo compiled artifacts and dependency metadata; rebuilt by Cargo", "Cargo のコンパイル済み成果物と依存情報。次回のビルドで再生成します。"),
             Self::CargoRelocated => ("Cargo metadata and compiled profile in a relocated output", "別の場所に置かれた Cargo のビルド出力を検出"),
             Self::NextJs => ("Next.js dependency and build output", "Next.js の依存関係とビルド出力を検出"),
             Self::Vite => ("Vite dependency and bundled assets", "Vite の依存関係とビルド出力を検出"),
@@ -42,6 +48,10 @@ impl Producer {
             Self::UnrealEngine => ("Unreal Engine files. Check project requirements and manage installed versions from Epic Games Launcher.", "Unreal Engine 本体です。プロジェクトが使う版を確認し、インストール済みの版は Epic Games Launcher で管理してください。"),
             Self::DeclaredOutput => ("Dedicated output declared with --output", "専用の出力先として登録されたフォルダ"),
         }
+    }
+
+    fn is_partial_cargo(self) -> bool {
+        matches!(self, Self::CargoIncremental | Self::CargoDependencies)
     }
 
     fn is_review_only(self) -> bool {
@@ -91,6 +101,17 @@ impl Policy {
         if self.outputs.iter().any(|output| path == output) {
             return Some(Producer::DeclaredOutput);
         }
+        if matches!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("incremental" | "deps")
+        ) && cargo_cache::cache_root(path).is_some_and(|target| self.permits(target))
+        {
+            return Some(if path.ends_with("incremental") {
+                Producer::CargoIncremental
+            } else {
+                Producer::CargoDependencies
+            });
+        }
         let parent = path.parent()?;
         match path.file_name()?.to_str()? {
             "target"
@@ -129,6 +150,23 @@ impl Policy {
             "No verified output producer",
             "何が生成したフォルダか確認できませんでした。",
         ))?;
+        if producer.is_partial_cargo() {
+            for parent in path.ancestors().skip(1).take(2) {
+                for marker in [".still-active", ".keep", ".gitkeep", ".git"] {
+                    match fs::symlink_metadata(parent.join(marker)) {
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(err) => return Err(err.into()),
+                        Ok(_) => {
+                            return Err(Message::new(
+                                format!("Protected parent marker: {marker}"),
+                                format!("親フォルダの保護マーカー {marker} を検出しました。"),
+                            )
+                            .into())
+                        }
+                    }
+                }
+            }
+        }
         if producer.is_review_only() {
             let (english, japanese) = producer.explanation();
             return Err(Message::new(english, japanese).into());
@@ -178,7 +216,7 @@ impl Policy {
 
     pub fn prepare(&self, path: &Path) -> Result<Prepared> {
         let (path, producer) = self.review_path(path)?;
-        let tree = stamp_tree(&path)?;
+        let tree = stamp_output(&path, producer.is_partial_cargo())?;
         Ok(Prepared {
             path,
             producer,
@@ -256,32 +294,39 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
         .as_deref()
         .map(super::docker::bind_mount_paths)
         .transpose();
+    let inspect = |row: &inventory::Row, producer: Producer| {
+        let preflight = (|| -> Result<()> {
+            let (path, _) = policy.review_path(&row.path)?;
+            let mount_paths = mounts.as_ref().map_err(|e| Message::new(
+                format!("Could not verify Docker bind mounts: {e:#}"),
+                "Docker に接続してマウント先を確認できませんでした。接続先を確認して再スキャンしてください。",
+            ))?;
+            if let Some(paths) = mount_paths {
+                super::docker::check_bind_mounts(&path, paths)?;
+            }
+            walk_tree(&path, |_, relative, meta| {
+                if producer.is_partial_cargo() {
+                    cargo_cache::verify_entry(&path, relative, meta)?;
+                }
+                Ok(())
+            })
+        })();
+        FileCandidate {
+            row: row.clone(),
+            producer,
+            blocked_reason: preflight.err().as_ref().map(Message::from_error),
+        }
+    };
     let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
     let mut files: Vec<_> = std::thread::scope(|scope| {
         found
             .chunks(found.len().div_ceil(workers))
             .map(|chunk| {
-                let mounts = &mounts;
+                let inspect = &inspect;
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|&(row, producer)| {
-                            let preflight = (|| -> Result<()> {
-                                let (path, _) = policy.review_path(&row.path)?;
-                                if let Some(paths) = mounts.as_ref().map_err(|e| Message::new(
-                                    format!("Could not verify Docker bind mounts: {e:#}"),
-                                    "Docker に接続してマウント先を確認できませんでした。接続先を確認して再スキャンしてください。",
-                                ))? {
-                                    super::docker::check_bind_mounts(&path, paths)?;
-                                }
-                                walk_tree(&path, |_, _, _| Ok(()))
-                            })();
-                            FileCandidate {
-                                row: row.clone(),
-                                producer,
-                                blocked_reason: preflight.err().as_ref().map(Message::from_error),
-                            }
-                        })
+                        .map(|&(row, producer)| inspect(row, producer))
                         .collect::<Vec<_>>()
                 })
             })
@@ -290,6 +335,30 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
             .flat_map(|worker| worker.join().expect("candidate review worker"))
             .collect()
     });
+    // Only expand a held target; keep the ordinary Cargo row for a clean build tree.
+    let held_targets: HashSet<_> = files
+        .iter()
+        .filter(|c| c.blocked_reason.is_some() && c.producer == Producer::Cargo)
+        .map(|c| c.row.path.clone())
+        .collect();
+    if !held_targets.is_empty() {
+        for row in &scan.directories {
+            if !matches!(
+                row.path.file_name().and_then(|s| s.to_str()),
+                Some("incremental" | "deps")
+            ) || !row
+                .path
+                .ancestors()
+                .nth(2)
+                .is_some_and(|p| held_targets.contains(p))
+            {
+                continue;
+            }
+            if let Some(producer) = policy.producer(&row.path).filter(|p| p.is_partial_cargo()) {
+                files.push(inspect(row, producer));
+            }
+        }
+    }
     files.sort_unstable_by(|a, b| {
         b.row
             .usage
@@ -342,11 +411,19 @@ pub struct Stamp {
     pub contents: Option<u64>,
 }
 
+#[cfg(windows)]
 pub fn stamp_tree(path: &Path) -> Result<Tree> {
+    stamp_output(path, false)
+}
+
+fn stamp_output(path: &Path, partial_cargo: bool) -> Result<Tree> {
     let parent = path.parent().context("Cannot stage a filesystem root")?;
     let parent_identity = filesystem::identity(parent, &fs::symlink_metadata(parent)?)?;
     let mut entries = BTreeMap::new();
     walk_tree(path, |entry, relative, metadata| {
+        if partial_cargo {
+            cargo_cache::verify_entry(path, relative, metadata)?;
+        }
         let stamp = filesystem::stamp(entry, metadata)?;
         if stamp.identity.device != parent_identity.device {
             bail!(
@@ -434,7 +511,7 @@ fn walk_tree(
                     .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
                     .as_deref()
                 {
-                    Some("pem" | "key" | "p12") => (
+                    Some("pem" | "key" | "p12" | "pfx" | "crt" | "cer" | "der") => (
                         "Protected key or certificate",
                         "鍵・証明書形式のファイルを保護",
                     ),
@@ -507,7 +584,12 @@ fn evidence_name(path: &Path) -> bool {
             | "surefire-reports"
             | "junit.xml"
             | "test-results.xml"
-    ) || lower.ends_with(".log")
+    ) || lower.strip_suffix(".json").is_some_and(|stem| {
+        matches!(
+            stem.rsplit(['-', '_', '.']).next(),
+            Some("result" | "results" | "report")
+        )
+    }) || lower.ends_with(".log")
         || lower.ends_with(".xcresult")
         || lower.ends_with(".trx")
 }
@@ -548,7 +630,19 @@ pub fn protected(path: &Path) -> bool {
                 .and_then(|ext| ext.to_str())
                 .map(str::to_ascii_lowercase)
                 .as_deref(),
-            Some("pem" | "key" | "p12" | "sqlite" | "sqlite3" | "db" | "dump")
+            Some(
+                "pem"
+                    | "key"
+                    | "p12"
+                    | "pfx"
+                    | "crt"
+                    | "cer"
+                    | "der"
+                    | "sqlite"
+                    | "sqlite3"
+                    | "db"
+                    | "dump"
+            )
         )
 }
 
@@ -754,6 +848,55 @@ mod tests {
         let (_temporary, output, policy) = fixture();
         fs::write(output.join(".env"), "").unwrap();
         assert!(policy.prepare(&output).is_err());
+    }
+
+    #[test]
+    fn held_target_exposes_only_independently_verified_build_caches() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().canonicalize()?;
+        let target = root.join("target");
+        let profile = target.join("debug");
+        let deps = profile.join("deps");
+        let incremental = profile.join("incremental");
+        fs::create_dir_all(&deps)?;
+        fs::create_dir(&incremental)?;
+        fs::create_dir(profile.join(".fingerprint"))?;
+        fs::write(profile.join(".cargo-lock"), b"")?;
+        fs::write(target.join(".rustc_info.json"), b"{}")?;
+        fs::write(root.join("Cargo.toml"), b"[workspace]")?;
+        fs::write(root.join(".gitignore"), b"/target/")?;
+        git::check(git::run(&root, ["init", "-q"])?, "init")?;
+        let cert = target.join("cacert.pem");
+        let log = target.join("cargo-test.log");
+        let result = deps.join("test-result.json");
+        fs::write(&cert, b"certificate")?;
+        fs::write(&log, b"test evidence")?;
+        fs::write(&result, b"{}")?;
+        let policy = Policy {
+            roots: vec![root.clone()],
+            outputs: vec![],
+            docker_context: None,
+        };
+        let scan = inventory::scan(&root, 2, None)?;
+        let rows = file_candidates(&scan, &policy);
+        let eligible = |path: &Path| {
+            rows.iter()
+                .find(|c| c.row.path == path)
+                .map(|c| c.blocked_reason.is_none())
+        };
+        assert_eq!(eligible(&target), Some(false));
+        assert_eq!(eligible(&deps), Some(false));
+        assert_eq!(eligible(&incremental), Some(true));
+        let approved = policy.prepare(&incremental)?;
+        fs::write(incremental.join("new-result.json"), b"evidence")?;
+        assert!(policy.remove(&approved).is_err());
+        assert!(cert.exists() && log.exists() && result.exists() && incremental.exists());
+        // A later review still protects result JSON even without a certificate or log.
+        fs::remove_file(&cert)?;
+        fs::remove_file(&log)?;
+        assert!(policy.prepare(&target).is_err());
+        assert!(result.exists());
+        Ok(())
     }
 
     #[test]

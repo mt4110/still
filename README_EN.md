@@ -42,6 +42,8 @@ Filter candidates by path and use **Select all eligible** to select matching fol
 
 On macOS, start the workspace scan from the home screen. The project list groups immediate child folders by usage, eligible candidate size, and change since the previous scan. Open a project to inspect its generated folders, see why items are held, recheck one item, or open it in Finder. The first scan sets the comparison baseline.
 
+When a standard Cargo `target` is held, still checks the `incremental` and `deps` directories immediately under its debug and release profiles separately. Only caches with verified Cargo markers and recognized compiler entries are selectable. Certificates, logs, results, and unknown entries keep their containing cache on hold.
+
 Relocated Cargo output appears when the scan finds build markers and compiled profiles. **Status** explains blockers such as missing project context, tracked files, symbolic links, and protected entries. The final removal check also checks for changes and files in use.
 
 Use **Reasons** to switch blocker explanations between English and Japanese. **Find old files…** lists large files under your home folder by the latest available modification, access, or creation date, with date details and an open-file check where available. You can select a folder, change the minimum age and size, and filter the results by path. The CLI equivalent is `still stale --older-than-days 180 --min-mib 512`. Old files are shown for review; an access date or open-file check cannot prove a file is unused.

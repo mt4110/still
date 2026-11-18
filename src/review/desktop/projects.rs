@@ -12,6 +12,27 @@ fn divider(ui: &mut egui::Ui) {
         .hline(rect.x_range(), rect.center().y, Stroke::new(1_f32, LINE));
 }
 
+// Reserve exactly the height passed to show_rows. Contents cannot move the
+// next virtual row when a label is long or the scrollbar changes width.
+fn virtual_row(ui: &mut egui::Ui, id: &Path, height: f32) -> egui::Ui {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        Stroke::new(1_f32, LINE),
+    );
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt(id)
+            .max_rect(rect.shrink2(egui::vec2(6., 4.))),
+    );
+    row.set_clip_rect(row.clip_rect().intersect(rect));
+    row
+}
+
 fn primary(text: impl Into<String>) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.into()).color(PAPER))
         .fill(ACCENT)
@@ -33,6 +54,7 @@ struct Project {
     reclaim: u64,
     delta: Option<Delta>,
     files: Vec<usize>,
+    reviewable_cargo_parts: BTreeMap<PathBuf, usize>,
 }
 
 fn name(path: &Path) -> String {
@@ -43,6 +65,10 @@ fn effect(p: Producer) -> &'static str {
     match p {
         Producer::Cargo | Producer::CargoRelocated => {
             "Cargo のビルド出力。次回のビルドで作り直します。"
+        }
+        Producer::CargoIncremental => "Cargo の差分ビルド用キャッシュ。次のビルドで作り直します。",
+        Producer::CargoDependencies => {
+            "Cargo の deps 内のビルド出力。次のビルドやテストで作り直します。"
         }
         Producer::NextJs => "Next.js のビルド出力。実行には再ビルドが必要です。",
         Producer::Vite => "Vite の配布用ファイル。次のビルドで再生成します。",
@@ -70,6 +96,7 @@ impl Projects {
                         reclaim: 0,
                         delta: scan.delta(r),
                         files: vec![],
+                        reviewable_cargo_parts: BTreeMap::new(),
                     },
                 )
             })
@@ -78,6 +105,15 @@ impl Projects {
             .files
             .iter()
             .filter(|c| c.blocked_reason.is_none())
+            .map(|c| c.row.path.as_path())
+            .collect();
+        let held_cargo_targets: BTreeSet<_> = scan
+            .files
+            .iter()
+            .filter(|c| {
+                c.blocked_reason.is_some()
+                    && matches!(c.producer, Producer::Cargo | Producer::CargoRelocated)
+            })
             .map(|c| c.row.path.as_path())
             .collect();
         for (index, candidate) in scan.files.iter().enumerate() {
@@ -91,6 +127,23 @@ impl Projects {
             };
             if let Some(project) = projects.get_mut(&scan.root.join(component)) {
                 project.files.push(index);
+                if candidate.blocked_reason.is_none()
+                    && matches!(
+                        candidate.producer,
+                        Producer::CargoIncremental | Producer::CargoDependencies
+                    )
+                {
+                    if let Some(target) = path
+                        .ancestors()
+                        .skip(1)
+                        .find(|p| held_cargo_targets.contains(p))
+                    {
+                        *project
+                            .reviewable_cargo_parts
+                            .entry(target.to_owned())
+                            .or_default() += 1;
+                    }
+                }
                 if candidate.blocked_reason.is_none()
                     && !path.ancestors().skip(1).any(|p| eligible.contains(p))
                 {
@@ -182,10 +235,12 @@ impl App {
         } else {
             false
         };
+        let compact = ui.available_width() < 410.;
+        let row_height = if compact { 146. } else { 116. };
         egui::ScrollArea::vertical()
             .id_salt(&project.path)
             .max_height((ui.available_height() - 76.).max(120.))
-            .show_rows(ui, 113., project.files.len(), |ui, range| {
+            .show_rows(ui, row_height, project.files.len(), |ui, range| {
                 for i in range {
                     let c = &scan.files[project.files[i]];
                     let path = &c.row.path;
@@ -195,9 +250,21 @@ impl App {
                     {
                         missing.insert(path.clone());
                     }
-                    ui.horizontal(|ui| {
+                    let mut row = virtual_row(ui, path, row_height);
+                    let rect = row.max_rect();
+                    let title_y = rect.top() + 2.;
+                    let left = rect.left() + 34.;
+                    let mut check = row.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(egui::Rect::from_min_size(
+                                egui::pos2(rect.left(), title_y),
+                                egui::vec2(26., 30.),
+                            ))
+                            .layout(egui::Layout::left_to_right(Align::Center)),
+                    );
+                    {
                         let mut selected = self.marked.contains(path);
-                        if ui
+                        if check
                             .add_enabled(
                                 c.blocked_reason.is_none(),
                                 egui::Checkbox::without_text(&mut selected),
@@ -213,38 +280,87 @@ impl App {
                                 self.marked.remove(path);
                             }
                         }
-                        let relative = path
-                            .strip_prefix(&project.path)
-                            .ok()
-                            .filter(|p| !p.as_os_str().is_empty())
-                            .unwrap_or(path);
-                        ui.strong(bytes(c.row.usage.size()));
-                        ui.add(
+                    }
+                    let relative = path
+                        .strip_prefix(&project.path)
+                        .ok()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or(path);
+                    let line_rect = |y, h| {
+                        egui::Rect::from_min_max(
+                            egui::pos2(left, y),
+                            egui::pos2(rect.right(), y + h),
+                        )
+                    };
+                    let title = line_rect(title_y, 30.);
+                    let size_width = 96.;
+                    let mut title_ui = row.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(title)
+                            .layout(egui::Layout::left_to_right(Align::Center)),
+                    );
+                    title_ui
+                        .add_sized(
+                            egui::vec2((title.width() - size_width - 8.).max(1.), 30.),
                             egui::Label::new(RichText::new(display(relative)).size(18.).strong())
+                                .halign(Align::Min)
                                 .truncate(),
                         )
                         .on_hover_text(display(path));
+                    title_ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(RichText::new(bytes(c.row.usage.size())).strong());
                     });
                     let reason = match &c.blocked_reason {
+                        Some(reason)
+                            if matches!(c.producer, Producer::Cargo | Producer::CargoRelocated) =>
+                        {
+                            let available = project.reviewable_cargo_parts.get(path);
+                            let scope = match (self.japanese_reasons, available) {
+                                (true, Some(n)) => {
+                                    format!("全体の削除は保留 · 内訳 {n} 件は個別に確認できます")
+                                }
+                                (false, Some(n)) => format!(
+                                    "Whole target on hold · {n} subfolders available for review"
+                                ),
+                                (true, None) => "全体の削除は保留".into(),
+                                (false, None) => "Whole target on hold".into(),
+                            };
+                            format!("{scope} · {}", reason.text(self.japanese_reasons))
+                        }
                         Some(reason) => {
                             format!("保留 · {}", reason.text(self.japanese_reasons))
                         }
                         None if c.producer == Producer::DeclaredOutput => effect(c.producer).into(),
                         None => format!("{} Git 追跡ファイルなし。", effect(c.producer)),
                     };
-                    ui.add(egui::Label::new(RichText::new(&reason).color(MUTED)).truncate())
+                    let mut body = row.new_child(egui::UiBuilder::new().max_rect(line_rect(
+                        title.bottom() + 2.,
+                        rect.bottom() - title.bottom() - 2.,
+                    )));
+                    body.spacing_mut().item_spacing = egui::vec2(10., 6.);
+                    body.add(egui::Label::new(RichText::new(&reason).color(MUTED)).truncate())
                         .on_hover_text(&reason);
-                    ui.horizontal(|ui| {
+                    let actions = |ui: &mut egui::Ui| {
+                        ui.spacing_mut().button_padding = egui::vec2(12., 4.);
                         if ui.add(primary("Finder で開く ↗")).clicked() {
                             if let Err(err) = open_in_finder(path) {
                                 self.status = err.to_string();
                             }
                         }
-                        if ui.link("この項目を再確認").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new("この項目を再確認").min_size(egui::vec2(0., 34.)),
+                            )
+                            .clicked()
+                        {
                             inspect = Some(path.clone());
                         }
-                    });
-                    divider(ui);
+                    };
+                    if compact {
+                        body.vertical(actions);
+                    } else {
+                        body.horizontal(actions);
+                    }
                 }
             });
         let mut review = false;
@@ -360,8 +476,17 @@ impl App {
         );
         ui.add_space(4.);
         divider(ui);
-        let widths = [(ui.available_width() - 345.).max(140.), 105., 110., 95.];
+        let available = (ui.available_width() - 12. - 3. * ui.spacing().item_spacing.x).max(1.);
+        let column = (available * 0.20).clamp(1., 106.);
+        let delta_width = (available * 0.18).clamp(1., 96.);
+        let widths = [
+            available - 2. * column - delta_width,
+            column,
+            column,
+            delta_width,
+        ];
         ui.horizontal(|ui| {
+            ui.add_space(6.);
             for (i, label) in ["プロジェクト名", "使用量", "候補容量", "前回比"]
                 .iter()
                 .enumerate()
@@ -386,8 +511,8 @@ impl App {
             self.projects.rows.len(),
             |ui, range| {
                 for p in &self.projects.rows[range] {
-                    divider(ui);
-                    ui.horizontal(|ui| {
+                    let mut row = virtual_row(ui, &p.path, 43.);
+                    row.horizontal(|ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(widths[0], 32.),
                             egui::Layout::left_to_right(Align::Center),
@@ -481,7 +606,14 @@ mod tests {
             files: vec![
                 candidate("b/other", 40, false),
                 candidate("b/other/child", 20, false),
-                candidate("a/kept", 100, true),
+                FileCandidate {
+                    producer: Producer::Cargo,
+                    ..candidate("a/target", 100, true)
+                },
+                FileCandidate {
+                    producer: Producer::CargoIncremental,
+                    ..candidate("a/target/debug/incremental", 15, false)
+                },
             ],
             external: vec![],
             notes: vec![],
@@ -489,7 +621,11 @@ mod tests {
         let mut projects = Projects::from_scan(&scan);
         assert_eq!(projects.rows.len(), 2);
         assert_eq!(projects.rows[0].path, root.join("a"));
-        assert_eq!(projects.rows[0].reclaim, 0);
+        assert_eq!(projects.rows[0].reclaim, 15);
+        assert_eq!(
+            projects.rows[0].reviewable_cargo_parts[&root.join("a/target")],
+            1
+        );
         projects.by_candidate = true;
         projects.sort();
         assert_eq!(projects.rows[0].path, root.join("b"));

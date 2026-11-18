@@ -37,7 +37,10 @@ pub fn run(profile: Option<String>) -> Result<()> {
         options,
         Box::new(move |cc| {
             configure_ui(&cc.egui_ctx);
-            let mut app = App::default();
+            let mut app = App {
+                japanese_reasons: cfg!(target_os = "macos"),
+                ..App::default()
+            };
             app.load_names();
             if let Some(name) = profile {
                 app.open_profile(&cc.egui_ctx, name);
@@ -56,6 +59,7 @@ pub fn run(profile: Option<String>) -> Result<()> {
 }
 
 fn configure_ui(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Light);
     let mut visuals = egui::Visuals::light();
     let paper = Color32::from_rgb(250, 249, 246);
     let line = Color32::from_rgb(223, 223, 218);
@@ -86,7 +90,7 @@ fn configure_ui(ctx: &egui::Context) {
         }
         style.spacing.interact_size.y = 30.0;
         style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.button_padding = egui::vec2(12.0, 6.0);
     });
     #[cfg(target_os = "macos")]
     let font = PathBuf::from("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc");
