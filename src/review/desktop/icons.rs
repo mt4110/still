@@ -134,6 +134,20 @@ pub(super) fn button(ui: &mut egui::Ui, icon: Icon, label: &str) -> egui::Respon
         egui::vec2(18.0, 18.0),
     );
     paint(ui, icon_rect, icon, visuals.fg_stroke.color);
+    #[cfg(target_os = "macos")]
+    {
+        let mut text_rect = rect;
+        text_rect.min.x += inset + 18.0 + 8.0;
+        text_rect.max.x -= inset;
+        super::controls::paint_label(
+            ui,
+            text_rect,
+            label,
+            egui::Align::Min,
+            visuals.fg_stroke.color,
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
     ui.painter().galley(
         egui::pos2(
             rect.left() + inset + 18.0 + 8.0,

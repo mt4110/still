@@ -66,13 +66,11 @@ fn navigation(ui: &mut egui::Ui, screen: Screen, active: bool, japanese: bool) -
         screen.icon(),
         color,
     );
-    ui.painter().text(
-        egui::pos2(rect.left() + 40.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(15.0),
-        color,
+    let text_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 40.0, rect.top()),
+        egui::pos2(rect.right() - 12.0, rect.bottom()),
     );
+    super::controls::paint_label(ui, text_rect, label, egui::Align::Min, color);
     if response.has_focus() {
         ui.painter().rect_stroke(
             rect,
@@ -166,17 +164,7 @@ impl App {
                     {
                         self.show_help = true;
                     }
-                    egui::ComboBox::from_id_salt("language")
-                        .width(142.0)
-                        .selected_text(if self.japanese_reasons {
-                            "日本語"
-                        } else {
-                            "English"
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.japanese_reasons, true, "日本語");
-                            ui.selectable_value(&mut self.japanese_reasons, false, "English");
-                        });
+                    let _ = super::controls::language(ui, &mut self.japanese_reasons);
                 });
             });
         egui::CentralPanel::default()
@@ -253,7 +241,8 @@ impl App {
                 }
                 if self.screen == Screen::Workspace || self.screen == Screen::Overview {
                     ui.add_enabled_ui(self.job.is_none(), |ui| {
-                        ui.menu_button(
+                        let _ = super::controls::menu(
+                            ui,
                             text(
                                 self.japanese_reasons,
                                 "調査先とプロファイル",
