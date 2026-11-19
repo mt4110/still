@@ -1,6 +1,10 @@
 use super::{command, command_on, validate_context, validate_endpoint};
 use crate::review::app_storage::command_output;
+use crate::review::message::Message;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+mod actions;
+pub(crate) use actions::{Receipt, Review};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -12,7 +16,7 @@ pub(crate) enum Kind {
     Cache,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub(crate) struct Resource {
     #[serde(rename = "ID")]
@@ -24,6 +28,20 @@ pub(crate) struct Resource {
     pub shared_size: String,
     pub unique_size: String,
     pub mounts: String,
+    #[serde(skip)]
+    pub created: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub started: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub finished: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub restart_count: u64,
+    #[serde(skip)]
+    pub eligible: bool,
+    #[serde(skip, default = "unavailable")]
+    pub reason: Message,
+    #[serde(skip)]
+    pub estimated_bytes: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -39,6 +57,8 @@ pub(crate) struct Report {
     pub context: String,
     pub observed_at: chrono::DateTime<chrono::Local>,
     pub groups: Vec<(Kind, Vec<Resource>)>,
+    daemon: Option<actions::Pin>,
+    snapshots: std::collections::BTreeMap<String, actions::Metadata>,
 }
 
 // Project only storage metadata. Container commands, environment variables,
@@ -71,12 +91,15 @@ pub(crate) fn inspect(context: &str) -> Result<Report> {
     )?;
     let endpoint: String = serde_json::from_str(&endpoint)?;
     validate_endpoint(&endpoint)?;
+    let pin = actions::capture(&endpoint)?;
     let response = command_output(
         command_on(&endpoint).args(["system", "df", "--verbose", "--format", FORMAT]),
         Duration::from_secs(30),
     )
     .context("Docker の容量を取得できませんでした。Docker Desktop または Colima と接続先を確認してください")?;
-    parse(context, &response)
+    let mut report = parse(context, &response)?;
+    actions::enrich(&mut report, pin)?;
+    Ok(report)
 }
 
 fn parse(context: String, json: &str) -> Result<Report> {
@@ -95,17 +118,58 @@ fn parse(context: String, json: &str) -> Result<Report> {
                 .cmp(&size_bytes(&a.size))
                 .then_with(|| a.name.cmp(&b.name))
         });
+        for item in &mut items {
+            item.reason = if kind == Kind::Container {
+                unavailable()
+            } else {
+                Message::new(
+                    "This category is view-only; images, volumes and cache are retained",
+                    "この種類は表示専用です。イメージ・ボリューム・キャッシュは保持します",
+                )
+            };
+        }
         (kind, items)
     })
     .collect();
     Ok(Report {
         context,
         observed_at: chrono::Local::now(),
+        daemon: None,
+        snapshots: Default::default(),
         groups,
     })
 }
 
-fn size_bytes(size: &str) -> Option<u64> {
+fn unavailable() -> Message {
+    Message::new(
+        "Complete container metadata could not be verified",
+        "コンテナの完全な情報を確認できないため削除できません",
+    )
+}
+
+impl Default for Resource {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            size: String::new(),
+            status: String::new(),
+            detail: String::new(),
+            shared_size: String::new(),
+            unique_size: String::new(),
+            mounts: String::new(),
+            created: None,
+            started: None,
+            finished: None,
+            restart_count: 0,
+            eligible: false,
+            reason: unavailable(),
+            estimated_bytes: None,
+        }
+    }
+}
+
+pub(crate) fn size_bytes(size: &str) -> Option<u64> {
     let number_end = size.find(|c: char| !c.is_ascii_digit() && c != '.')?;
     let number: f64 = size[..number_end].parse().ok()?;
     let scale = match size[number_end..].trim() {

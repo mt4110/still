@@ -61,12 +61,13 @@ impl App {
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                refresh = ui
-                    .add_enabled(
-                        !busy && self.sdk.confirmation.is_none(),
-                        egui::Button::new(text(japanese, "再スキャン", "Scan again")),
-                    )
-                    .clicked();
+                refresh = super::controls::button(
+                    ui,
+                    text(japanese, "再スキャン", "Scan again"),
+                    false,
+                    !busy && self.sdk.confirmation.is_none(),
+                )
+                .clicked();
             });
         });
         ui.add_space(4.0);
@@ -119,13 +120,7 @@ impl App {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let label =
                                 text(japanese, "選択した項目を確認", "Review selected versions");
-                            preview = ui
-                                .add_enabled(
-                                    !busy && count > 0,
-                                    egui::Button::new(RichText::new(label).color(Color32::WHITE))
-                                        .fill(ACCENT)
-                                        .min_size(egui::vec2(0.0, super::controls::HEIGHT)),
-                                )
+                            preview = super::controls::button(ui, label, true, !busy && count > 0)
                                 .clicked();
                         });
                     }
@@ -271,20 +266,16 @@ impl App {
                     });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    cancel = ui.button(text(japanese, "戻る", "Back")).clicked();
+                    cancel =
+                        super::controls::button(ui, text(japanese, "戻る", "Back"), false, true)
+                            .clicked();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let label = if japanese {
                             format!("{} 件をアンインストール", review.items.len())
                         } else {
                             format!("Uninstall {} selected", review.items.len())
                         };
-                        uninstall = ui
-                            .add(
-                                egui::Button::new(RichText::new(label).color(Color32::WHITE))
-                                    .fill(Color32::from_rgb(180, 48, 42))
-                                    .min_size(egui::vec2(0.0, super::controls::HEIGHT)),
-                            )
-                            .clicked();
+                        uninstall = super::controls::destructive_button(ui, &label, true).clicked();
                     });
                 });
             });
@@ -340,7 +331,7 @@ fn sdk_rows(
         (text(japanese, "状態", "Status"), 150.0, egui::Align::Min),
     ] {
         cell(&mut header, width, 28.0, align, |ui| {
-            ui.label(RichText::new(title).size(12.0).color(MUTED));
+            super::controls::label(ui, title, 12.0, MUTED, align, egui::Sense::hover());
         });
     }
     ui.separator();
@@ -353,13 +344,15 @@ fn sdk_rows(
         .show_rows(ui, 48.0, report.items.len(), |ui, range| {
             for index in range {
                 let item = &report.items[index];
+                // Include the complete target identity, independent of sort position.
+                let target_id = format!("{:?}", item.target);
                 let (rect, response) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), 48.0),
                     egui::Sense::click(),
                 );
                 let selected = focused.as_ref() == Some(&item.target);
                 let tint = ui.ctx().animate_bool_with_time(
-                    egui::Id::new(("sdk-row-focus", index)),
+                    egui::Id::new(("sdk-row-focus", &target_id)),
                     selected || response.hovered(),
                     ui.style().animation_time.min(0.12),
                 );
@@ -380,23 +373,24 @@ fn sdk_rows(
                 );
                 let mut row = ui.new_child(
                     egui::UiBuilder::new()
-                        .id_salt(("sdk-version", index))
+                        .id_salt(("sdk-version", &target_id))
                         .max_rect(rect.shrink2(egui::vec2(4.0, 6.0)))
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 row.set_clip_rect(row.clip_rect().intersect(rect));
                 let mut checked = marked.contains(&item.target);
-                if row
-                    .add_enabled(
+                if cell(&mut row, HEIGHT, HEIGHT, egui::Align::Min, |ui| {
+                    ui.add_enabled(
                         enabled && item.selectable,
                         egui::Checkbox::without_text(&mut checked),
                     )
-                    .on_hover_text(text(
-                        japanese,
-                        "アンインストールの確認に含める",
-                        "Include in uninstall review",
-                    ))
-                    .changed()
+                })
+                .on_hover_text(text(
+                    japanese,
+                    "アンインストールの確認に含める",
+                    "Include in uninstall review",
+                ))
+                .changed()
                 {
                     if checked {
                         marked.insert(item.target.clone());
@@ -406,11 +400,13 @@ fn sdk_rows(
                     *focused = Some(item.target.clone());
                 }
                 let name_response = cell(&mut row, name_width, HEIGHT, egui::Align::Min, |ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(&item.label).size(15.0).color(INK))
-                            .selectable(false)
-                            .sense(egui::Sense::click())
-                            .truncate(),
+                    super::controls::label(
+                        ui,
+                        &item.label,
+                        15.0,
+                        INK,
+                        egui::Align::Min,
+                        egui::Sense::click(),
                     )
                     .on_hover_text(&item.label)
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -427,17 +423,24 @@ fn sdk_rows(
                     *focused = Some(item.target.clone());
                 }
                 cell(&mut row, 90.0, HEIGHT, egui::Align::Max, |ui| {
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(item.size.map_or_else(|| "—".into(), bytes)).color(INK),
-                        )
-                        .truncate(),
+                    super::controls::label(
+                        ui,
+                        &item.size.map_or_else(|| "—".into(), bytes),
+                        15.0,
+                        INK,
+                        egui::Align::Max,
+                        egui::Sense::hover(),
                     );
                 });
                 let status = item_status(item, japanese);
                 cell(&mut row, 150.0, HEIGHT, egui::Align::Min, |ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(&status).size(13.0).color(INK)).truncate(),
+                    super::controls::label(
+                        ui,
+                        &status,
+                        13.0,
+                        INK,
+                        egui::Align::Min,
+                        egui::Sense::hover(),
                     )
                     .on_hover_text(format!("{status} · {}", item.reason.text(japanese)));
                 });

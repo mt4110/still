@@ -1,11 +1,14 @@
+mod docker_ui;
+
 use super::{bytes, egui, text, App, ACCENT, LINE, MUTED};
 use crate::review::{app_storage::command_output, docker::storage};
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io::Write;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -27,7 +30,17 @@ pub(super) struct Panel {
     history: VecDeque<Rates>,
     next_sample: Option<Instant>,
     docker_job: Option<Receiver<Result<storage::Report>>>,
-    docker: Option<Result<storage::Report>>,
+    docker: Option<Result<Arc<storage::Report>>>,
+    marked: BTreeSet<String>,
+    review: Option<storage::Review>,
+    receipt: Option<storage::Receipt>,
+    receipt_context: String,
+    receipt_names: std::collections::BTreeMap<String, String>,
+    docker_error: String,
+    refresh_pending: bool,
+    sort: docker_ui::Order,
+    filter: docker_ui::Filter,
+    age_days: u16,
     kind: usize,
     query: String,
     selected: Option<(String, String)>,
@@ -256,7 +269,7 @@ impl Panel {
                             self.context = report.context.clone();
                         }
                     }
-                    self.docker = Some(report);
+                    self.docker = Some(report.map(Arc::new));
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.docker_job = None;
@@ -293,6 +306,12 @@ impl Panel {
     }
 
     fn inspect_docker(&mut self, ctx: &egui::Context) {
+        if self.docker_job.is_some() || self.review.is_some() {
+            return;
+        }
+        self.marked.clear();
+        self.docker_error.clear();
+        self.refresh_pending = false;
         self.docker = None;
         self.selected = None;
         let context = self.context.clone();
@@ -468,254 +487,6 @@ impl Panel {
         ui.add_space(12.0);
         ui.label(egui::RichText::new(text(japanese, "この画面を開いている間、約2秒間隔で計測します。読み書きは、このボリュームが使う物理ディスク全体の値です。", "Samples about every two seconds while this view is open. Activity covers the physical disks serving this volume.")).color(MUTED));
     }
-
-    fn docker_view(&mut self, ui: &mut egui::Ui, japanese: bool) {
-        ui.heading("Docker");
-        ui.label(
-            egui::RichText::new(text(
-                japanese,
-                "コンテナ・イメージ・ボリューム・ビルドキャッシュの容量を確認します。",
-                "Inspect containers, images, volumes, and build-cache storage.",
-            ))
-            .color(MUTED),
-        );
-        ui.add_space(24.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(text(japanese, "ローカル接続先", "Local context"));
-            ui.add_enabled(
-                self.docker_job.is_none(),
-                super::controls::field(ui, &mut self.context)
-                    .desired_width(240.0)
-                    .hint_text(text(
-                        japanese,
-                        "現在の Docker 接続先",
-                        "Current Docker context",
-                    )),
-            );
-            if ui
-                .add_enabled(
-                    self.docker_job.is_none(),
-                    egui::Button::new(text(japanese, "容量を調べる", "Inspect storage")),
-                )
-                .clicked()
-            {
-                self.inspect_docker(ui.ctx());
-            }
-            if self.docker_job.is_some() {
-                ui.spinner();
-                ui.label(text(japanese, "調査中…", "Inspecting…"));
-            }
-        });
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new(text(japanese, "Docker 内の容量です。共有レイヤーがあるため、SSD で回収できる容量とは異なる場合があります。", "Docker sizes include shared layers and may differ from SSD space recoverable.")).color(MUTED));
-        ui.add_space(20.0);
-        let Some(result) = &self.docker else {
-            if self.docker_job.is_none() {
-                egui::Frame::group(ui.style())
-                    .inner_margin(egui::Margin::same(20))
-                    .show(ui, |ui| {
-                        ui.strong(text(
-                            japanese,
-                            "接続先を調べる",
-                            "Inspect a local connection",
-                        ));
-                        ui.add_space(6.0);
-                        ui.label(text(
-                            japanese,
-                            "Docker Desktop または Colima を起動し、接続先の容量を調べてください。",
-                            "Start Docker Desktop or Colima, then inspect its storage.",
-                        ));
-                    });
-            }
-            return;
-        };
-        let report = match result {
-            Ok(report) => report,
-            Err(error) => {
-                egui::Frame::group(ui.style())
-                    .inner_margin(egui::Margin::same(16))
-                    .show(ui, |ui| {
-                        ui.strong(text(
-                            japanese,
-                            "Docker に接続できませんでした",
-                            "Docker connection unavailable",
-                        ));
-                        ui.add_space(6.0);
-                        ui.label(format!("{error:#}"));
-                    });
-                return;
-            }
-        };
-        ui.label(format!(
-            "{} · {} · {}",
-            text(japanese, "調査した接続先", "Inspected context"),
-            report.context,
-            report.observed_at.format("%H:%M:%S")
-        ));
-        ui.add_space(12.0);
-        ui.horizontal_wrapped(|ui| {
-            for (index, (kind, items)) in report.groups.iter().enumerate() {
-                if ui
-                    .selectable_value(
-                        &mut self.kind,
-                        index,
-                        format!("{} {}", kind_label(*kind, japanese), items.len()),
-                    )
-                    .clicked()
-                {
-                    self.selected = None;
-                }
-            }
-        });
-        ui.add_space(8.0);
-        ui.add(super::controls::field(ui, &mut self.query).hint_text(text(
-            japanese,
-            "名前・ID・状態で検索",
-            "Search name, ID or state",
-        )));
-        ui.add_space(12.0);
-        let (kind, items) = &report.groups[self.kind];
-        let needle = self.query.to_lowercase();
-        let rows: Vec<_> = items
-            .iter()
-            .filter(|item| {
-                needle.is_empty()
-                    || format!(
-                        "{} {} {} {}",
-                        item.name,
-                        item.id,
-                        item.status,
-                        resource_state(*kind, item, japanese)
-                    )
-                    .to_lowercase()
-                    .contains(&needle)
-            })
-            .collect();
-        if rows.is_empty() {
-            ui.label(text(
-                japanese,
-                "表示する項目はありません",
-                "No matching resources",
-            ));
-        }
-        let name_width = ui.available_width() - 220.0;
-        ui.horizontal(|ui| {
-            super::controls::cell(ui, name_width, 28.0, egui::Align::Min, |ui| {
-                ui.add_space(super::controls::PADDING_X);
-                ui.label(
-                    egui::RichText::new(text(japanese, "名前", "Name"))
-                        .size(12.0)
-                        .color(MUTED),
-                );
-            });
-            super::controls::cell(ui, 90.0, 28.0, egui::Align::Max, |ui| {
-                ui.label(
-                    egui::RichText::new(text(japanese, "容量", "Size"))
-                        .size(12.0)
-                        .color(MUTED),
-                );
-            });
-            ui.label(
-                egui::RichText::new(text(japanese, "状態・参照", "State / references"))
-                    .size(12.0)
-                    .color(MUTED),
-            );
-        });
-        let table_height = (ui.available_height() - 160.0).clamp(180.0, 420.0);
-        egui::ScrollArea::vertical()
-            .id_salt("docker-resources")
-            .max_height(table_height)
-            .show_rows(ui, 34.0, rows.len(), |ui, range| {
-                for index in range {
-                    let item = rows[index];
-                    ui.push_id((&item.id, &item.name), |ui| {
-                        ui.horizontal(|ui| {
-                            let selected = self
-                                .selected
-                                .as_ref()
-                                .is_some_and(|key| key == &(item.id.clone(), item.name.clone()));
-                            if ui
-                                .add_sized(
-                                    [ui.available_width() - 220.0, 28.0],
-                                    egui::Button::new("")
-                                        .left_text(egui::RichText::new(&item.name))
-                                        .frame_when_inactive(false)
-                                        .selected(selected)
-                                        .truncate(),
-                                )
-                                .on_hover_text(&item.name)
-                                .clicked()
-                            {
-                                self.selected = Some((item.id.clone(), item.name.clone()));
-                            }
-                            super::controls::cell(ui, 90.0, 28.0, egui::Align::Max, |ui| {
-                                ui.label(&item.size);
-                            });
-                            ui.label(resource_state(*kind, item, japanese));
-                        });
-                    });
-                }
-            });
-        if let Some(item) = items
-            .iter()
-            .find(|item| self.selected.as_ref() == Some(&(item.id.clone(), item.name.clone())))
-        {
-            ui.add_space(12.0);
-            ui.separator();
-            ui.add_space(8.0);
-            ui.strong(&item.name);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(&item.id);
-                if ui
-                    .small_button(text(japanese, "IDをコピー", "Copy ID"))
-                    .clicked()
-                {
-                    ui.ctx().copy_text(item.id.clone());
-                }
-            });
-            match kind {
-                storage::Kind::Image => {
-                    ui.label(format!(
-                        "{} {} · {} {}",
-                        text(japanese, "共有", "Shared"),
-                        item.shared_size,
-                        text(japanese, "固有", "Unique"),
-                        item.unique_size
-                    ));
-                }
-                storage::Kind::Container => {
-                    ui.label(format!(
-                        "{} {}",
-                        text(japanese, "イメージ", "Image"),
-                        item.detail
-                    ));
-                    ui.label(format!(
-                        "{} {}",
-                        text(japanese, "マウント", "Mounts"),
-                        item.mounts
-                    ));
-                }
-                storage::Kind::Volume => {
-                    ui.label(text(japanese, "ボリュームは未接続でもアプリのデータを保持するため保護しています。", "Volumes are protected because they can retain app data even when unreferenced."));
-                }
-                storage::Kind::Cache => {
-                    ui.label(format!(
-                        "{} {}",
-                        text(japanese, "共有", "Shared"),
-                        text(
-                            japanese,
-                            if item.detail == "true" {
-                                "あり"
-                            } else {
-                                "なし"
-                            },
-                            &item.detail
-                        )
-                    ));
-                }
-            }
-        }
-    }
 }
 
 fn kind_label(kind: storage::Kind, japanese: bool) -> &'static str {
@@ -748,19 +519,17 @@ fn resource_state(kind: storage::Kind, item: &storage::Resource, japanese: bool)
 impl App {
     pub(super) fn monitor_page(&mut self, ui: &mut egui::Ui, tab: Tab) {
         let japanese = self.japanese_reasons;
-        let state = &mut self.monitor;
-        state.poll(ui.ctx());
-        egui::ScrollArea::vertical()
-            .id_salt("storage-monitor-page")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                match tab {
-                    Tab::Disk => state.disk_view(ui, japanese),
-                    Tab::Docker => state.docker_view(ui, japanese),
-                }
-                ui.add_space(20.0);
-            });
+        self.monitor.poll(ui.ctx());
+        if tab == Tab::Docker {
+            self.docker_page(ui);
+        } else {
+            egui::ScrollArea::vertical()
+                .id_salt("storage-monitor-page")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.monitor.disk_view(ui, japanese);
+                });
+        }
     }
 }
 

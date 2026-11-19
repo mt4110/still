@@ -27,8 +27,6 @@ const INK: Color32 = Color32::from_rgb(29, 31, 36);
 const ACCENT: Color32 = Color32::from_rgb(0, 102, 222);
 
 #[cfg(target_os = "macos")]
-const PAPER: Color32 = Color32::WHITE;
-#[cfg(target_os = "macos")]
 const MUTED: Color32 = Color32::from_rgb(95, 100, 110);
 #[cfg(target_os = "macos")]
 const LINE: Color32 = Color32::from_rgb(226, 228, 233);
@@ -301,6 +299,10 @@ enum Outcome {
     SdkScan(Result<super::sdk_cleanup::Report>),
     #[cfg(target_os = "macos")]
     SdkRemoval(Result<super::sdk_cleanup::Receipt>),
+    #[cfg(target_os = "macos")]
+    DockerReview(Result<super::docker::storage::Review>),
+    #[cfg(target_os = "macos")]
+    DockerRemoval(super::docker::storage::Receipt),
     Review(Result<Confirmation>),
     Inspection(Vec<String>),
     Removal(scan::CleanupReceipt),
@@ -480,6 +482,10 @@ impl App {
             Outcome::SdkScan(result) => self.sdk.report = Some(result),
             #[cfg(target_os = "macos")]
             Outcome::SdkRemoval(result) => self.sdk.receipt = Some(result),
+            #[cfg(target_os = "macos")]
+            Outcome::DockerReview(result) => self.monitor.set_review(result),
+            #[cfg(target_os = "macos")]
+            Outcome::DockerRemoval(receipt) => self.monitor.set_receipt(receipt),
             Outcome::Review(Ok(confirmation)) => self.confirmation = Some(confirmation),
             Outcome::Inspection(report) => self.inspection = Some(report),
             Outcome::Removal(results) => {
@@ -1721,6 +1727,8 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         self.sdk_dialog(ctx);
+        #[cfg(target_os = "macos")]
+        self.docker_confirmation(ctx);
         if let Some(name) = &mut self.save_as {
             let mut close = false;
             let mut save = false;
@@ -1792,9 +1800,22 @@ impl App {
                             }
                         },
                     );
-                    close = ui
-                        .button(text(self.japanese_reasons, "閉じる", "Close"))
+                    #[cfg(target_os = "macos")]
+                    {
+                        close = controls::button(
+                            ui,
+                            text(self.japanese_reasons, "閉じる", "Close"),
+                            false,
+                            true,
+                        )
                         .clicked();
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        close = ui
+                            .button(text(self.japanese_reasons, "閉じる", "Close"))
+                            .clicked();
+                    }
                 });
             if close || dialog.should_close() {
                 self.inspection = None;
@@ -1855,23 +1876,46 @@ impl App {
                         });
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        close = ui
-                            .button(text(self.japanese_reasons, "キャンセル", "Cancel"))
-                            .clicked();
-                        delete = ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(text(
-                                        self.japanese_reasons,
-                                        "確認した対象を削除",
-                                        "Delete selected",
-                                    ))
-                                    .color(Color32::WHITE),
-                                )
-                                .fill(Color32::from_rgb(180, 48, 42))
-                                .min_size(egui::vec2(0.0, controls::HEIGHT)),
+                        #[cfg(target_os = "macos")]
+                        {
+                            close = controls::button(
+                                ui,
+                                text(self.japanese_reasons, "キャンセル", "Cancel"),
+                                false,
+                                true,
                             )
                             .clicked();
+                            delete = controls::destructive_button(
+                                ui,
+                                text(
+                                    self.japanese_reasons,
+                                    "確認した対象を削除",
+                                    "Delete selected",
+                                ),
+                                true,
+                            )
+                            .clicked();
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            close = ui
+                                .button(text(self.japanese_reasons, "キャンセル", "Cancel"))
+                                .clicked();
+                            delete = ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(text(
+                                            self.japanese_reasons,
+                                            "確認した対象を削除",
+                                            "Delete selected",
+                                        ))
+                                        .color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(180, 48, 42))
+                                    .min_size(egui::vec2(0.0, controls::HEIGHT)),
+                                )
+                                .clicked();
+                        }
                     });
                 });
             if close || dialog.should_close() {
