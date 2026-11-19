@@ -34,6 +34,12 @@ cargo install --path .
 
 ### Desktop app (macOS / Windows)
 
+The initial interface is Japanese. Use the language menu in the upper right to switch to English. **Help** explains candidate review, held items, deletion, permissions and privacy inside the app.
+
+On the Mac, **Disk** in the header shows capacity for your home volume and separate read/write activity for the physical disks serving it. Sampling runs about every two seconds while this view is open. **Docker** lists local containers, images, volumes and build cache by reported size, with name/ID/state filtering and details for the selected row. Docker storage sizes can differ from actual SSD space recoverable.
+
+Workspace scans report observed file/folder counts, logical bytes and the current directory before checking candidate safety. The [cleanup algorithm and product plan](docs/CLEANUP_STRATEGY.md) describes the proposed Library ownership checks and before/after evidence.
+
 Open `still.app` on macOS or `stilll` from the Windows Start menu. Choose **Add workspace…**, sort folders by size, or search paths recursively. Choose **Save as…** to save a weekly profile. Profiles saved with `still review --save-profile` can also be opened here.
 
 **Cleanup candidates** shows each candidate's size and reason. Select folders and choose **Review … selected** to see what will be affected. Nothing is removed until you choose **Delete selected** in the confirmation dialog. This action is permanent. **Candidate sources** lets you include dedicated script outputs, Git repositories, or a local Docker context. Git and Docker candidates can be inspected in the app and reviewed for removal through the dedicated CLI commands.
@@ -62,7 +68,17 @@ To use the app on another Apple Silicon Mac, ZIP the bundle, transfer it, and pl
 ditto -c -k --sequesterRsrc --keepParent target/still.app target/still-macos-arm64.zip
 ```
 
-After the PR's **Rust CI → build (macos-15)** succeeds, download the app ZIP from **Artifacts → still-macos-arm64** on the workflow run. Local and CI bundles use ad-hoc signing for personal use and are not notarized.
+After the PR's **Rust CI → build (macos-15)** succeeds, download the app ZIP from **Artifacts → still-macos-arm64** on the workflow run. By default, local and CI bundles use ad-hoc signing for personal use and are not notarized.
+
+For organization-managed Macs, explicitly select a **Developer ID Application** certificate in your Keychain and prepare a notarized ZIP. An `Apple Development` certificate is not accepted for this distribution mode.
+
+```sh
+STILL_SIGNING_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
+  scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.2.0 target/still-signed.app
+scripts/notarize-macos-app.sh target/still-signed.app still-notary target/still-notarized.zip
+```
+
+`still-notary` names credentials you have already registered with `notarytool` in your Keychain. The notarization script submits a copy of the app to Apple and publishes a ZIP after acceptance, ticket stapling, and Gatekeeper verification succeed. It preserves the input app and refuses to overwrite an existing output. Organization-specific security software may also require approval under that organization's policy. [Apple Developer ID](https://developer.apple.com/developer-id/), [Apple notarization guide](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
 
 On macOS, **App storage…** measures known Android NDK, Unity, Unreal, browser cache, Slack and Teams log, and Notion data locations under your home folder. It reads metadata without opening logs or databases. The optional Xcode checkbox queries its simulator runtime inventory. Use `still app-storage` or `still app-storage --xcode-runtimes` in the terminal. The view is read-only. Workspace review also identifies protected game assets, autosaves, engine files, and caches.
 

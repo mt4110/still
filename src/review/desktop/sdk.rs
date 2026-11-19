@@ -23,7 +23,11 @@ impl App {
         let roots = self.profile.roots.clone();
         self.spawn(
             ctx,
-            "Checking installed SDK versions…",
+            text(
+                self.japanese_reasons,
+                "インストール済みの SDK を確認中…",
+                "Checking installed SDK versions…",
+            ),
             false,
             move || Outcome::SdkScan(sdk_cleanup::scan(&roots)),
         );
@@ -39,7 +43,7 @@ impl App {
         let state = &mut self.sdk;
         let dialog = egui::Modal::new(egui::Id::new("sdk-storage")).show(ctx, |ui| {
             ui.set_width((ctx.content_rect().width() - 80.0).clamp(590.0, 870.0));
-            ui.heading("Xcode & Android NDK");
+            ui.heading(text(self.japanese_reasons, "Xcode と Android NDK", "Xcode & Android NDK"));
             if let Some(job) = busy {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -48,19 +52,19 @@ impl App {
                 return;
             }
             if let Some(review) = &state.confirmation {
-                ui.label(RichText::new("Uninstall these versions?").strong());
-                ui.label("Tests or builds that use them will need the exact versions installed again.");
+                ui.label(RichText::new(text(self.japanese_reasons, "選択した版をアンインストールしますか？", "Uninstall these versions?")).strong());
+                ui.label(text(self.japanese_reasons, "この版を使うテストやビルドには、同じ版の再インストールが必要です。", "Tests or builds that use them will need the exact versions installed again."));
                 egui::ScrollArea::vertical().max_height(285.0).show(ui, |ui| {
                     for item in &review.items {
-                        ui.label(RichText::new(item_title(item)).strong());
+                        ui.label(RichText::new(item_title(item, self.japanese_reasons)).strong());
                         ui.label(item.reason.text(self.japanese_reasons));
                         ui.separator();
                     }
                 });
                 ui.horizontal(|ui| {
-                    cancel = ui.button("Back").clicked();
+                    cancel = ui.button(text(self.japanese_reasons, "戻る", "Back")).clicked();
                     delete = ui.add(
-                        egui::Button::new(format!("Uninstall {} selected", review.items.len()))
+                        egui::Button::new(if self.japanese_reasons { format!("選択した {} 件をアンインストール", review.items.len()) } else { format!("Uninstall {} selected", review.items.len()) })
                             .fill(Color32::from_rgb(243, 186, 176)),
                     ).clicked();
                 });
@@ -69,14 +73,14 @@ impl App {
             if let Some(result) = &state.receipt {
                 show_receipt(ui, result, self.japanese_reasons);
             } else {
-                ui.label("Checks installed versions and local test or build settings under ~/_workspace, ~/AndroidStudioProjects, and your open profile.");
-                ui.label("A candidate is based on the use records available here. Check old test or build requirements before selecting.");
+                ui.label(text(self.japanese_reasons, "SDK の版と、~/_workspace・~/AndroidStudioProjects・開いているプロファイル内のテスト／ビルド設定を確認します。", "Checks installed versions and local test or build settings under ~/_workspace, ~/AndroidStudioProjects, and your open profile."));
+                ui.label(text(self.japanese_reasons, "候補は確認できた利用記録から判断しています。選択前に、過去のテストやビルドで必要な版か確認してください。", "A candidate is based on the use records available here. Check old test or build requirements before selecting."));
                 match &state.report {
                     Some(Ok(report)) => {
                         let candidates = report.items.iter().filter(|item| item.selectable).count();
                         let residuals = report.items.iter().filter(|item| matches!(item.target, Target::ResidualRuntime { .. })).count();
                         let protected = report.items.len() - candidates - residuals;
-                        ui.label(format!("{candidates} candidates · {protected} protected"));
+                        ui.label(if self.japanese_reasons { format!("候補 {candidates} 件 · 保護 {protected} 件") } else { format!("{candidates} candidates · {protected} protected") });
                         if residuals > 0 {
                             ui.label(if self.japanese_reasons {
                                 format!("一部残存 {residuals} 件")
@@ -90,7 +94,7 @@ impl App {
                                 let title = if residual {
                                     format!("{} · {}", item.label, partial_with_size(item.size, self.japanese_reasons))
                                 } else {
-                                    item_title(item)
+                                    item_title(item, self.japanese_reasons)
                                 };
                                 let mut checked = state.marked.contains(&item.target);
                                 if ui.add_enabled(item.selectable, egui::Checkbox::new(&mut checked, title)).changed() {
@@ -119,7 +123,7 @@ impl App {
                             }
                         });
                     }
-                    Some(Err(error)) => { ui.label(format!("{error:#}")); }
+                    Some(Err(error)) => { ui.label(format!("{} · {error:#}", text(self.japanese_reasons, "SDK の確認に失敗しました", "Could not inspect SDKs"))); }
                     None => {}
                 }
             }
@@ -127,10 +131,10 @@ impl App {
                 ui.label(&state.error);
             }
             ui.horizontal(|ui| {
-                close = ui.button("Close").clicked();
-                refresh = ui.button("Scan again").clicked();
+                close = ui.button(text(self.japanese_reasons, "閉じる", "Close")).clicked();
+                refresh = ui.button(text(self.japanese_reasons, "もう一度調べる", "Scan again")).clicked();
                 if !state.marked.is_empty() {
-                    preview = ui.button(format!("Review {} selected…", state.marked.len())).clicked();
+                    preview = ui.button(if self.japanese_reasons { format!("選択した {} 件を確認…", state.marked.len()) } else { format!("Review {} selected…", state.marked.len()) }).clicked();
                 }
             });
         });
@@ -146,7 +150,11 @@ impl App {
                 state.marked.clear();
                 self.spawn(
                     ctx,
-                    "Uninstalling confirmed SDK versions…",
+                    text(
+                        self.japanese_reasons,
+                        "確認した SDK をアンインストール中…",
+                        "Uninstalling confirmed SDK versions…",
+                    ),
                     true,
                     move || Outcome::SdkRemoval(review.apply()),
                 );
@@ -159,16 +167,43 @@ impl App {
             if let Some(Ok(report)) = &state.report {
                 match Review::new(report, &state.marked, self.profile.roots.clone()) {
                     Ok(review) => state.confirmation = Some(review),
-                    Err(error) => state.error = format!("{error:#}"),
+                    Err(error) => {
+                        state.error = format!(
+                            "{} · {error:#}",
+                            text(
+                                self.japanese_reasons,
+                                "選択した版を再確認してください",
+                                "Check the selected versions"
+                            )
+                        )
+                    }
                 }
             }
         }
     }
 }
 
-fn item_title(item: &Item) -> String {
+fn text(japanese: bool, ja: &'static str, en: &'static str) -> &'static str {
+    if japanese {
+        ja
+    } else {
+        en
+    }
+}
+
+fn item_title(item: &Item, japanese: bool) -> String {
+    let basis = if japanese {
+        match item.basis {
+            "Xcode estimate" => "（Xcode の見積もり）",
+            "remaining image" => "（残存イメージ）",
+            "allocated" => "（ディスク使用量）",
+            other => other,
+        }
+    } else {
+        item.basis
+    };
     match item.size {
-        Some(size) => format!("{} · {} {}", item.label, bytes(size), item.basis),
+        Some(size) => format!("{} · {} {}", item.label, bytes(size), basis),
         None => item.label.clone(),
     }
 }
@@ -199,7 +234,14 @@ fn partial_with_size(image_bytes: Option<u64>, japanese: bool) -> String {
 fn show_receipt(ui: &mut egui::Ui, result: &Result<Receipt>, japanese: bool) {
     match result {
         Err(error) => {
-            ui.label(format!("{error:#}"));
+            ui.label(format!(
+                "{} · {error:#}",
+                text(
+                    japanese,
+                    "アンインストール結果を確認できませんでした",
+                    "Could not verify the uninstall result"
+                )
+            ));
         }
         Ok(receipt) => {
             let (heading, before_label, after_label, measured_label) = if japanese {
@@ -228,7 +270,12 @@ fn show_receipt(ui: &mut egui::Ui, result: &Result<Receipt>, japanese: bool) {
                 }
                 Err(error) => {
                     ui.label(format!(
-                        "Could not measure free space after cleanup · {error:#}"
+                        "{} · {error:#}",
+                        text(
+                            japanese,
+                            "削除後の空き容量を取得できませんでした",
+                            "Could not measure free space after cleanup"
+                        )
                     ));
                 }
             }
@@ -260,7 +307,14 @@ fn show_receipt(ui: &mut egui::Ui, result: &Result<Receipt>, japanese: bool) {
                                 "Could not verify complete removal"
                             }
                             .into(),
-                            Err(error) => format!("{error:#}"),
+                            Err(error) => format!(
+                                "{} · {error:#}",
+                                text(
+                                    japanese,
+                                    "処理を完了できませんでした",
+                                    "Could not complete the operation"
+                                )
+                            ),
                         };
                         ui.label(format!("{label} · {detail}"));
                     }

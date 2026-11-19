@@ -9,6 +9,9 @@ use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+pub(super) mod storage;
+
 #[derive(Debug, Eq, PartialEq)]
 struct Daemon {
     endpoint: String,
@@ -289,13 +292,7 @@ fn protected_volumes(daemon: &Daemon) -> Result<Vec<ReviewCandidate>> {
 }
 
 fn connect(context: &str) -> Result<Daemon> {
-    if context.is_empty()
-        || !context
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    {
-        bail!("Invalid Docker context name");
-    }
+    validate_context(context)?;
     let mut command = command();
     let result = execute(
         command.args([
@@ -308,9 +305,7 @@ fn connect(context: &str) -> Result<Daemon> {
         "context inspect",
     )?;
     let endpoint: String = serde_json::from_slice(&result)?;
-    if !endpoint.starts_with("unix:///") && !endpoint.starts_with("npipe:////./pipe/") {
-        bail!("Select a Docker context with a local Unix socket or Windows named pipe");
-    }
+    validate_endpoint(&endpoint)?;
     let mut base = command_on(&endpoint);
     let result = execute(base.args(["info", "--format", "{{json .ID}}"]), "info")?;
     let id: String = serde_json::from_slice(&result)?;
@@ -318,6 +313,24 @@ fn connect(context: &str) -> Result<Daemon> {
         bail!("Docker did not identify the daemon");
     }
     Ok(Daemon { endpoint, id })
+}
+
+fn validate_context(context: &str) -> Result<()> {
+    if context.is_empty()
+        || !context
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        bail!("Invalid Docker context name");
+    }
+    Ok(())
+}
+
+fn validate_endpoint(endpoint: &str) -> Result<()> {
+    if !endpoint.starts_with("unix:///") && !endpoint.starts_with("npipe:////./pipe/") {
+        bail!("Select a Docker context with a local Unix socket or Windows named pipe");
+    }
+    Ok(())
 }
 
 pub fn protect_bind_mounts(context: &str, output: &Path) -> Result<()> {

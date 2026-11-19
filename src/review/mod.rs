@@ -30,14 +30,29 @@ use std::process::Command;
 
 fn external_command(name: &str) -> Command {
     #[cfg(target_os = "macos")]
-    let program = std::env::var_os("PATH")
-        .iter()
-        .flat_map(std::env::split_paths)
-        .chain(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from))
-        .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(name))
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| PathBuf::from(name));
+    let program = {
+        let mut fallback = vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/bin"),
+        ];
+        if name == "docker" {
+            if let Some(dirs) = directories::BaseDirs::new() {
+                fallback.push(dirs.home_dir().join(".docker/bin"));
+            }
+            fallback.push(PathBuf::from(
+                "/Applications/Docker.app/Contents/Resources/bin",
+            ));
+        }
+        std::env::var_os("PATH")
+            .iter()
+            .flat_map(std::env::split_paths)
+            .chain(fallback)
+            .filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| PathBuf::from(name))
+    };
     #[cfg(not(target_os = "macos"))]
     let program = name;
     #[allow(unused_mut)]

@@ -5,7 +5,76 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+
+#[derive(Default)]
+pub struct ScanProgress {
+    files: AtomicU64,
+    directories: AtomicU64,
+    logical_bytes: AtomicU64,
+    current_directory: Mutex<Option<PathBuf>>,
+    inventory_done: AtomicBool,
+}
+
+#[cfg(any(
+    test,
+    all(feature = "desktop", any(target_os = "macos", target_os = "windows"))
+))]
+pub struct ProgressSnapshot {
+    pub files: u64,
+    pub directories: u64,
+    pub logical_bytes: u64,
+    pub current_directory: Option<PathBuf>,
+    pub inventory_done: bool,
+}
+
+impl ScanProgress {
+    #[cfg(any(
+        test,
+        all(feature = "desktop", any(target_os = "macos", target_os = "windows"))
+    ))]
+    pub fn snapshot(&self) -> ProgressSnapshot {
+        let inventory_done = self.inventory_done.load(Ordering::Acquire);
+        ProgressSnapshot {
+            files: self.files.load(Ordering::Relaxed),
+            directories: self.directories.load(Ordering::Relaxed),
+            logical_bytes: self.logical_bytes.load(Ordering::Relaxed),
+            current_directory: self
+                .current_directory
+                .lock()
+                .expect("scan progress")
+                .clone(),
+            inventory_done,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProgressBatch {
+    files: u64,
+    directories: u64,
+    logical_bytes: u64,
+}
+
+impl ProgressBatch {
+    fn publish(&mut self, progress: Option<&ScanProgress>, directory: Option<&Path>) {
+        let pending = std::mem::take(self);
+        let Some(progress) = progress else { return };
+        progress.files.fetch_add(pending.files, Ordering::Relaxed);
+        progress
+            .directories
+            .fetch_add(pending.directories, Ordering::Relaxed);
+        progress
+            .logical_bytes
+            .fetch_add(pending.logical_bytes, Ordering::Relaxed);
+        if let Some(directory) = directory {
+            if let Ok(mut current) = progress.current_directory.try_lock() {
+                *current = Some(directory.to_owned());
+            }
+        }
+    }
+}
 
 #[derive(Clone, Default, Serialize)]
 pub struct Usage {
@@ -76,9 +145,25 @@ struct Batch {
 const MATCH_LIMIT: usize = 1000;
 
 pub fn scan(root: &Path, threads: u16, query: Option<&str>) -> Result<Inventory> {
+    scan_with_progress(root, threads, query, None)
+}
+
+pub fn scan_with_progress(
+    root: &Path,
+    threads: u16,
+    query: Option<&str>,
+    progress: Option<&ScanProgress>,
+) -> Result<Inventory> {
     let root_metadata = fs::symlink_metadata(root)?;
     if !root_metadata.is_dir() || is_link(&root_metadata) {
         bail!("Scan root must be a directory: {root:?}");
+    }
+    if let Some(progress) = progress {
+        progress.files.store(0, Ordering::Relaxed);
+        progress.directories.store(1, Ordering::Relaxed);
+        progress.logical_bytes.store(0, Ordering::Relaxed);
+        progress.inventory_done.store(false, Ordering::Release);
+        *progress.current_directory.lock().expect("scan progress") = Some(root.to_owned());
     }
 
     let mut merged = Batch::default();
@@ -96,6 +181,8 @@ pub fn scan(root: &Path, threads: u16, query: Option<&str>) -> Result<Inventory>
         let mut worker = Worker {
             results: &result,
             batch: Batch::default(),
+            progress,
+            pending_progress: ProgressBatch::default(),
         };
         let query = query.as_deref();
         let root_metadata = &root_metadata;
@@ -148,7 +235,7 @@ pub fn scan(root: &Path, threads: u16, query: Option<&str>) -> Result<Inventory>
     });
     matches.truncate(MATCH_LIMIT);
 
-    Ok(Inventory {
+    let inventory = Inventory {
         directories: paths
             .into_iter()
             .map(|path| Row {
@@ -160,12 +247,18 @@ pub fn scan(root: &Path, threads: u16, query: Option<&str>) -> Result<Inventory>
         omitted_matches: (match_count + directory_matches).saturating_sub(matches.len()),
         cargo_marker_dirs,
         matches,
-    })
+    };
+    if let Some(progress) = progress {
+        progress.inventory_done.store(true, Ordering::Release);
+    }
+    Ok(inventory)
 }
 
 struct Worker<'a> {
     results: &'a Mutex<Batch>,
     batch: Batch,
+    progress: Option<&'a ScanProgress>,
+    pending_progress: ProgressBatch,
 }
 
 impl Worker<'_> {
@@ -196,6 +289,7 @@ impl Worker<'_> {
             return WalkState::Skip;
         } else if metadata.is_dir() {
             self.batch.directories.entry(path.to_owned()).or_default();
+            self.pending_progress.directories += 1;
         } else if metadata.is_file() {
             if matches!(
                 path.file_name().and_then(|name| name.to_str()),
@@ -204,6 +298,11 @@ impl Worker<'_> {
                 self.batch.cargo_marker_dirs.insert(parent.to_owned());
             }
             let stats = Usage::file(&metadata);
+            self.pending_progress.files += 1;
+            self.pending_progress.logical_bytes = self
+                .pending_progress
+                .logical_bytes
+                .saturating_add(metadata.len());
             let counted = stats.clone();
             #[cfg(unix)]
             let counted = {
@@ -233,12 +332,19 @@ impl Worker<'_> {
         } else {
             usage.skipped += 1;
         }
+        if self.pending_progress.files + self.pending_progress.directories >= 128 {
+            self.pending_progress.publish(
+                self.progress,
+                Some(if metadata.is_dir() { path } else { parent }),
+            );
+        }
         WalkState::Continue
     }
 }
 
 impl Drop for Worker<'_> {
     fn drop(&mut self) {
+        self.pending_progress.publish(self.progress, None);
         let mut results = self.results.lock().expect("walker results");
         for (path, usage) in self.batch.directories.drain() {
             results.directories.entry(path).or_default().add(&usage);
@@ -459,4 +565,43 @@ pub fn display(path: &Path) -> String {
 
 fn serialize_path<S: serde::Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(&display(path))
+}
+
+#[cfg(test)]
+#[test]
+fn scan_progress_finishes_with_the_inventory_counts() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    fs::create_dir(root.join("files"))?;
+    fs::create_dir(root.join("empty"))?;
+    for index in 0..257 {
+        fs::write(root.join("files").join(format!("{index}.bin")), [0; 17])?;
+    }
+    let progress = ScanProgress::default();
+    let inventory = scan_with_progress(&root, 4, None, Some(&progress))?;
+    let observed = progress.snapshot();
+    let total = &inventory
+        .directories
+        .iter()
+        .find(|row| row.path == root)
+        .unwrap()
+        .usage;
+    assert!(observed.inventory_done);
+    assert_eq!(observed.files, 257);
+    assert_eq!(observed.files, total.files);
+    assert_eq!(observed.logical_bytes, total.logical_bytes);
+    assert_eq!(observed.directories, inventory.directories.len() as u64);
+    assert!(observed
+        .current_directory
+        .as_ref()
+        .is_some_and(|path| path.starts_with(&root)));
+
+    scan_with_progress(&root.join("empty"), 2, None, Some(&progress))?;
+    let empty = progress.snapshot();
+    assert!(empty.inventory_done);
+    assert_eq!(
+        (empty.files, empty.directories, empty.logical_bytes),
+        (0, 1, 0)
+    );
+    Ok(())
 }

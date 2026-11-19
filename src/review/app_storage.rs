@@ -246,6 +246,11 @@ mod mac {
             .context("Could not launch the management tool")?;
         let deadline = Instant::now() + timeout;
         loop {
+            if output.metadata()?.len() > 4 * 1024 * 1024 {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("Management tool output exceeded 4 MiB");
+            }
             if let Some(status) = child.try_wait()? {
                 if status.success() {
                     break;

@@ -197,7 +197,7 @@ impl App {
             return;
         }
         ui.add_space(6.);
-        ui.label(RichText::new(name(&project.path)).size(33.).strong());
+        ui.label(RichText::new(name(&project.path)).size(26.).strong());
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("使用量  {}", bytes(project.size))).color(MUTED));
             ui.label(
@@ -207,7 +207,7 @@ impl App {
             );
         });
         ui.add_space(14.);
-        ui.label(RichText::new("掃除候補と保留理由").size(22.).strong());
+        ui.label(RichText::new("掃除候補と保留理由").size(20.).strong());
         divider(ui);
         if project.files.is_empty() {
             ui.label("このフォルダで確認できた生成物候補はありません。");
@@ -430,7 +430,7 @@ impl App {
 
     fn project_list(&mut self, ui: &mut egui::Ui) {
         let scan = self.scan.as_ref().unwrap();
-        ui.label(RichText::new(name(&scan.root)).size(34.).strong());
+        ui.label(RichText::new(name(&scan.root)).size(26.).strong());
         if let Some((p, delta)) = self
             .projects
             .rows
@@ -454,7 +454,7 @@ impl App {
         }
         ui.add_space(18.);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("プロジェクト").size(22.).strong());
+            ui.label(RichText::new("プロジェクト").size(20.).strong());
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 let mut by_candidate = self.projects.by_candidate;
                 egui::ComboBox::from_id_salt("project-sort")
@@ -522,6 +522,11 @@ impl App {
                             egui::Layout::left_to_right(Align::Center),
                             |ui| {
                                 ui.set_width(widths[0]);
+                                let (icon, _) = ui.allocate_exact_size(
+                                    egui::vec2(18.0, 18.0),
+                                    egui::Sense::hover(),
+                                );
+                                super::icons::paint(ui, icon, super::icons::Icon::Folder, ACCENT);
                                 let link = egui::Button::new(
                                     RichText::new(format!("{} ›", name(&p.path)))
                                         .color(ACCENT)

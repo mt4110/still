@@ -97,7 +97,7 @@ impl App {
         );
         if let Some((free, total)) = self.home.capacity {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(bytes(free)).size(48.0).strong().color(INK));
+                ui.label(RichText::new(bytes(free)).size(34.0).strong().color(INK));
                 ui.label(
                     RichText::new(format!("/ {}", bytes(total)))
                         .size(19.0)
@@ -144,7 +144,7 @@ impl App {
 
                 if let Some(last) = &self.home.recent {
                     ui.label(RichText::new("前回調べた場所").color(MUTED));
-                    ui.label(RichText::new(&path_label).size(23.0).strong().color(INK));
+                    ui.label(RichText::new(&path_label).size(22.0).strong().color(INK));
                     let completed = last
                         .completed
                         .with_timezone(&Local)
@@ -153,7 +153,7 @@ impl App {
                     ui.label(RichText::new(format!("前回のスキャン　{completed}")).color(MUTED));
                 } else {
                     ui.label(RichText::new("開発ワークスペース").color(MUTED));
-                    ui.label(RichText::new(&path_label).size(23.0).strong().color(INK));
+                    ui.label(RichText::new(&path_label).size(22.0).strong().color(INK));
                 }
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 ui.add_space(8.0);

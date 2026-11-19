@@ -24,6 +24,7 @@ impl Scan {
         profile_name: Option<&str>,
         baseline: Option<Baseline>,
         record: bool,
+        progress: &inventory::ScanProgress,
     ) -> Result<Self> {
         let Scope {
             roots,
@@ -34,7 +35,7 @@ impl Scan {
             .get(index)
             .context("Workspace is no longer available")?
             .clone();
-        let inventory = inventory::scan(&root, THREADS, None)?;
+        let inventory = inventory::scan_with_progress(&root, THREADS, None, Some(progress))?;
         let findings = sources.collect(&policy);
         let external = candidates::deduplicate(findings.rows(&inventory));
         let mut notes = findings.notes;
