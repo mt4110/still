@@ -1,3 +1,4 @@
+mod controls;
 mod help;
 #[cfg(target_os = "macos")]
 mod home;
@@ -9,6 +10,8 @@ mod projects;
 mod scan;
 #[cfg(target_os = "macos")]
 mod sdk;
+#[cfg(target_os = "macos")]
+mod shell;
 
 use super::message::Message;
 use super::{app_storage, bytes, inventory, profile_for, resolve, stale, Profile};
@@ -20,21 +23,21 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 
-const INK: Color32 = Color32::from_rgb(41, 46, 50);
-const ACCENT: Color32 = Color32::from_rgb(50, 104, 91);
+const INK: Color32 = Color32::from_rgb(29, 31, 36);
+const ACCENT: Color32 = Color32::from_rgb(0, 102, 222);
 
 #[cfg(target_os = "macos")]
-const PAPER: Color32 = Color32::from_rgb(250, 249, 246);
+const PAPER: Color32 = Color32::WHITE;
 #[cfg(target_os = "macos")]
-const MUTED: Color32 = Color32::from_rgb(88, 99, 95);
+const MUTED: Color32 = Color32::from_rgb(95, 100, 110);
 #[cfg(target_os = "macos")]
-const LINE: Color32 = Color32::from_rgb(223, 223, 218);
+const LINE: Color32 = Color32::from_rgb(226, 228, 233);
 
 pub fn run(profile: Option<String>) -> Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1110.0, 720.0])
-            .with_min_inner_size([760.0, 520.0]),
+            .with_inner_size([1240.0, 800.0])
+            .with_min_inner_size([980.0, 640.0]),
         ..Default::default()
     };
     let result = eframe::run_native(
@@ -66,17 +69,22 @@ pub fn run(profile: Option<String>) -> Result<()> {
 fn configure_ui(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Light);
     let mut visuals = egui::Visuals::light();
-    let paper = Color32::from_rgb(250, 249, 246);
-    let line = Color32::from_rgb(223, 223, 218);
+    let paper = Color32::WHITE;
+    let line = Color32::from_rgb(226, 228, 233);
     visuals.panel_fill = paper;
     visuals.window_fill = paper;
-    visuals.weak_text_color = Some(Color32::from_rgb(88, 99, 95));
+    visuals.window_corner_radius = egui::CornerRadius::same(12);
+    visuals.weak_text_color = Some(Color32::from_rgb(95, 100, 110));
     visuals.hyperlink_color = ACCENT;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, line);
     visuals.widgets.inactive.weak_bg_fill = paper;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, line);
-    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(236, 238, 232);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(240, 245, 253);
+    visuals.widgets.hovered.bg_stroke =
+        egui::Stroke::new(1.0_f32, Color32::from_rgb(160, 185, 222));
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(220, 235, 254);
+    visuals.widgets.active.fg_stroke.color = INK;
+    visuals.widgets.hovered.fg_stroke.color = INK;
     for widget in [
         &mut visuals.widgets.inactive,
         &mut visuals.widgets.hovered,
@@ -87,13 +95,14 @@ fn configure_ui(ctx: &egui::Context) {
     }
     visuals.widgets.noninteractive.fg_stroke.color = INK;
     visuals.widgets.inactive.fg_stroke.color = INK;
-    visuals.selection.bg_fill = Color32::from_rgb(201, 234, 226);
+    visuals.selection.bg_fill = Color32::from_rgb(220, 234, 255);
+    visuals.selection.stroke.color = ACCENT;
     ctx.set_visuals(visuals);
     ctx.global_style_mut(|style| {
         for (kind, size) in [
             (egui::TextStyle::Heading, 22.0),
             (egui::TextStyle::Body, 15.0),
-            (egui::TextStyle::Button, 14.0),
+            (egui::TextStyle::Button, 15.0),
             (egui::TextStyle::Small, 12.0),
         ] {
             style
@@ -103,9 +112,11 @@ fn configure_ui(ctx: &egui::Context) {
         style
             .text_styles
             .insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.0));
-        style.spacing.interact_size.y = 32.0;
-        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        style.spacing.button_padding = egui::vec2(12.0, 6.0);
+        style.spacing.window_margin = egui::Margin::same(22);
+        style.spacing.interact_size.y = controls::HEIGHT;
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(controls::PADDING_X, 8.0);
+        style.animation_time = if reduce_motion() { 0.0 } else { 0.12 };
     });
     #[cfg(target_os = "macos")]
     let font = PathBuf::from("/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc");
@@ -115,6 +126,17 @@ fn configure_ui(ctx: &egui::Context) {
         .join("YuGothM.ttc");
     if let Ok(data) = std::fs::read(font) {
         let mut fonts = egui::FontDefinitions::default();
+        #[cfg(target_os = "macos")]
+        if let Ok(data) = std::fs::read("/System/Library/Fonts/SFNS.ttf") {
+            fonts
+                .font_data
+                .insert("system-ui".into(), egui::FontData::from_owned(data).into());
+            fonts
+                .families
+                .entry(egui::FontFamily::Proportional)
+                .or_default()
+                .insert(0, "system-ui".into());
+        }
         fonts.font_data.insert(
             "system-japanese".into(),
             egui::FontData::from_owned(data).into(),
@@ -124,6 +146,24 @@ fn configure_ui(ctx: &egui::Context) {
         }
         ctx.set_fonts(fonts);
     }
+}
+
+fn reduce_motion() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::{process::Command, time::Duration};
+        app_storage::command_output(
+            Command::new("/usr/bin/defaults").args([
+                "read",
+                "com.apple.universalaccess",
+                "reduceMotion",
+            ]),
+            Duration::from_secs(1),
+        )
+        .is_ok_and(|value| value.trim() == "1")
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -171,6 +211,12 @@ fn finder_breadcrumb(ui: &mut egui::Ui, path: &Path, japanese: bool) -> Option<S
         }
     });
     error
+}
+
+fn modal_frame(ctx: &egui::Context) -> egui::Frame {
+    egui::Frame::popup(&ctx.global_style())
+        .inner_margin(24)
+        .corner_radius(12)
 }
 
 fn text<'a>(japanese: bool, ja: &'a str, en: &'a str) -> &'a str {
@@ -267,6 +313,10 @@ impl Default for StaleFiles {
 
 #[derive(Default)]
 struct App {
+    #[cfg(target_os = "macos")]
+    screen: shell::Screen,
+    #[cfg(target_os = "macos")]
+    app_storage_selected: bool,
     #[cfg(target_os = "macos")]
     projects: projects::Projects,
     #[cfg(target_os = "macos")]
@@ -445,6 +495,9 @@ impl App {
     }
 
     fn open_profile(&mut self, ctx: &egui::Context, name: String) {
+        if self.job.is_some() {
+            return;
+        }
         match Profile::load(&name).and_then(|p| resolve(p, true)) {
             Ok(scope) => {
                 self.profile = profile_for(&scope.roots, &scope.policy, &scope.sources);
@@ -470,6 +523,9 @@ impl App {
     }
 
     fn add_workspace(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.job.is_some() {
+            return;
+        }
         match inventory::safe_workspace_dir(&path) {
             Ok(path) => {
                 if let Some(index) = self.profile.roots.iter().position(|root| *root == path) {
@@ -496,6 +552,8 @@ impl App {
         if self.job.is_some() {
             return;
         }
+        #[cfg(target_os = "macos")]
+        self.navigate(shell::Screen::Workspace);
         self.marked.clear();
         self.matches.clear();
         if self.view == View::Search {
@@ -693,6 +751,7 @@ impl App {
             .sort_by(|a, b| b.order.cmp(&a.order).then(a.name.cmp(&b.name)));
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
@@ -831,6 +890,7 @@ impl App {
             })
             .clicked()
         {
+            ui.close();
             self.show_stale_files = true;
         }
         #[cfg(target_os = "macos")]
@@ -847,6 +907,7 @@ impl App {
             })
             .clicked()
         {
+            ui.close();
             self.show_app_storage = true;
         }
         if ui
@@ -862,6 +923,7 @@ impl App {
             })
             .clicked()
         {
+            ui.close();
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 self.add_workspace(ctx, path);
             }
@@ -918,6 +980,7 @@ impl App {
             })
             .clicked()
         {
+            ui.close();
             self.save_as = Some(String::new());
         }
         if ui
@@ -927,6 +990,7 @@ impl App {
             )
             .clicked()
         {
+            ui.close();
             self.cleanup_receipt = None;
             self.refresh(ctx, true);
         }
@@ -982,13 +1046,11 @@ impl App {
                         "ローカル Docker 接続先",
                         "Local Docker context",
                     ));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.docker_input).hint_text(text(
-                            self.japanese_reasons,
-                            "例 colima",
-                            "e.g. colima",
-                        )),
-                    );
+                    ui.add(controls::field(ui, &mut self.docker_input).hint_text(text(
+                        self.japanese_reasons,
+                        "例 colima",
+                        "e.g. colima",
+                    )));
                     if ui
                         .button(text(self.japanese_reasons, "接続先を設定", "Set context"))
                         .clicked()
@@ -1024,12 +1086,12 @@ impl App {
                 ));
                 ui.horizontal(|ui| {
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.kube_context)
+                        controls::field(ui, &mut self.kube_context)
                             .desired_width(140.0)
                             .hint_text(text(self.japanese_reasons, "接続先", "Context")),
                     );
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.kube_namespace)
+                        controls::field(ui, &mut self.kube_namespace)
                             .desired_width(140.0)
                             .hint_text(text(self.japanese_reasons, "名前空間", "Namespace")),
                     );
@@ -1205,7 +1267,7 @@ impl App {
             if self.view == View::Candidates {
                 if ui
                     .add(
-                        egui::TextEdit::singleline(&mut self.candidate_filter).hint_text(text(
+                        controls::field(ui, &mut self.candidate_filter).hint_text(text(
                             self.japanese_reasons,
                             "候補名で絞り込む",
                             "Filter candidates",
@@ -1217,7 +1279,7 @@ impl App {
                     self.rebuild();
                 }
             } else {
-                let input = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text(text(
+                let input = ui.add(controls::field(ui, &mut self.query).hint_text(text(
                     self.japanese_reasons,
                     "フォルダ・ファイル名を検索",
                     "Search paths",
@@ -1623,48 +1685,46 @@ impl App {
         if self.show_help {
             self.help_dialog(ctx);
         }
-        #[cfg(target_os = "macos")]
-        if self.monitor.open {
-            self.monitor_dialog(ctx);
-        }
+        #[cfg(not(target_os = "macos"))]
         if self.show_stale_files {
-            self.stale_dialog(ctx);
+            self.stale_dialog(ctx, None);
         }
+        #[cfg(not(target_os = "macos"))]
         if self.show_app_storage {
-            self.app_storage_dialog(ctx);
+            self.app_storage_dialog(ctx, None);
         }
         #[cfg(target_os = "macos")]
-        if self.sdk.open {
-            self.sdk_dialog(ctx);
-        }
+        self.sdk_dialog(ctx);
         if let Some(name) = &mut self.save_as {
             let mut close = false;
             let mut save = false;
-            let dialog = egui::Modal::new(egui::Id::new("save-profile")).show(ctx, |ui| {
-                ui.heading(text(
-                    self.japanese_reasons,
-                    "週次プロファイルを保存",
-                    "Save weekly profile",
-                ));
-                ui.label(text(
-                    self.japanese_reasons,
-                    "名前には半角英小文字・数字・ハイフン・アンダースコアを使えます。",
-                    "Use lowercase letters, digits, hyphens or underscores.",
-                ));
-                ui.text_edit_singleline(name);
-                ui.horizontal(|ui| {
-                    close = ui
-                        .button(text(self.japanese_reasons, "キャンセル", "Cancel"))
-                        .clicked();
-                    save = ui
-                        .button(text(
-                            self.japanese_reasons,
-                            "プロファイルを保存",
-                            "Save profile",
-                        ))
-                        .clicked();
+            let dialog = egui::Modal::new(egui::Id::new("save-profile"))
+                .frame(modal_frame(ctx))
+                .show(ctx, |ui| {
+                    ui.heading(text(
+                        self.japanese_reasons,
+                        "週次プロファイルを保存",
+                        "Save weekly profile",
+                    ));
+                    ui.label(text(
+                        self.japanese_reasons,
+                        "名前には半角英小文字・数字・ハイフン・アンダースコアを使えます。",
+                        "Use lowercase letters, digits, hyphens or underscores.",
+                    ));
+                    ui.add(controls::field(ui, name));
+                    ui.horizontal(|ui| {
+                        close = ui
+                            .button(text(self.japanese_reasons, "キャンセル", "Cancel"))
+                            .clicked();
+                        save = ui
+                            .button(text(
+                                self.japanese_reasons,
+                                "プロファイルを保存",
+                                "Save profile",
+                            ))
+                            .clicked();
+                    });
                 });
-            });
             if close || dialog.should_close() {
                 self.save_as = None;
             } else if save {
@@ -1686,28 +1746,30 @@ impl App {
         }
         if let Some(report) = &self.inspection {
             let mut close = false;
-            let dialog = egui::Modal::new(egui::Id::new("inspection")).show(ctx, |ui| {
-                ui.set_width((ctx.content_rect().width() - 80.0).clamp(560.0, 940.0));
-                ui.heading(text(
-                    self.japanese_reasons,
-                    "選んだフォルダの確認結果",
-                    "Selected folder scan",
-                ));
-                egui::ScrollArea::vertical().max_height(320.0).show_rows(
-                    ui,
-                    28.0,
-                    report.len(),
-                    |ui, range| {
-                        for line in &report[range] {
-                            ui.add(egui::Label::new(line).truncate())
-                                .on_hover_text(line);
-                        }
-                    },
-                );
-                close = ui
-                    .button(text(self.japanese_reasons, "閉じる", "Close"))
-                    .clicked();
-            });
+            let dialog = egui::Modal::new(egui::Id::new("inspection"))
+                .frame(modal_frame(ctx))
+                .show(ctx, |ui| {
+                    ui.set_width((ctx.content_rect().width() - 80.0).clamp(560.0, 940.0));
+                    ui.heading(text(
+                        self.japanese_reasons,
+                        "選んだフォルダの確認結果",
+                        "Selected folder scan",
+                    ));
+                    egui::ScrollArea::vertical().max_height(320.0).show_rows(
+                        ui,
+                        28.0,
+                        report.len(),
+                        |ui, range| {
+                            for line in &report[range] {
+                                ui.add(egui::Label::new(line).truncate())
+                                    .on_hover_text(line);
+                            }
+                        },
+                    );
+                    close = ui
+                        .button(text(self.japanese_reasons, "閉じる", "Close"))
+                        .clicked();
+                });
             if close || dialog.should_close() {
                 self.inspection = None;
             }
@@ -1715,64 +1777,77 @@ impl App {
         if let Some(confirmation) = &self.confirmation {
             let mut delete = false;
             let mut close = false;
-            let dialog = egui::Modal::new(egui::Id::new("delete-review")).show(ctx, |ui| {
-                ui.set_min_width(500.0);
-                ui.heading(if self.japanese_reasons {
-                    format!(
-                        "{} 件のフォルダを完全に削除しますか？",
-                        confirmation.items().len()
-                    )
-                } else {
-                    format!("Delete {} folders permanently?", confirmation.items().len())
-                });
-                ui.label(text(
-                    self.japanese_reasons,
-                    "下の実行ボタンを押すと、このフォルダを完全に削除します。",
-                    "These folders will be removed immediately when you confirm.",
-                ));
-                egui::ScrollArea::vertical().max_height(235.0).show_rows(
-                    ui,
-                    58.0,
-                    confirmation.items().len(),
-                    |ui, range| {
-                        for item in &confirmation.items()[range] {
-                            let path = display(&item.path);
-                            ui.add(egui::Label::new(&path).truncate())
-                                .on_hover_text(path);
-                            let (english, japanese) = item.producer.explanation();
-                            ui.label(if self.japanese_reasons {
-                                format!(
-                                    "{} ファイル · 論理容量 {} · {japanese}",
-                                    item.files(),
-                                    bytes(item.logical_bytes())
-                                )
-                            } else {
-                                format!(
-                                    "{} files · {} logical · {english}",
-                                    item.files(),
-                                    bytes(item.logical_bytes())
-                                )
-                            });
-                            ui.separator();
-                        }
-                    },
-                );
-                ui.horizontal(|ui| {
-                    close = ui
-                        .button(text(self.japanese_reasons, "キャンセル", "Cancel"))
-                        .clicked();
-                    delete = ui
-                        .add(
-                            egui::Button::new(text(
-                                self.japanese_reasons,
-                                "確認した対象を削除",
-                                "Delete selected",
-                            ))
-                            .fill(Color32::from_rgb(243, 186, 176)),
+            let dialog = egui::Modal::new(egui::Id::new("delete-review"))
+                .frame(modal_frame(ctx))
+                .show(ctx, |ui| {
+                    ui.set_width((ctx.content_rect().width() - 120.0).clamp(460.0, 650.0));
+                    ui.heading(if self.japanese_reasons {
+                        format!(
+                            "{} 件のフォルダを完全に削除しますか？",
+                            confirmation.items().len()
                         )
-                        .clicked();
+                    } else {
+                        format!("Delete {} folders permanently?", confirmation.items().len())
+                    });
+                    ui.label(text(
+                        self.japanese_reasons,
+                        "ゴミ箱を経由せず削除します。再生成の方法と対象を確認してください。",
+                        "Deletion bypasses Trash. Check these paths and how to regenerate them.",
+                    ));
+                    ui.add_space(14.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for item in confirmation.items() {
+                                ui.label(
+                                    RichText::new(
+                                        item.path.file_name().unwrap_or_default().to_string_lossy(),
+                                    )
+                                    .strong(),
+                                );
+                                ui.add(
+                                    egui::Label::new(RichText::new(display(&item.path)).small())
+                                        .wrap(),
+                                );
+                                let (english, japanese) = item.producer.explanation();
+                                ui.label(if self.japanese_reasons {
+                                    format!(
+                                        "{} ファイル · 論理容量 {} · {japanese}",
+                                        item.files(),
+                                        bytes(item.logical_bytes())
+                                    )
+                                } else {
+                                    format!(
+                                        "{} files · {} logical · {english}",
+                                        item.files(),
+                                        bytes(item.logical_bytes())
+                                    )
+                                });
+                                ui.add_space(8.0);
+                                ui.separator();
+                            }
+                        });
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        close = ui
+                            .button(text(self.japanese_reasons, "キャンセル", "Cancel"))
+                            .clicked();
+                        delete = ui
+                            .add(
+                                egui::Button::new(
+                                    RichText::new(text(
+                                        self.japanese_reasons,
+                                        "確認した対象を削除",
+                                        "Delete selected",
+                                    ))
+                                    .color(Color32::WHITE),
+                                )
+                                .fill(Color32::from_rgb(180, 48, 42))
+                                .min_size(egui::vec2(180.0, 36.0)),
+                            )
+                            .clicked();
+                    });
                 });
-            });
             if close || dialog.should_close() {
                 self.confirmation = None;
             } else if delete {
@@ -1795,14 +1870,17 @@ impl App {
         }
     }
 
-    fn app_storage_dialog(&mut self, ctx: &egui::Context) {
+    fn app_storage_dialog(&mut self, ctx: &egui::Context, page: Option<&mut egui::Ui>) {
         let busy = self.job.is_some();
         let mut start = false;
         let mut close = false;
+        let as_page = page.is_some();
         #[cfg(target_os = "macos")]
         let mut review_sdk = false;
-        let dialog = egui::Modal::new(egui::Id::new("app-storage")).show(ctx, |ui| {
-            ui.set_width((ctx.content_rect().width() - 80.0).clamp(590.0, 920.0));
+        let render = |ui: &mut egui::Ui| {
+            if !as_page {
+                ui.set_width((ctx.content_rect().width() - 80.0).clamp(590.0, 920.0));
+            }
             ui.heading(text(
                 self.japanese_reasons,
                 "アプリと SDK の容量",
@@ -1841,7 +1919,7 @@ impl App {
                         .clicked();
                 }
             });
-            if busy {
+            if busy && !as_page {
                 ui.spinner();
             }
             match &self.app_storage {
@@ -1896,16 +1974,28 @@ impl App {
                 }
                 None => {}
             }
-            close = ui
-                .button(text(self.japanese_reasons, "閉じる", "Close"))
-                .clicked();
-        });
-        if close || dialog.should_close() {
+            if !as_page {
+                close = ui
+                    .button(text(self.japanese_reasons, "閉じる", "Close"))
+                    .clicked();
+            }
+        };
+        let should_close = if let Some(ui) = page {
+            egui::Frame::NONE.show(ui, render);
+            false
+        } else {
+            egui::Modal::new(egui::Id::new("app-storage"))
+                .show(ctx, render)
+                .should_close()
+        };
+        if close || should_close {
             self.show_app_storage = false;
         }
         #[cfg(target_os = "macos")]
         if review_sdk {
             self.show_app_storage = false;
+            self.app_storage_selected = false;
+            self.navigate(shell::Screen::Apps);
             self.sdk.open = true;
             self.scan_sdks(ctx);
         }
@@ -1925,13 +2015,16 @@ impl App {
         }
     }
 
-    fn stale_dialog(&mut self, ctx: &egui::Context) {
+    fn stale_dialog(&mut self, ctx: &egui::Context, page: Option<&mut egui::Ui>) {
         let mut start = false;
         let mut close = false;
+        let as_page = page.is_some();
         let busy = self.job.is_some();
         let state = &mut self.stale_files;
-        let dialog = egui::Modal::new(egui::Id::new("old-files")).show(ctx, |ui| {
-            ui.set_width((ctx.content_rect().width() - 80.0).clamp(590.0, 920.0));
+        let render = |ui: &mut egui::Ui| {
+            if !as_page {
+                ui.set_width((ctx.content_rect().width() - 80.0).clamp(590.0, 920.0));
+            }
             ui.heading(text(
                 self.japanese_reasons,
                 "古いファイルを探す",
@@ -2026,7 +2119,7 @@ impl App {
                     }
                 });
             });
-            if busy {
+            if busy && !as_page {
                 ui.spinner();
             }
             if !state.error.is_empty() {
@@ -2058,7 +2151,7 @@ impl App {
                     ));
                 }
                 if !report.candidates.is_empty() {
-                    ui.add(egui::TextEdit::singleline(&mut state.query).hint_text(text(
+                    ui.add(controls::field(ui, &mut state.query).hint_text(text(
                         self.japanese_reasons,
                         "パスで絞り込む",
                         "Filter results by path",
@@ -2147,11 +2240,21 @@ impl App {
                 "アクセス日時だけでは未使用と断定できません。内容と用途を確認してください。",
                 "Access dates can be incomplete. Check what a file is before removing it.",
             ));
-            close = ui
-                .button(text(self.japanese_reasons, "閉じる", "Close"))
-                .clicked();
-        });
-        if close || dialog.should_close() {
+            if !as_page {
+                close = ui
+                    .button(text(self.japanese_reasons, "閉じる", "Close"))
+                    .clicked();
+            }
+        };
+        let should_close = if let Some(ui) = page {
+            egui::Frame::NONE.show(ui, render);
+            false
+        } else {
+            egui::Modal::new(egui::Id::new("old-files"))
+                .show(ctx, render)
+                .should_close()
+        };
+        if close || should_close {
             self.show_stale_files = false;
         }
         if start {
@@ -2217,114 +2320,121 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let panel = egui::CentralPanel::default();
         #[cfg(target_os = "macos")]
-        let panel = panel.frame(
-            egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin::symmetric(24, 14)),
-        );
-        panel.show_inside(ui, |ui| {
-            self.toolbar(ui);
-            ui.separator();
-            if let Some(job) = &self.job {
-                let progress = job.progress.as_ref().map(|progress| progress.snapshot());
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(
-                        if progress
-                            .as_ref()
-                            .is_some_and(|progress| progress.inventory_done)
-                        {
-                            text(
-                                self.japanese_reasons,
-                                "候補の安全性と利用状況を確認中…",
-                                "Checking candidate safety and use…",
+        self.desktop_shell(ui);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let panel = egui::CentralPanel::default();
+            #[cfg(target_os = "macos")]
+            let panel = panel.frame(
+                egui::Frame::central_panel(ui.style())
+                    .inner_margin(egui::Margin::symmetric(24, 14)),
+            );
+            panel.show_inside(ui, |ui| {
+                self.toolbar(ui);
+                ui.separator();
+                if let Some(job) = &self.job {
+                    let progress = job.progress.as_ref().map(|progress| progress.snapshot());
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            if progress
+                                .as_ref()
+                                .is_some_and(|progress| progress.inventory_done)
+                            {
+                                text(
+                                    self.japanese_reasons,
+                                    "候補の安全性と利用状況を確認中…",
+                                    "Checking candidate safety and use…",
+                                )
+                            } else {
+                                job.label
+                            },
+                        );
+                    });
+                    if let Some(progress) = progress {
+                        ui.label(if self.japanese_reasons {
+                            format!(
+                                "確認済み {} ファイル・{} フォルダ · 論理容量 {}",
+                                progress.files,
+                                progress.directories,
+                                bytes(progress.logical_bytes)
                             )
                         } else {
-                            job.label
+                            format!(
+                                "{} files · {} folders checked · {} logical",
+                                progress.files,
+                                progress.directories,
+                                bytes(progress.logical_bytes)
+                            )
+                        });
+                        if !progress.inventory_done {
+                            if let Some(directory) = progress.current_directory {
+                                let path = display(&directory);
+                                ui.add(egui::Label::new(&path).truncate())
+                                    .on_hover_text(path);
+                            }
+                        }
+                        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    }
+                }
+                if !self.status.is_empty() {
+                    ui.label(RichText::new(&self.status).color(Color32::from_rgb(155, 50, 39)));
+                }
+                if let Some(receipt) = &self.cleanup_receipt {
+                    let removed = receipt.outcomes.len() - receipt.held;
+                    let japanese = self.japanese_reasons || cfg!(target_os = "macos");
+                    let heading = if japanese {
+                        format!("削除 {removed} 件・保留 {} 件", receipt.held)
+                    } else {
+                        format!("{removed} deleted · {} held", receipt.held)
+                    };
+                    ui.strong(heading);
+                    let change = match (receipt.before, receipt.after) {
+                        (Some(before), Some(after)) => format!(
+                            "{}{}",
+                            if after >= before { "+" } else { "−" },
+                            bytes(after.abs_diff(before))
+                        ),
+                        _ if japanese => "測定できませんでした".into(),
+                        _ => "Unavailable".into(),
+                    };
+                    ui.label(if japanese {
+                        format!("実測したボリューム空き容量の変化　{change}")
+                    } else {
+                        format!("Measured volume free-space change: {change}")
+                    });
+                    ui.collapsing(
+                        if japanese {
+                            "項目ごとの結果"
+                        } else {
+                            "Individual results"
+                        },
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .max_height(160.0)
+                                .show(ui, |ui| {
+                                    for (path, result) in &receipt.outcomes {
+                                        match result {
+                                            Ok(()) => ui.label(path),
+                                            Err(reason) => ui.label(format!(
+                                                "{path} · {}",
+                                                reason.text(japanese)
+                                            )),
+                                        };
+                                    }
+                                });
                         },
                     );
-                });
-                if let Some(progress) = progress {
-                    ui.label(if self.japanese_reasons {
-                        format!(
-                            "確認済み {} ファイル・{} フォルダ · 論理容量 {}",
-                            progress.files,
-                            progress.directories,
-                            bytes(progress.logical_bytes)
-                        )
-                    } else {
-                        format!(
-                            "{} files · {} folders checked · {} logical",
-                            progress.files,
-                            progress.directories,
-                            bytes(progress.logical_bytes)
-                        )
-                    });
-                    if !progress.inventory_done {
-                        if let Some(directory) = progress.current_directory {
-                            let path = display(&directory);
-                            ui.add(egui::Label::new(&path).truncate())
-                                .on_hover_text(path);
-                        }
+                }
+                if let Some(scan) = &self.scan {
+                    for note in &scan.notes {
+                        ui.label(note);
                     }
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
                 }
-            }
-            if !self.status.is_empty() {
-                ui.label(RichText::new(&self.status).color(Color32::from_rgb(155, 50, 39)));
-            }
-            if let Some(receipt) = &self.cleanup_receipt {
-                let removed = receipt.outcomes.len() - receipt.held;
-                let japanese = self.japanese_reasons || cfg!(target_os = "macos");
-                let heading = if japanese {
-                    format!("削除 {removed} 件・保留 {} 件", receipt.held)
-                } else {
-                    format!("{removed} deleted · {} held", receipt.held)
-                };
-                ui.strong(heading);
-                let change = match (receipt.before, receipt.after) {
-                    (Some(before), Some(after)) => format!(
-                        "{}{}",
-                        if after >= before { "+" } else { "−" },
-                        bytes(after.abs_diff(before))
-                    ),
-                    _ if japanese => "測定できませんでした".into(),
-                    _ => "Unavailable".into(),
-                };
-                ui.label(if japanese {
-                    format!("実測したボリューム空き容量の変化　{change}")
-                } else {
-                    format!("Measured volume free-space change: {change}")
-                });
-                ui.collapsing(
-                    if japanese {
-                        "項目ごとの結果"
-                    } else {
-                        "Individual results"
-                    },
-                    |ui| {
-                        egui::ScrollArea::vertical()
-                            .max_height(160.0)
-                            .show(ui, |ui| {
-                                for (path, result) in &receipt.outcomes {
-                                    match result {
-                                        Ok(()) => ui.label(path),
-                                        Err(reason) => {
-                                            ui.label(format!("{path} · {}", reason.text(japanese)))
-                                        }
-                                    };
-                                }
-                            });
-                    },
-                );
-            }
-            if let Some(scan) = &self.scan {
-                for note in &scan.notes {
-                    ui.label(note);
-                }
-            }
-            ui.add_enabled_ui(self.job.is_none(), |ui| self.workspace(ui));
-        });
+                ui.add_enabled_ui(self.job.is_none(), |ui| self.workspace(ui));
+            });
+        }
         self.dialogs(&ctx);
     }
 }
@@ -2354,7 +2464,22 @@ mod tests {
         };
 
         app.switch_workspace(&ctx, 1);
+        app.open_profile(&ctx, "another-profile".into());
+        app.add_workspace(&ctx, PathBuf::from("another-workspace"));
         app.refresh(&ctx, true);
+        #[cfg(target_os = "macos")]
+        {
+            for screen in [
+                shell::Screen::Apps,
+                shell::Screen::Disk,
+                shell::Screen::Docker,
+                shell::Screen::OldFiles,
+                shell::Screen::Workspace,
+            ] {
+                app.navigate(screen);
+            }
+            app.scan_sdks(&ctx);
+        }
         app.spawn(&ctx, "Another job", false, || {
             Outcome::Inspection(Vec::new())
         });
@@ -2362,6 +2487,7 @@ mod tests {
         assert_eq!(app.index, 0);
         assert_eq!(app.query, "keep this search");
         assert!(app.marked.contains(&PathBuf::from("confirmed-output")));
+        assert!(app.status.is_empty());
         let job = app.job.as_ref().unwrap();
         assert!(job.removing);
         assert!(job.progress.is_none());

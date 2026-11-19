@@ -14,10 +14,38 @@ fn divider(ui: &mut egui::Ui) {
 
 // Reserve exactly the height passed to show_rows. Contents cannot move the
 // next virtual row when a label is long or the scrollbar changes width.
-fn virtual_row(ui: &mut egui::Ui, id: &Path, height: f32) -> egui::Ui {
+fn virtual_row(
+    ui: &mut egui::Ui,
+    id: &Path,
+    height: f32,
+    selected: bool,
+) -> (egui::Ui, egui::Response) {
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::hover(),
+    );
+    let response = ui.interact(
+        rect,
+        ui.make_persistent_id(("project-row", id)),
+        egui::Sense::click(),
+    );
+    let duration = ui.style().animation_time.min(0.12);
+    let hover =
+        ui.ctx()
+            .animate_bool_with_time(response.id.with("hover"), response.hovered(), duration);
+    let selected =
+        ui.ctx()
+            .animate_bool_with_time(response.id.with("selected"), selected, duration);
+    let opacity = (selected * 0.12 + hover * 0.035).min(0.16);
+    ui.painter().rect_filled(
+        rect.shrink(1.),
+        5.,
+        egui::Color32::from_rgba_unmultiplied(
+            ACCENT.r(),
+            ACCENT.g(),
+            ACCENT.b(),
+            (opacity * 255.) as u8,
+        ),
     );
     ui.painter().hline(
         rect.x_range(),
@@ -27,23 +55,25 @@ fn virtual_row(ui: &mut egui::Ui, id: &Path, height: f32) -> egui::Ui {
     let mut row = ui.new_child(
         egui::UiBuilder::new()
             .id_salt(id)
-            .max_rect(rect.shrink2(egui::vec2(6., 4.))),
+            .max_rect(rect.shrink2(egui::vec2(8., 4.))),
     );
     row.set_clip_rect(row.clip_rect().intersect(rect));
-    row
+    (row, response)
 }
 
 fn primary(text: impl Into<String>) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.into()).color(PAPER))
         .fill(ACCENT)
-        .corner_radius(6.)
-        .min_size(egui::vec2(0., 34.))
+        .corner_radius(7.)
+        .min_size(egui::vec2(0., super::controls::HEIGHT))
 }
 
 #[derive(Default)]
 pub(super) struct Projects {
     rows: Vec<Project>,
     selected: Option<PathBuf>,
+    focused: Option<PathBuf>,
+    query: String,
     by_candidate: bool,
     pub(super) active: bool,
 }
@@ -63,7 +93,24 @@ fn name(path: &Path) -> String {
 
 fn effect(p: Producer, japanese: bool) -> &'static str {
     if !japanese {
-        return p.explanation().0;
+        return match p {
+            Producer::Cargo | Producer::CargoRelocated => {
+                "Cargo rebuilds this output on the next build."
+            }
+            Producer::CargoIncremental => {
+                "Cargo regenerates the incremental cache on the next build."
+            }
+            Producer::CargoDependencies => {
+                "The next build or test regenerates these dependency artifacts."
+            }
+            Producer::NextJs => "Build again before running the Next.js application.",
+            Producer::Vite => "The next build regenerates these distribution files.",
+            Producer::PythonBytecode => "Python regenerates bytecode when the code runs again.",
+            Producer::DeclaredOutput => {
+                "Confirm that the original script can regenerate this dedicated output."
+            }
+            other => other.explanation().0,
+        };
     }
     match p {
         Producer::Cargo | Producer::CargoRelocated => {
@@ -81,6 +128,99 @@ fn effect(p: Producer, japanese: bool) -> &'static str {
         }
         other => other.explanation().1,
     }
+}
+
+fn candidate_header(ui: &mut egui::Ui, japanese: bool) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.), egui::Sense::hover());
+    let mut header =
+        ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(8., 0.))));
+    let width = header.available_width();
+    let status_width = if width >= 460. { 92. } else { 64. };
+    let name_width =
+        (width - 24. - 82. - status_width - 3. * header.spacing().item_spacing.x).max(40.);
+    header.horizontal(|ui| {
+        ui.allocate_ui_with_layout(
+            egui::vec2(24., 28.),
+            egui::Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.set_width(24.);
+            },
+        );
+        for (label, width, align) in [
+            (text(japanese, "項目", "Item"), name_width, Align::Min),
+            (text(japanese, "サイズ", "Size"), 82., Align::Max),
+            (text(japanese, "状態", "Status"), status_width, Align::Min),
+        ] {
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 28.),
+                egui::Layout::top_down(align),
+                |ui| {
+                    ui.set_width(width);
+                    ui.label(RichText::new(label).size(12.).color(MUTED));
+                },
+            );
+        }
+    });
+}
+
+fn candidate_inspector(
+    ui: &mut egui::Ui,
+    candidate: &super::super::artifacts::FileCandidate,
+    project: &Project,
+    japanese: bool,
+    height: f32,
+    inspect: &mut Option<PathBuf>,
+    finder_error: &mut Option<String>,
+) {
+    let path = &candidate.row.path;
+    ui.set_max_width(ui.available_width());
+    egui::ScrollArea::vertical().id_salt((path, "inspector"))
+        .max_height(height).show(ui, |ui| {
+            ui.add_space(8.);
+            ui.label(RichText::new(name(path)).size(23.).strong());
+            ui.label(RichText::new(bytes(candidate.row.usage.size())).size(22.).strong());
+            ui.label(RichText::new(text(japanese,
+                if candidate.row.usage.allocated_bytes.is_some() { "ディスク使用量" } else { "論理容量" },
+                if candidate.row.usage.allocated_bytes.is_some() { "Allocated space" } else { "Logical size" },
+            )).size(12.).color(MUTED));
+            ui.add_space(16.);
+            ui.label(RichText::new(text(japanese, "パス", "Path")).size(12.).color(MUTED));
+            ui.add(egui::Label::new(RichText::new(display(path)).monospace().size(12.)).wrap());
+            ui.add_space(16.);
+            divider(ui);
+            ui.add_space(12.);
+            ui.strong(text(japanese, "判定理由", "Decision"));
+            if let Some(reason) = &candidate.blocked_reason {
+                ui.label(RichText::new(text(japanese, "保留", "On hold")).color(MUTED));
+                ui.label(reason.text(japanese));
+                if let Some(count) = project.reviewable_cargo_parts.get(path) {
+                    ui.label(if japanese { format!("全体の削除は保留です。下位の {count} 件は個別に確認できます。") }
+                        else { format!("Whole-target removal is on hold. {count} subfolders can be reviewed individually.") });
+                }
+            } else {
+                ui.label(text(japanese, "確認できる掃除候補です。", "Available for cleanup review."));
+                let explanation = candidate.producer.explanation();
+                ui.label(if japanese { explanation.1 } else { explanation.0 });
+            }
+            ui.add_space(14.);
+            divider(ui);
+            ui.add_space(12.);
+            ui.strong(text(japanese, "削除した場合", "After removal"));
+            ui.label(effect(candidate.producer, japanese));
+            ui.add_space(8.);
+            ui.label(RichText::new(text(japanese,
+                "削除前に、内容の変化と使用中のファイルを再確認します。実際に空いた容量は処理後に測定します。",
+                "Contents and open files are checked again before removal. Free-space change is measured afterward.",
+            )).size(12.).color(MUTED));
+            ui.add_space(18.);
+            if ui.button(text(japanese, "Finder で開く ↗", "Open in Finder ↗")).clicked() {
+                *finder_error = open_in_finder(path).err().map(|error| super::display_error(&error, japanese));
+            }
+            if ui.button(text(japanese, "この項目を再確認", "Inspect this item")).clicked() {
+                *inspect = Some(path.clone());
+            }
+        });
 }
 
 impl Projects {
@@ -171,79 +311,89 @@ impl Projects {
 
 impl App {
     pub(super) fn project_screen(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::NONE
-            .inner_margin(egui::Margin::symmetric(24, 12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                if let Some(index) = self
-                    .projects
-                    .selected
-                    .as_ref()
-                    .and_then(|path| self.projects.rows.iter().position(|p| p.path == *path))
-                {
-                    self.project_detail(ui, index);
-                } else {
-                    self.project_list(ui);
-                }
-            });
+        if let Some(index) = self
+            .projects
+            .selected
+            .as_ref()
+            .and_then(|path| self.projects.rows.iter().position(|p| p.path == *path))
+        {
+            self.project_detail(ui, index);
+        } else {
+            self.project_list(ui);
+        }
     }
 
     fn project_detail(&mut self, ui: &mut egui::Ui, index: usize) {
         let scan = self.scan.as_ref().unwrap();
         let project = &self.projects.rows[index];
+        let japanese = self.japanese_reasons;
         if ui
-            .link(if self.japanese_reasons {
-                format!("‹ {} の一覧へ", name(&scan.root))
+            .link(if japanese {
+                format!("‹ {}", name(&scan.root))
             } else {
                 format!("‹ Back to {}", name(&scan.root))
             })
             .clicked()
         {
             self.projects.selected = None;
+            self.projects.focused = None;
+            self.projects.query.clear();
             self.marked.clear();
             return;
         }
-        ui.add_space(6.);
-        ui.label(RichText::new(name(&project.path)).size(26.).strong());
-        ui.horizontal(|ui| {
+        ui.add_space(8.);
+        ui.label(RichText::new(name(&project.path)).size(28.).strong());
+        ui.add(egui::Label::new(RichText::new(display(&project.path)).color(MUTED)).truncate())
+            .on_hover_text(display(&project.path));
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "{}  {}",
+                text(japanese, "使用量", "Used"),
+                bytes(project.size)
+            ));
+            ui.separator();
             ui.label(
                 RichText::new(format!(
                     "{}  {}",
-                    text(self.japanese_reasons, "使用量", "Used"),
-                    bytes(project.size)
-                ))
-                .color(MUTED),
-            );
-            ui.label(
-                RichText::new(format!(
-                    "{}  {}",
-                    text(self.japanese_reasons, "候補容量", "Candidates"),
+                    text(japanese, "掃除候補", "Candidates"),
                     bytes(project.reclaim)
                 ))
-                .color(ACCENT)
                 .strong(),
             );
         });
         ui.add_space(14.);
-        ui.label(
-            RichText::new(text(
-                self.japanese_reasons,
-                "掃除候補と保留理由",
-                "Cleanup candidates and hold reasons",
-            ))
-            .size(20.)
-            .strong(),
+        let search = ui.add(
+            super::controls::field(ui, &mut self.projects.query)
+                .hint_text(text(japanese, "候補を検索", "Search candidates"))
+                .desired_width(320.),
         );
-        divider(ui);
-        if project.files.is_empty() {
-            ui.label(text(
-                self.japanese_reasons,
-                "このフォルダで確認できた生成物候補はありません。",
-                "No generated-output candidates found in this folder.",
-            ));
+        if search.changed() {
+            self.marked.clear();
         }
-        let mut inspect = None;
-        let mut missing = BTreeSet::new();
+        ui.add_space(10.);
+        let query = self.projects.query.to_lowercase();
+        let visible: Vec<_> = project
+            .files
+            .iter()
+            .copied()
+            .filter(|&i| {
+                query.is_empty()
+                    || display(&scan.files[i].row.path)
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .collect();
+        let mut focused = self
+            .projects
+            .focused
+            .clone()
+            .filter(|path| {
+                project
+                    .files
+                    .iter()
+                    .any(|&i| scan.files[i].row.path == *path)
+            })
+            .or_else(|| visible.first().map(|&i| scan.files[i].row.path.clone()));
         let now = std::time::Instant::now();
         let due = if self.job.is_none()
             && !self.show_stale_files
@@ -265,223 +415,300 @@ impl App {
         } else {
             false
         };
-        let compact = ui.available_width() < 410.;
-        let row_height = if compact { 146. } else { 116. };
-        egui::ScrollArea::vertical()
-            .id_salt(&project.path)
-            .max_height((ui.available_height() - 76.).max(120.))
-            .show_rows(ui, row_height, project.files.len(), |ui, range| {
-                for i in range {
-                    let c = &scan.files[project.files[i]];
-                    let path = &c.row.path;
-                    if due
-                        && std::fs::symlink_metadata(path)
-                            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                    {
-                        missing.insert(path.clone());
+        let mut missing = BTreeSet::new();
+        let mut inspect = None;
+        let mut finder_error = None;
+        let body_height = (ui.available_height() - 72.).max(160.);
+        let wide = ui.available_width() >= 680.;
+        let inspector_width = if wide { 280. } else { ui.available_width() };
+        let table_width = if wide {
+            ui.available_width() - inspector_width - 20.
+        } else {
+            ui.available_width()
+        };
+        let table_height = if wide || focused.is_none() {
+            body_height
+        } else {
+            (body_height * 0.55).max(100.)
+        };
+        let mut table = |ui: &mut egui::Ui, focused: &mut Option<PathBuf>| {
+            ui.set_min_size(egui::vec2(table_width, table_height));
+            ui.set_max_width(table_width);
+            candidate_header(ui, japanese);
+            divider(ui);
+            if visible.is_empty() {
+                ui.add_space(14.);
+                ui.label(text(
+                    japanese,
+                    "条件に合う掃除候補はありません。",
+                    "No candidates match this search.",
+                ));
+            }
+            ui.spacing_mut().item_spacing.y = 0.;
+            egui::ScrollArea::vertical()
+                .id_salt((&project.path, "candidates"))
+                .max_height((table_height - 34.).max(60.))
+                .show_rows(ui, 52., visible.len(), |ui, range| {
+                    for &i in &visible[range] {
+                        let c = &scan.files[i];
+                        let path = &c.row.path;
+                        if due
+                            && std::fs::symlink_metadata(path)
+                                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            missing.insert(path.clone());
+                        }
+                        let active = focused.as_ref() == Some(path) || self.marked.contains(path);
+                        let (mut row, response) = virtual_row(ui, path, 52., active);
+                        if response.clicked() {
+                            *focused = Some(path.clone());
+                        }
+                        let width = row.available_width();
+                        let status_width = if width >= 460. { 92. } else { 64. };
+                        let name_width =
+                            (width - 24. - 82. - status_width - 3. * row.spacing().item_spacing.x)
+                                .max(40.);
+                        row.horizontal(|ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(24., 42.),
+                                egui::Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    ui.set_width(24.);
+                                    let mut checked = self.marked.contains(path);
+                                    if ui
+                                        .add_enabled(
+                                            self.job.is_none() && c.blocked_reason.is_none(),
+                                            egui::Checkbox::without_text(&mut checked),
+                                        )
+                                        .on_hover_text(text(
+                                            japanese,
+                                            "この候補を選択",
+                                            "Select this candidate",
+                                        ))
+                                        .changed()
+                                    {
+                                        *focused = Some(path.clone());
+                                        if checked {
+                                            self.marked.retain(|other| {
+                                                !other.starts_with(path) && !path.starts_with(other)
+                                            });
+                                            self.marked.insert(path.clone());
+                                        } else {
+                                            self.marked.remove(path);
+                                        }
+                                    }
+                                },
+                            );
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(name_width, 42.),
+                                egui::Layout::top_down(Align::Min),
+                                |ui| {
+                                    ui.set_width(name_width);
+                                    ui.spacing_mut().item_spacing.y = 2.;
+                                    ui.spacing_mut().interact_size.y = 21.;
+                                    ui.spacing_mut().button_padding.y = 0.;
+                                    let relative = path
+                                        .strip_prefix(&project.path)
+                                        .ok()
+                                        .filter(|p| !p.as_os_str().is_empty())
+                                        .unwrap_or(path);
+                                    if ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new(display(relative)).size(15.0),
+                                            )
+                                            .selectable(false)
+                                            .sense(egui::Sense::click())
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(display(path))
+                                        .clicked()
+                                    {
+                                        *focused = Some(path.clone());
+                                    }
+                                    let reason = c.blocked_reason.as_ref().map_or_else(
+                                        || effect(c.producer, japanese),
+                                        |reason| reason.text(japanese),
+                                    );
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(reason).size(12.).color(MUTED),
+                                        )
+                                        .truncate(),
+                                    );
+                                },
+                            );
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(82., 42.),
+                                egui::Layout::right_to_left(Align::Center),
+                                |ui| {
+                                    ui.set_width(82.);
+                                    ui.add(egui::Label::new(bytes(c.row.usage.size())).truncate());
+                                },
+                            );
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(status_width, 42.),
+                                egui::Layout::left_to_right(Align::Center),
+                                |ui| {
+                                    ui.set_width(status_width);
+                                    let (label, color) = if c.blocked_reason.is_some() {
+                                        (text(japanese, "保留", "On hold"), MUTED)
+                                    } else {
+                                        (text(japanese, "掃除候補", "Candidate"), ACCENT)
+                                    };
+                                    ui.label(RichText::new(label).size(12.).color(color));
+                                },
+                            );
+                        });
                     }
-                    let mut row = virtual_row(ui, path, row_height);
-                    let rect = row.max_rect();
-                    let title_y = rect.top() + 2.;
-                    let left = rect.left() + 34.;
-                    let mut check = row.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(egui::Rect::from_min_size(
-                                egui::pos2(rect.left(), title_y),
-                                egui::vec2(26., 30.),
-                            ))
-                            .layout(egui::Layout::left_to_right(Align::Center)),
-                    );
-                    {
-                        let mut selected = self.marked.contains(path);
-                        if check
-                            .add_enabled(
-                                c.blocked_reason.is_none(),
-                                egui::Checkbox::without_text(&mut selected),
-                            )
-                            .changed()
-                        {
-                            if selected {
-                                self.marked.retain(|other| {
-                                    !other.starts_with(path) && !path.starts_with(other)
-                                });
-                                self.marked.insert(path.clone());
-                            } else {
-                                self.marked.remove(path);
-                            }
+                });
+        };
+        if wide {
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(table_width, body_height),
+                    egui::Layout::top_down(Align::Min),
+                    |ui| table(ui, &mut focused),
+                );
+                ui.add_space(4.);
+                let line = ui.cursor().left_top();
+                ui.painter().vline(
+                    line.x,
+                    line.y..=line.y + body_height,
+                    Stroke::new(1_f32, LINE),
+                );
+                ui.add_space(4.);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(inspector_width, body_height),
+                    egui::Layout::top_down(Align::Min),
+                    |ui| {
+                        if let Some(c) = focused.as_ref().and_then(|path| {
+                            project
+                                .files
+                                .iter()
+                                .map(|&i| &scan.files[i])
+                                .find(|c| c.row.path == *path)
+                        }) {
+                            candidate_inspector(
+                                ui,
+                                c,
+                                project,
+                                japanese,
+                                body_height,
+                                &mut inspect,
+                                &mut finder_error,
+                            );
                         }
-                    }
-                    let relative = path
-                        .strip_prefix(&project.path)
-                        .ok()
-                        .filter(|p| !p.as_os_str().is_empty())
-                        .unwrap_or(path);
-                    let line_rect = |y, h| {
-                        egui::Rect::from_min_max(
-                            egui::pos2(left, y),
-                            egui::pos2(rect.right(), y + h),
-                        )
-                    };
-                    let title = line_rect(title_y, 30.);
-                    let mut title_ui = row.new_child(
-                        egui::UiBuilder::new()
-                            .max_rect(title)
-                            .layout(egui::Layout::left_to_right(Align::Center)),
-                    );
-                    title_ui.allocate_ui_with_layout(
-                        egui::vec2((title.width() - 106.).max(1.), title.height()),
-                        egui::Layout::left_to_right(Align::Center),
-                        |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(display(relative)).size(18.).strong(),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(display(path));
-                        },
-                    );
-                    title_ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(RichText::new(bytes(c.row.usage.size())).strong());
-                    });
-                    let reason = match &c.blocked_reason {
-                        Some(reason)
-                            if matches!(c.producer, Producer::Cargo | Producer::CargoRelocated) =>
-                        {
-                            let available = project.reviewable_cargo_parts.get(path);
-                            let scope = match (self.japanese_reasons, available) {
-                                (true, Some(n)) => {
-                                    format!("全体の削除は保留 · 内訳 {n} 件は個別に確認できます")
-                                }
-                                (false, Some(n)) => format!(
-                                    "Whole target on hold · {n} subfolders available for review"
-                                ),
-                                (true, None) => "全体の削除は保留".into(),
-                                (false, None) => "Whole target on hold".into(),
-                            };
-                            format!("{scope} · {}", reason.text(self.japanese_reasons))
-                        }
-                        Some(reason) => {
-                            format!(
-                                "{} · {}",
-                                text(self.japanese_reasons, "保留", "On hold"),
-                                reason.text(self.japanese_reasons)
-                            )
-                        }
-                        None if c.producer == Producer::DeclaredOutput => {
-                            effect(c.producer, self.japanese_reasons).into()
-                        }
-                        None => format!(
-                            "{} {}",
-                            effect(c.producer, self.japanese_reasons),
-                            text(
-                                self.japanese_reasons,
-                                "Git 追跡ファイルなし。",
-                                "No Git-tracked files."
-                            )
-                        ),
-                    };
-                    let mut body = row.new_child(egui::UiBuilder::new().max_rect(line_rect(
-                        title.bottom() + 2.,
-                        rect.bottom() - title.bottom() - 2.,
-                    )));
-                    body.spacing_mut().item_spacing = egui::vec2(10., 6.);
-                    body.add(egui::Label::new(RichText::new(&reason).color(MUTED)).truncate())
-                        .on_hover_text(&reason);
-                    let actions = |ui: &mut egui::Ui| {
-                        ui.spacing_mut().button_padding = egui::vec2(12., 4.);
-                        if ui
-                            .add(primary(text(
-                                self.japanese_reasons,
-                                "Finder で開く ↗",
-                                "Open in Finder ↗",
-                            )))
-                            .clicked()
-                        {
-                            if let Err(err) = open_in_finder(path) {
-                                self.status = super::display_error(&err, self.japanese_reasons);
-                            }
-                        }
-                        if ui
-                            .add(
-                                egui::Button::new(text(
-                                    self.japanese_reasons,
-                                    "この項目を再確認",
-                                    "Inspect this item",
-                                ))
-                                .min_size(egui::vec2(0., 34.)),
-                            )
-                            .clicked()
-                        {
-                            inspect = Some(path.clone());
-                        }
-                    };
-                    if compact {
-                        body.vertical(actions);
-                    } else {
-                        body.horizontal(actions);
-                    }
-                }
+                    },
+                );
             });
+        } else {
+            ui.allocate_ui_with_layout(
+                egui::vec2(table_width, table_height),
+                egui::Layout::top_down(Align::Min),
+                |ui| table(ui, &mut focused),
+            );
+            if let Some(c) = focused.as_ref().and_then(|path| {
+                project
+                    .files
+                    .iter()
+                    .map(|&i| &scan.files[i])
+                    .find(|c| c.row.path == *path)
+            }) {
+                divider(ui);
+                candidate_inspector(
+                    ui,
+                    c,
+                    project,
+                    japanese,
+                    (body_height - table_height).max(100.),
+                    &mut inspect,
+                    &mut finder_error,
+                );
+            }
+        }
+        self.projects.focused = focused;
+        ui.add_space(8.);
+        divider(ui);
+        ui.add_space(8.);
+        let estimate = project
+            .files
+            .iter()
+            .map(|&i| &scan.files[i])
+            .filter(|c| {
+                self.marked.contains(&c.row.path)
+                    && !c
+                        .row
+                        .path
+                        .ancestors()
+                        .skip(1)
+                        .any(|p| self.marked.contains(p))
+            })
+            .fold(0u64, |sum, c| sum.saturating_add(c.row.usage.size()));
         let mut review = false;
-        if !self.marked.is_empty() {
-            let estimate = project
-                .files
-                .iter()
-                .map(|&i| &scan.files[i])
-                .filter(|c| {
-                    self.marked.contains(&c.row.path)
-                        && !c
-                            .row
-                            .path
-                            .ancestors()
-                            .skip(1)
-                            .any(|p| self.marked.contains(p))
-                })
-                .fold(0u64, |sum, c| sum.saturating_add(c.row.usage.size()));
-            review = ui
-                .add(primary(if self.japanese_reasons {
-                    format!(
-                        "選んだ {} 件を確認 · 見込み {}",
-                        self.marked.len(),
-                        bytes(estimate)
+        ui.horizontal(|ui| {
+            ui.label(if japanese {
+                format!(
+                    "{} 件を選択 · 見込み {}",
+                    self.marked.len(),
+                    bytes(estimate)
+                )
+            } else {
+                format!(
+                    "{} selected · estimated {}",
+                    self.marked.len(),
+                    bytes(estimate)
+                )
+            });
+            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                review = ui
+                    .add_enabled(
+                        self.job.is_none() && !self.marked.is_empty(),
+                        primary(text(
+                            japanese,
+                            "選択した項目を確認",
+                            "Review selected items",
+                        )),
                     )
-                } else {
-                    format!(
-                        "Review {} selected · estimated {}",
-                        self.marked.len(),
-                        bytes(estimate)
-                    )
-                }))
-                .clicked();
+                    .clicked();
+            });
+        });
+        if let Some(error) = finder_error {
+            self.status = error;
         }
         if !missing.is_empty() {
             let selected = project.path.clone();
+            let focused = self.projects.focused.clone();
+            let query = self.projects.query.clone();
             let scan = self.scan.as_mut().unwrap();
             scan.files.retain(|c| !missing.contains(&c.row.path));
             self.marked.retain(|p| !missing.contains(p));
             self.projects = Projects::from_scan(scan);
             self.projects.selected = Some(selected);
+            self.projects.focused = focused.filter(|p| !missing.contains(p));
+            self.projects.query = query;
             ui.ctx().request_repaint();
+            return;
+        }
+        if self.job.is_some() {
             return;
         }
         if let Some(path) = inspect {
             let policy = scan.policy.clone();
-            let ja = self.japanese_reasons;
             self.spawn(
                 ui.ctx(),
-                text(ja, "候補を再確認中…", "Inspecting candidate…"),
+                text(japanese, "候補を再確認中…", "Inspecting candidate…"),
                 false,
                 move || {
                     let detail = match policy.prepare(&path) {
                         Ok(p) => format!(
                             "{} · {} {} · {}",
-                            effect(p.producer, ja),
+                            effect(p.producer, japanese),
                             p.files(),
-                            text(ja, "ファイル", "files"),
+                            text(japanese, "ファイル", "files"),
                             bytes(p.logical_bytes())
                         ),
-                        Err(e) => Message::from_error(&e).text(ja).to_owned(),
+                        Err(e) => Message::from_error(&e).text(japanese).to_owned(),
                     };
                     Outcome::Inspection(vec![format!("{} · {detail}", display(&path))])
                 },
@@ -492,7 +719,7 @@ impl App {
             self.spawn(
                 ui.ctx(),
                 text(
-                    self.japanese_reasons,
+                    japanese,
                     "選択した候補を確認中…",
                     "Checking selected candidates…",
                 ),
@@ -505,6 +732,10 @@ impl App {
     fn project_list(&mut self, ui: &mut egui::Ui) {
         let scan = self.scan.as_ref().unwrap();
         ui.label(RichText::new(name(&scan.root)).size(26.).strong());
+        ui.add(
+            egui::Label::new(RichText::new(display(&scan.root)).size(13.).color(MUTED)).truncate(),
+        )
+        .on_hover_text(display(&scan.root));
         if let Some((p, delta)) = self
             .projects
             .rows
@@ -620,11 +851,17 @@ impl App {
         }
         egui::ScrollArea::vertical().id_salt("projects").show_rows(
             ui,
-            43.,
+            52.,
             self.projects.rows.len(),
             |ui, range| {
                 for p in &self.projects.rows[range] {
-                    let mut row = virtual_row(ui, &p.path, 43.);
+                    let (mut row, response) = virtual_row(ui, &p.path, 52., false);
+                    if response.clicked() {
+                        self.projects.selected = Some(p.path.clone());
+                        self.projects.focused = None;
+                        self.projects.query.clear();
+                        self.marked.clear();
+                    }
                     row.horizontal(|ui| {
                         ui.allocate_ui_with_layout(
                             egui::vec2(widths[0], 32.),
@@ -636,15 +873,18 @@ impl App {
                                     egui::Sense::hover(),
                                 );
                                 super::icons::paint(ui, icon, super::icons::Icon::Folder, ACCENT);
-                                let link = egui::Button::new(
+                                let link = egui::Label::new(
                                     RichText::new(format!("{} ›", name(&p.path)))
-                                        .color(ACCENT)
-                                        .strong(),
+                                        .size(15.0)
+                                        .color(ACCENT),
                                 )
-                                .truncate()
-                                .frame_when_inactive(false);
+                                .selectable(false)
+                                .sense(egui::Sense::click())
+                                .truncate();
                                 if ui.add(link).on_hover_text(display(&p.path)).clicked() {
                                     self.projects.selected = Some(p.path.clone());
+                                    self.projects.focused = None;
+                                    self.projects.query.clear();
                                     self.marked.clear();
                                 }
                             },

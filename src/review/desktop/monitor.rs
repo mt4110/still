@@ -1,4 +1,4 @@
-use super::{bytes, egui, text, App, ACCENT};
+use super::{bytes, egui, text, App, ACCENT, LINE, MUTED};
 use crate::review::{app_storage::command_output, docker::storage};
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
@@ -308,19 +308,22 @@ impl Panel {
     fn disk_view(&mut self, ui: &mut egui::Ui, japanese: bool) {
         self.sample(ui.ctx());
         ui.horizontal(|ui| {
-            ui.heading(text(japanese, "ディスクの状態", "Disk activity"));
-            if ui
-                .button(text(
-                    japanese,
-                    if self.paused {
-                        "再開"
-                    } else {
-                        "一時停止"
-                    },
-                    if self.paused { "Resume" } else { "Pause" },
-                ))
-                .clicked()
-            {
+            ui.heading(text(japanese, "ディスク", "Disk"));
+            let clicked = ui
+                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.button(text(
+                        japanese,
+                        if self.paused {
+                            "再開"
+                        } else {
+                            "一時停止"
+                        },
+                        if self.paused { "Resume" } else { "Pause" },
+                    ))
+                    .clicked()
+                })
+                .inner;
+            if clicked {
                 self.paused = !self.paused;
                 if !self.paused {
                     self.disk = None;
@@ -329,6 +332,15 @@ impl Panel {
                 }
             }
         });
+        ui.label(
+            egui::RichText::new(text(
+                japanese,
+                "ホームフォルダの使用量と、物理ディスクの読み書きを確認します。",
+                "Inspect home-volume usage and physical-disk activity.",
+            ))
+            .color(MUTED),
+        );
+        ui.add_space(24.0);
         if let Some(sample) = &self.disk {
             let used = 1.0 - sample.free as f32 / sample.total as f32;
             ui.label(text(japanese, "ホームフォルダのボリューム", "Home volume"));
@@ -341,7 +353,18 @@ impl Panel {
                 .size(24.0)
                 .strong(),
             );
-            ui.add(egui::ProgressBar::new(used).text(format!("{:.1}%", used * 100.0)));
+            ui.add_space(6.0);
+            ui.add(
+                egui::ProgressBar::new(used)
+                    .desired_height(7.0)
+                    .corner_radius(4),
+            );
+            ui.small(format!(
+                "{:.1}% {}",
+                used * 100.0,
+                text(japanese, "使用中", "used")
+            ));
+            ui.add_space(6.0);
             ui.label(format!(
                 "{} {} · {} · {}",
                 text(japanese, "空き", "Free"),
@@ -350,16 +373,31 @@ impl Panel {
                 sample.clock.format("%H:%M:%S")
             ));
         } else if !self.paused && self.disk_error.is_empty() {
-            ui.label(text(
-                japanese,
-                "ディスク情報を取得中…",
-                "Reading disk information…",
-            ));
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(text(
+                    japanese,
+                    "ディスク情報を取得中…",
+                    "Reading disk information…",
+                ));
+            });
         }
         if !self.disk_error.is_empty() {
-            ui.label(&self.disk_error);
+            ui.add_space(12.0);
+            egui::Frame::group(ui.style())
+                .inner_margin(egui::Margin::same(14))
+                .show(ui, |ui| {
+                    ui.strong(text(
+                        japanese,
+                        "計測できませんでした",
+                        "Measurement unavailable",
+                    ));
+                    ui.label(&self.disk_error);
+                });
         }
-        ui.add_space(12.0);
+        ui.add_space(24.0);
+        ui.strong(text(japanese, "読み書き速度", "Read and write activity"));
+        ui.add_space(8.0);
         if let Some(rate) = self.history.back() {
             ui.horizontal(|ui| {
                 ui.colored_label(
@@ -371,7 +409,7 @@ impl Panel {
                     ),
                 );
                 ui.colored_label(
-                    egui::Color32::from_rgb(68, 103, 160),
+                    MUTED,
                     format!(
                         "{} {}/s",
                         text(japanese, "書き込み", "Write"),
@@ -387,20 +425,21 @@ impl Panel {
             ));
         }
         let (rect, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 130.0),
+            egui::vec2(ui.available_width(), 180.0),
             egui::Sense::hover(),
         );
         let painter = ui.painter();
-        painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(240, 242, 238));
+        painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(248, 249, 251));
+        for fraction in [0.25, 0.5, 0.75] {
+            let y = rect.top() + rect.height() * fraction;
+            painter.hline(rect.x_range(), y, egui::Stroke::new(1.0_f32, LINE));
+        }
         let ceiling = self
             .history
             .iter()
             .map(|rate| rate.read.max(rate.written))
             .fold(1024.0, f64::max);
-        for (write, color) in [
-            (false, ACCENT),
-            (true, egui::Color32::from_rgb(68, 103, 160)),
-        ] {
+        for (write, color) in [(false, ACCENT), (true, MUTED)] {
             let points: Vec<_> = self
                 .history
                 .iter()
@@ -426,16 +465,27 @@ impl Panel {
             ),
             bytes(ceiling as u64)
         ));
-        ui.label(text(japanese, "この画面を開いている間、約2秒間隔で計測します。読み書きは、このボリュームが使う物理ディスク全体の値です。", "Samples about every two seconds while this view is open. Activity covers the physical disks serving this volume."));
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new(text(japanese, "この画面を開いている間、約2秒間隔で計測します。読み書きは、このボリュームが使う物理ディスク全体の値です。", "Samples about every two seconds while this view is open. Activity covers the physical disks serving this volume.")).color(MUTED));
     }
 
     fn docker_view(&mut self, ui: &mut egui::Ui, japanese: bool) {
+        ui.heading("Docker");
+        ui.label(
+            egui::RichText::new(text(
+                japanese,
+                "コンテナ・イメージ・ボリューム・ビルドキャッシュの容量を確認します。",
+                "Inspect containers, images, volumes, and build-cache storage.",
+            ))
+            .color(MUTED),
+        );
+        ui.add_space(24.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(text(japanese, "ローカル接続先", "Local context"));
             ui.add_enabled(
                 self.docker_job.is_none(),
-                egui::TextEdit::singleline(&mut self.context)
-                    .desired_width(190.0)
+                super::controls::field(ui, &mut self.context)
+                    .desired_width(240.0)
                     .hint_text(text(
                         japanese,
                         "現在の Docker 接続先",
@@ -456,19 +506,43 @@ impl Panel {
                 ui.label(text(japanese, "調査中…", "Inspecting…"));
             }
         });
-        ui.label(text(japanese, "Docker 内の容量です。共有レイヤーがあるため、SSD で回収できる容量とは異なる場合があります。", "Docker sizes include shared layers and may differ from SSD space recoverable."));
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new(text(japanese, "Docker 内の容量です。共有レイヤーがあるため、SSD で回収できる容量とは異なる場合があります。", "Docker sizes include shared layers and may differ from SSD space recoverable.")).color(MUTED));
+        ui.add_space(20.0);
         let Some(result) = &self.docker else {
-            ui.label(text(
-                japanese,
-                "Docker Desktop または Colima を起動し、接続先の容量を調べてください。",
-                "Start Docker Desktop or Colima, then inspect its storage.",
-            ));
+            if self.docker_job.is_none() {
+                egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(20))
+                    .show(ui, |ui| {
+                        ui.strong(text(
+                            japanese,
+                            "接続先を調べる",
+                            "Inspect a local connection",
+                        ));
+                        ui.add_space(6.0);
+                        ui.label(text(
+                            japanese,
+                            "Docker Desktop または Colima を起動し、接続先の容量を調べてください。",
+                            "Start Docker Desktop or Colima, then inspect its storage.",
+                        ));
+                    });
+            }
             return;
         };
         let report = match result {
             Ok(report) => report,
             Err(error) => {
-                ui.label(format!("{error:#}"));
+                egui::Frame::group(ui.style())
+                    .inner_margin(egui::Margin::same(16))
+                    .show(ui, |ui| {
+                        ui.strong(text(
+                            japanese,
+                            "Docker に接続できませんでした",
+                            "Docker connection unavailable",
+                        ));
+                        ui.add_space(6.0);
+                        ui.label(format!("{error:#}"));
+                    });
                 return;
             }
         };
@@ -478,6 +552,7 @@ impl Panel {
             report.context,
             report.observed_at.format("%H:%M:%S")
         ));
+        ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
             for (index, (kind, items)) in report.groups.iter().enumerate() {
                 if ui
@@ -492,11 +567,13 @@ impl Panel {
                 }
             }
         });
-        ui.add(egui::TextEdit::singleline(&mut self.query).hint_text(text(
+        ui.add_space(8.0);
+        ui.add(super::controls::field(ui, &mut self.query).hint_text(text(
             japanese,
             "名前・ID・状態で検索",
             "Search name, ID or state",
         )));
+        ui.add_space(12.0);
         let (kind, items) = &report.groups[self.kind];
         let needle = self.query.to_lowercase();
         let rows: Vec<_> = items
@@ -524,17 +601,18 @@ impl Panel {
         ui.horizontal(|ui| {
             ui.add_sized(
                 [ui.available_width() - 220.0, 20.0],
-                egui::Label::new(text(japanese, "名前", "Name")),
+                egui::Label::new(text(japanese, "名前", "Name")).halign(egui::Align::Min),
             );
             ui.add_sized(
                 [90.0, 20.0],
-                egui::Label::new(text(japanese, "容量", "Size")),
+                egui::Label::new(text(japanese, "容量", "Size")).halign(egui::Align::Max),
             );
             ui.label(text(japanese, "状態・参照", "State / references"));
         });
+        let table_height = (ui.available_height() - 160.0).clamp(180.0, 420.0);
         egui::ScrollArea::vertical()
             .id_salt("docker-resources")
-            .max_height(230.0)
+            .max_height(table_height)
             .show_rows(ui, 34.0, rows.len(), |ui, range| {
                 for index in range {
                     let item = rows[index];
@@ -558,7 +636,10 @@ impl Panel {
                             {
                                 self.selected = Some((item.id.clone(), item.name.clone()));
                             }
-                            ui.add_sized([90.0, 28.0], egui::Label::new(&item.size));
+                            ui.add_sized(
+                                [90.0, 28.0],
+                                egui::Label::new(&item.size).halign(egui::Align::Max),
+                            );
                             ui.label(resource_state(*kind, item, japanese));
                         });
                     });
@@ -568,7 +649,9 @@ impl Panel {
             .iter()
             .find(|item| self.selected.as_ref() == Some(&(item.id.clone(), item.name.clone())))
         {
+            ui.add_space(12.0);
             ui.separator();
+            ui.add_space(8.0);
             ui.strong(&item.name);
             ui.horizontal_wrapped(|ui| {
                 ui.label(&item.id);
@@ -652,35 +735,21 @@ fn resource_state(kind: storage::Kind, item: &storage::Resource, japanese: bool)
 }
 
 impl App {
-    pub(super) fn monitor_dialog(&mut self, ctx: &egui::Context) {
+    pub(super) fn monitor_page(&mut self, ui: &mut egui::Ui, tab: Tab) {
+        let japanese = self.japanese_reasons;
         let state = &mut self.monitor;
-        state.poll(ctx);
-        let dialog = egui::Modal::new(egui::Id::new("storage-monitor")).show(ctx, |ui| {
-            ui.set_width((ctx.content_rect().width() - 90.0).clamp(620.0, 900.0));
-            let previous_tab = state.tab;
-            ui.horizontal(|ui| {
-                ui.selectable_value(
-                    &mut state.tab,
-                    Tab::Disk,
-                    text(self.japanese_reasons, "ディスク", "Disk"),
-                );
-                ui.selectable_value(&mut state.tab, Tab::Docker, "Docker");
+        state.poll(ui.ctx());
+        egui::ScrollArea::vertical()
+            .id_salt("storage-monitor-page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(4.0);
+                match tab {
+                    Tab::Disk => state.disk_view(ui, japanese),
+                    Tab::Docker => state.docker_view(ui, japanese),
+                }
+                ui.add_space(20.0);
             });
-            if state.tab != previous_tab {
-                state.reset_disk();
-            }
-            ui.separator();
-            match state.tab {
-                Tab::Disk => state.disk_view(ui, self.japanese_reasons),
-                Tab::Docker => state.docker_view(ui, self.japanese_reasons),
-            }
-            ui.add_space(8.0);
-            ui.button(text(self.japanese_reasons, "閉じる", "Close"))
-                .clicked()
-        });
-        if dialog.inner || dialog.should_close() {
-            state.close();
-        }
     }
 }
 

@@ -74,14 +74,10 @@ impl Home {
 
 impl App {
     pub(super) fn show_home(&mut self, ui: &mut egui::Ui) {
-        let inset = ((ui.available_width() - 680.0) / 2.0).max(20.0);
-        ui.horizontal_top(|ui| {
-            ui.add_space(inset);
-            ui.vertical(|ui| {
-                ui.set_max_width((ui.available_width() - inset).clamp(120.0, 680.0));
-                ui.add_space(32.0);
-                self.home_content(ui);
-            });
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.set_max_width(820.0);
+            ui.add_space(10.0);
+            self.home_content(ui);
         });
     }
 
@@ -92,11 +88,29 @@ impl App {
         ui.label(
             RichText::new(text(
                 self.japanese_reasons,
+                "この Mac のストレージ",
+                "Storage on this Mac",
+            ))
+            .size(26.0)
+            .strong()
+            .color(INK),
+        );
+        ui.label(
+            RichText::new(text(
+                self.japanese_reasons,
+                "容量を調べ、理由を確かめてから整理します。",
+                "Explore your storage and review what can be cleaned up.",
+            ))
+            .color(MUTED),
+        );
+        ui.add_space(28.0);
+        ui.label(
+            RichText::new(text(
+                self.japanese_reasons,
                 "この Mac の空き容量",
                 "Free space on this Mac",
             ))
-            .size(19.0)
-            .strong()
+            .size(14.0)
             .color(INK),
         );
         if let Some((free, total)) = self.home.capacity {
@@ -130,7 +144,7 @@ impl App {
                 "Could not read free space",
             ));
         }
-        ui.add_space(24.0);
+        ui.add_space(32.0);
         let workspace = self
             .home
             .directory
@@ -150,9 +164,15 @@ impl App {
             .and_then(|home| path.strip_prefix(home).ok())
             .map(|relative| display(&Path::new("~").join(relative)))
             .unwrap_or_else(|| display(&path));
+        ui.label(
+            RichText::new(text(self.japanese_reasons, "週次の掃除", "Weekly cleanup"))
+                .size(17.0)
+                .strong(),
+        );
+        ui.add_space(4.0);
         let open = egui::Frame::new()
             .stroke(egui::Stroke::new(1.0_f32, LINE))
-            .corner_radius(9)
+            .corner_radius(10)
             .inner_margin(22)
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
@@ -166,7 +186,7 @@ impl App {
                         ))
                         .color(MUTED),
                     );
-                    ui.label(RichText::new(&path_label).size(22.0).strong().color(INK));
+                    ui.label(RichText::new(&path_label).size(20.0).strong().color(INK));
                     let completed = last
                         .completed
                         .with_timezone(&Local)
@@ -188,11 +208,12 @@ impl App {
                         ))
                         .color(MUTED),
                     );
-                    ui.label(RichText::new(&path_label).size(22.0).strong().color(INK));
+                    ui.label(RichText::new(&path_label).size(20.0).strong().color(INK));
                 }
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 ui.add_space(8.0);
-                ui.add(
+                ui.add_enabled(
+                    self.job.is_none(),
                     egui::Button::new(
                         RichText::new(if self.japanese_reasons {
                             format!("{name} を調べる")
@@ -204,7 +225,7 @@ impl App {
                     )
                     .fill(ACCENT)
                     .corner_radius(7)
-                    .min_size(egui::vec2(180.0, 42.0)),
+                    .min_size(egui::vec2(180.0, super::controls::HEIGHT)),
                 )
                 .clicked()
             })
@@ -228,6 +249,9 @@ impl App {
     }
 
     fn start_workspace_scan(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.job.is_some() {
+            return;
+        }
         self.profile = Profile::default();
         self.profile_name = None;
         self.docker_input.clear();
@@ -238,6 +262,9 @@ impl App {
     }
 
     fn resume_scan(&mut self, ctx: &egui::Context, path: PathBuf) -> Result<()> {
+        if self.job.is_some() {
+            return Ok(());
+        }
         let Some(last) = &self.home.recent else {
             self.start_workspace_scan(ctx, path);
             return Ok(());
