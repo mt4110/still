@@ -1843,7 +1843,7 @@ impl App {
                                     .color(Color32::WHITE),
                                 )
                                 .fill(Color32::from_rgb(180, 48, 42))
-                                .min_size(egui::vec2(180.0, 36.0)),
+                                .min_size(egui::vec2(0.0, controls::HEIGHT)),
                             )
                             .clicked();
                     });

@@ -225,7 +225,7 @@ impl App {
                     )
                     .fill(ACCENT)
                     .corner_radius(7)
-                    .min_size(egui::vec2(180.0, super::controls::HEIGHT)),
+                    .min_size(egui::vec2(0.0, super::controls::HEIGHT)),
                 )
                 .clicked()
             })

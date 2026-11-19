@@ -124,7 +124,7 @@ impl App {
                                     !busy && count > 0,
                                     egui::Button::new(RichText::new(label).color(Color32::WHITE))
                                         .fill(ACCENT)
-                                        .min_size(egui::vec2(190.0, 36.0)),
+                                        .min_size(egui::vec2(0.0, super::controls::HEIGHT)),
                                 )
                                 .clicked();
                         });
@@ -282,7 +282,7 @@ impl App {
                             .add(
                                 egui::Button::new(RichText::new(label).color(Color32::WHITE))
                                     .fill(Color32::from_rgb(180, 48, 42))
-                                    .min_size(egui::vec2(190.0, 36.0)),
+                                    .min_size(egui::vec2(0.0, super::controls::HEIGHT)),
                             )
                             .clicked();
                     });
