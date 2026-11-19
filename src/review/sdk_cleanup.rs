@@ -797,51 +797,91 @@ struct ProjectEvidence {
     incomplete: bool,
 }
 
+#[derive(Clone, Copy)]
+enum ProjectBoundary {
+    Module,
+    Project,
+}
+
+fn project_boundary(path: &Path) -> Result<Option<ProjectBoundary>> {
+    let mut found = None;
+    for (marker, boundary) in [
+        ("build.gradle", ProjectBoundary::Module),
+        ("build.gradle.kts", ProjectBoundary::Module),
+        ("CMakeLists.txt", ProjectBoundary::Module),
+        ("Android.mk", ProjectBoundary::Module),
+        ("Cargo.toml", ProjectBoundary::Module),
+        ("settings.gradle", ProjectBoundary::Project),
+        ("settings.gradle.kts", ProjectBoundary::Project),
+        (".git", ProjectBoundary::Project),
+    ] {
+        match fs::symlink_metadata(path.join(marker)) {
+            Ok(metadata) => {
+                if inventory::is_link(&metadata)
+                    || !(metadata.is_file() || marker == ".git" && metadata.is_dir())
+                {
+                    bail!("Could not establish the project boundary at {path:?}");
+                }
+                if found.is_none() {
+                    found = Some(boundary);
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(found)
+}
+
 fn project_evidence(machine: &Machine, versions: Vec<&str>) -> ProjectEvidence {
     let mut report = ProjectEvidence::default();
-    let mut projects: BTreeMap<PathBuf, (bool, bool)> = BTreeMap::new();
+    let mut boundaries = BTreeMap::new();
+    let mut settings = Vec::new();
     for root in &machine.roots {
         let Ok(root) = inventory::home_scan_dir(&machine.home, root) else {
             report.incomplete = true;
             continue;
         };
-        let is_collection = root == machine.home.join("_workspace")
-            || root == machine.home.join("AndroidStudioProjects");
         for item in project_walker(&root) {
             let Ok(entry) = item else {
                 report.incomplete = true;
                 continue;
             };
-            if !entry.file_type().is_some_and(|kind| kind.is_file()) || !ndk_config(entry.path()) {
+            if entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                match project_boundary(entry.path()) {
+                    Ok(Some(boundary)) => {
+                        boundaries.insert(entry.path().to_owned(), boundary);
+                    }
+                    Ok(None) => {}
+                    Err(_) => report.incomplete = true,
+                }
+                continue;
+            }
+            if !ndk_config(entry.path()) {
+                continue;
+            }
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                report.incomplete = true;
                 continue;
             }
             let Ok(content) = read_small(entry.path(), 2 * 1024 * 1024) else {
                 report.incomplete = true;
                 continue;
             };
-            let project = if is_collection {
-                let relative = entry.path().strip_prefix(&root).expect("walker root");
-                relative
-                    .components()
-                    .next()
-                    .map_or_else(|| root.clone(), |part| root.join(part))
-            } else {
-                root.clone()
-            };
-            let state = projects.entry(project).or_default();
             let tokens: HashSet<_> = content
                 .split(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
                 .collect();
+            let mut resolved = false;
             for version in &versions {
                 if tokens.contains(version) {
-                    state.1 = true;
+                    resolved = true;
                     report
                         .references
                         .entry((*version).to_owned())
                         .or_insert_with(|| entry.path().to_owned());
                 }
             }
-            state.0 |= [
+            let native = [
                 "ndkVersion",
                 "externalNativeBuild",
                 "ndk.dir",
@@ -852,7 +892,26 @@ fn project_evidence(machine: &Machine, versions: Vec<&str>) -> ProjectEvidence {
             ]
             .iter()
             .any(|marker| content.contains(marker));
+            settings.push((entry.path().to_owned(), native, resolved));
         }
+    }
+
+    let mut projects: BTreeMap<PathBuf, (bool, bool)> = BTreeMap::new();
+    for (path, native, resolved) in settings {
+        let parent = path.parent().expect("configuration has a parent");
+        // Build records belong to their nearest module. A settings file or
+        // repository boundary prevents an unrelated parent's pin from resolving it.
+        let project = parent
+            .ancestors()
+            .find_map(|directory| match boundaries.get(directory) {
+                Some(ProjectBoundary::Module) => Some(directory),
+                Some(ProjectBoundary::Project) => Some(parent),
+                None => None,
+            })
+            .unwrap_or(parent);
+        let state = projects.entry(project.to_owned()).or_default();
+        state.0 |= native;
+        state.1 |= resolved;
     }
     report.unresolved_native = projects
         .values()
@@ -1037,6 +1096,222 @@ mod tests {
         };
         assert!(apply_selection(review, &machine).is_err());
         assert!(machine.removals.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn android_evidence_separates_arbitrary_collection_siblings() -> Result<()> {
+        for collection in ["projects", "development/mobile/apps"] {
+            let fixture = tempfile::tempdir()?;
+            let home = fixture.path().canonicalize()?;
+            let root = home.join(collection);
+            let pinned = root.join("pinned");
+            let ambiguous = root.join("ambiguous");
+            fs::create_dir_all(&pinned)?;
+            fs::create_dir_all(&ambiguous)?;
+            let reference = pinned.join("build.gradle");
+            fs::write(&reference, "android { ndkVersion '27.1.12297006' }")?;
+            fs::write(
+                ambiguous.join("build.gradle.kts"),
+                "android { externalNativeBuild { cmake {} } }",
+            )?;
+            let machine = Machine {
+                sdk: home.join("Library/Android/sdk"),
+                home,
+                roots: vec![root],
+            };
+            let evidence = project_evidence(&machine, vec!["27.1.12297006", "28.2.13676358"]);
+            assert_eq!(evidence.references.get("27.1.12297006"), Some(&reference));
+            assert!(evidence.unresolved_native, "collection {collection}");
+            assert!(!evidence.incomplete);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn android_evidence_cuts_off_independent_nested_projects_and_repositories() -> Result<()> {
+        for marker in ["settings.gradle.kts", ".git"] {
+            let fixture = tempfile::tempdir()?;
+            let home = fixture.path().canonicalize()?;
+            let root = home.join("projects/outer");
+            let nested = root.join("vendor/independent");
+            fs::create_dir_all(&nested)?;
+            fs::write(root.join("settings.gradle"), "include ':app'")?;
+            fs::write(
+                root.join("build.gradle"),
+                "android { ndkVersion '27.1.12297006' }",
+            )?;
+            fs::write(nested.join(marker), "")?;
+            fs::write(
+                nested.join("build.gradle"),
+                "android { externalNativeBuild { cmake {} } }",
+            )?;
+            let machine = Machine {
+                sdk: home.join("Library/Android/sdk"),
+                home,
+                roots: vec![root],
+            };
+            let evidence = project_evidence(&machine, vec!["27.1.12297006", "28.2.13676358"]);
+            assert!(evidence.references.contains_key("27.1.12297006"));
+            assert!(evidence.unresolved_native, "nested marker {marker}");
+            assert!(!evidence.incomplete);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn android_evidence_keeps_shared_settings_from_resolving_unpinned_sibling_modules() -> Result<()>
+    {
+        let fixture = tempfile::tempdir()?;
+        let home = fixture.path().canonicalize()?;
+        let root = home.join("projects/application");
+        let pinned = root.join("pinned");
+        let unresolved = root.join("unresolved");
+        fs::create_dir_all(&pinned)?;
+        fs::create_dir_all(&unresolved)?;
+        fs::write(
+            root.join("settings.gradle.kts"),
+            r#"include(":pinned", ":unresolved")"#,
+        )?;
+        fs::write(
+            pinned.join("build.gradle.kts"),
+            "android { ndkVersion = \"27.1.12297006\" }",
+        )?;
+        fs::write(
+            unresolved.join("build.gradle.kts"),
+            "android { externalNativeBuild { cmake {} } }",
+        )?;
+        let machine = Machine {
+            sdk: home.join("Library/Android/sdk"),
+            home,
+            roots: vec![root],
+        };
+        let evidence = project_evidence(&machine, vec!["27.1.12297006", "28.2.13676358"]);
+        assert!(evidence.references.contains_key("27.1.12297006"));
+        assert!(evidence.unresolved_native);
+        assert!(!evidence.incomplete);
+        Ok(())
+    }
+
+    #[test]
+    fn android_evidence_resolves_a_single_module_from_its_pin_or_build_record() -> Result<()> {
+        for from_history in [false, true] {
+            let fixture = tempfile::tempdir()?;
+            let home = fixture.path().canonicalize()?;
+            let root = home.join("development/mobile/application");
+            let record_dir = root.join(".cxx/debug/arm64-v8a");
+            fs::create_dir_all(&record_dir)?;
+            fs::write(
+                root.join("settings.gradle.kts"),
+                "rootProject.name = \"example\"",
+            )?;
+            let reference = if from_history {
+                fs::write(
+                    root.join("build.gradle.kts"),
+                    "android { externalNativeBuild { cmake {} } }",
+                )?;
+                let record = record_dir.join("build_model.json");
+                fs::write(&record, r#"{ "ndk": "/some/sdk/ndk/27.1.12297006" }"#)?;
+                record
+            } else {
+                let build = root.join("build.gradle.kts");
+                fs::write(
+                    &build,
+                    "android { ndkVersion = \"27.1.12297006\"; externalNativeBuild { cmake {} } }",
+                )?;
+                build
+            };
+            let machine = Machine {
+                sdk: home.join("Library/Android/sdk"),
+                home,
+                roots: vec![record_dir, root],
+            };
+            let evidence = project_evidence(&machine, vec!["27.1.12297006", "28.2.13676358"]);
+            assert_eq!(evidence.references.get("27.1.12297006"), Some(&reference));
+            assert!(!evidence.unresolved_native, "from history {from_history}");
+            assert!(!evidence.incomplete);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn android_evidence_holds_modules_without_a_known_gradle_boundary() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let home = fixture.path().canonicalize()?;
+        let root = home.join("projects/repository");
+        let module = root.join("unresolved");
+        fs::create_dir_all(root.join(".git"))?;
+        fs::create_dir_all(&module)?;
+        fs::write(
+            root.join("build.gradle"),
+            "android { ndkVersion '27.1.12297006' }",
+        )?;
+        fs::write(
+            module.join("build.gradle"),
+            "android { externalNativeBuild { cmake {} } }",
+        )?;
+        let machine = Machine {
+            sdk: home.join("Library/Android/sdk"),
+            home,
+            roots: vec![root],
+        };
+        let evidence = project_evidence(&machine, vec!["27.1.12297006", "28.2.13676358"]);
+        assert!(evidence.references.contains_key("27.1.12297006"));
+        assert!(evidence.unresolved_native);
+        assert!(!evidence.incomplete);
+        Ok(())
+    }
+
+    #[test]
+    fn android_evidence_does_not_resolve_a_module_from_an_unproven_root_pin() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let home = fixture.path().canonicalize()?;
+        let root = home.join("projects/application");
+        let module = root.join("app");
+        fs::create_dir_all(&module)?;
+        fs::write(root.join("settings.gradle"), "include ':app'")?;
+        fs::write(
+            root.join("build.gradle"),
+            "ext.ndkVersion = '27.1.12297006'",
+        )?;
+        fs::write(
+            module.join("build.gradle"),
+            "android { externalNativeBuild { cmake {} } }",
+        )?;
+        let machine = Machine {
+            sdk: home.join("Library/Android/sdk"),
+            home,
+            roots: vec![root],
+        };
+        let evidence = project_evidence(&machine, vec!["27.1.12297006", "28.2.13676358"]);
+        assert!(evidence.references.contains_key("27.1.12297006"));
+        assert!(evidence.unresolved_native);
+        assert!(!evidence.incomplete);
+        Ok(())
+    }
+
+    #[test]
+    fn android_evidence_marks_linked_settings_incomplete() -> Result<()> {
+        for config in ["settings.gradle", "gradle.properties"] {
+            let fixture = tempfile::tempdir()?;
+            let home = fixture.path().canonicalize()?;
+            let root = home.join("projects/application");
+            fs::create_dir_all(&root)?;
+            fs::write(
+                root.join("build.gradle"),
+                "android { ndkVersion '27.1.12297006' }",
+            )?;
+            let source = home.join("shared-config");
+            fs::write(&source, "externalNativeBuild")?;
+            std::os::unix::fs::symlink(&source, root.join(config))?;
+            let machine = Machine {
+                sdk: home.join("Library/Android/sdk"),
+                home,
+                roots: vec![root],
+            };
+            let evidence = project_evidence(&machine, vec!["27.1.12297006", "28.2.13676358"]);
+            assert!(evidence.incomplete, "linked config {config}");
+        }
         Ok(())
     }
 

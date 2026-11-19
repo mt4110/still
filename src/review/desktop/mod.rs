@@ -318,6 +318,9 @@ impl App {
         removing: bool,
         work: impl FnOnce() -> Outcome + Send + 'static,
     ) {
+        if self.job.is_some() {
+            return;
+        }
         let (tx, result) = mpsc::channel();
         let ctx = ctx.clone();
         self.status.clear();
@@ -490,6 +493,9 @@ impl App {
     }
 
     fn refresh(&mut self, ctx: &egui::Context, record: bool) {
+        if self.job.is_some() {
+            return;
+        }
         self.marked.clear();
         self.matches.clear();
         if self.view == View::Search {
@@ -785,21 +791,30 @@ impl App {
         {
             return;
         }
-        ui.horizontal(|ui| {
-            let mut selected = self.index;
-            egui::ComboBox::from_id_salt("workspace")
-                .selected_text(display(&self.profile.roots[self.index]))
-                .show_ui(ui, |ui| {
-                    for (i, root) in self.profile.roots.iter().enumerate() {
-                        ui.selectable_value(&mut selected, i, display(root));
-                    }
-                });
-            if selected != self.index {
-                self.index = selected;
-                self.cleanup_receipt = None;
-                self.refresh(&ctx, true);
-            }
+        ui.add_enabled_ui(self.job.is_none(), |ui| {
+            ui.horizontal(|ui| {
+                let mut selected = self.index;
+                egui::ComboBox::from_id_salt("workspace")
+                    .selected_text(display(&self.profile.roots[self.index]))
+                    .show_ui(ui, |ui| {
+                        for (i, root) in self.profile.roots.iter().enumerate() {
+                            ui.selectable_value(&mut selected, i, display(root));
+                        }
+                    });
+                if selected != self.index {
+                    self.switch_workspace(&ctx, selected);
+                }
+            })
         });
+    }
+
+    fn switch_workspace(&mut self, ctx: &egui::Context, index: usize) {
+        if self.job.is_some() || index == self.index {
+            return;
+        }
+        self.index = index;
+        self.cleanup_receipt = None;
+        self.refresh(ctx, true);
     }
 
     fn toolbar_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2311,5 +2326,56 @@ impl eframe::App for App {
             ui.add_enabled_ui(self.job.is_none(), |ui| self.workspace(ui));
         });
         self.dialogs(&ctx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_changes_and_new_jobs_preserve_an_active_removal_and_its_receipt() {
+        let ctx = egui::Context::default();
+        let (sender, result) = mpsc::channel();
+        let mut app = App {
+            profile: Profile {
+                roots: vec![PathBuf::from("first"), PathBuf::from("second")],
+                ..Profile::default()
+            },
+            job: Some(Job {
+                result,
+                label: "Removing confirmed output",
+                removing: true,
+                progress: None,
+            }),
+            query: "keep this search".into(),
+            marked: BTreeSet::from([PathBuf::from("confirmed-output")]),
+            ..App::default()
+        };
+
+        app.switch_workspace(&ctx, 1);
+        app.refresh(&ctx, true);
+        app.spawn(&ctx, "Another job", false, || {
+            Outcome::Inspection(Vec::new())
+        });
+
+        assert_eq!(app.index, 0);
+        assert_eq!(app.query, "keep this search");
+        assert!(app.marked.contains(&PathBuf::from("confirmed-output")));
+        let job = app.job.as_ref().unwrap();
+        assert!(job.removing);
+        assert!(job.progress.is_none());
+        sender
+            .send(Outcome::Removal(scan::CleanupReceipt {
+                outcomes: Vec::new(),
+                before: Some(100),
+                after: Some(150),
+                held: 0,
+            }))
+            .unwrap_or_else(|_| panic!("The original result receiver was dropped"));
+        let Outcome::Removal(receipt) = job.result.try_recv().unwrap() else {
+            panic!("The original receipt was replaced");
+        };
+        assert_eq!((receipt.before, receipt.after), (Some(100), Some(150)));
     }
 }

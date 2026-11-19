@@ -221,6 +221,10 @@ impl Explorer {
     }
 
     fn reload(&mut self, root: PathBuf, saved_root: bool) -> Result<()> {
+        self.approved.clear();
+        self.findings = None;
+        self.file_candidates = None;
+        self.external_rows.clear();
         let new_inventory = inventory::scan(&root, self.threads, None)?;
         self.message.clear();
         if saved_root {
@@ -232,7 +236,6 @@ impl Explorer {
         }
         self.location = root;
         self.inventory = new_inventory;
-        self.file_candidates = None;
         Ok(())
     }
 
@@ -334,6 +337,18 @@ impl Explorer {
         terminal: &mut Terminal<B>,
         refresh: bool,
     ) -> Result<()> {
+        let mut scan_note = String::new();
+        if refresh {
+            let root = self.roots[self.root].clone();
+            self.message = format!("Scanning {}", display(&root));
+            self.draw(terminal)?;
+            if let Err(error) = self.reload(root, self.root < self.saved_roots) {
+                self.message = format!("{error:#}");
+                self.update_rows();
+                return Ok(());
+            }
+            scan_note = std::mem::take(&mut self.message);
+        }
         if refresh || self.file_candidates.is_none() {
             self.message = "Checking cleanup candidates…".into();
             self.draw(terminal)?;
@@ -342,7 +357,7 @@ impl Explorer {
                 self.findings = Some(self.sources.collect(&self.policy));
             }
         }
-        self.message.clear();
+        self.message = scan_note;
         self.switch(View::Candidates);
         Ok(())
     }
@@ -660,6 +675,88 @@ impl Explorer {
             };
             frame.render_widget(Paragraph::new(footer).wrap(Wrap { trim: false }), area[2]);
         })?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use std::fs;
+
+    #[test]
+    fn candidate_refresh_rescans_sizes_and_new_outputs_and_drops_old_approvals() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let existing = root.join("existing/generated");
+        let added = root.join("added/target");
+        fs::create_dir_all(&existing)?;
+        fs::write(existing.join("artifact.bin"), b"before")?;
+        let policy = artifacts::Policy {
+            roots: vec![root.clone()],
+            outputs: vec![existing.clone()],
+            docker_context: None,
+        };
+        let approved = policy.prepare(&existing)?;
+        let mut explorer = Explorer {
+            roots: vec![root.clone()],
+            saved_roots: 1,
+            root: 0,
+            location: root.join("existing"),
+            inventory: inventory::scan(&root, 2, None)?,
+            policy,
+            sources: candidates::Sources {
+                git_repos: Vec::new(),
+                git_base: None,
+                docker_cache: false,
+                kube: None,
+            },
+            findings: Some(candidates::Findings::default()),
+            file_candidates: None,
+            external_rows: Vec::new(),
+            threads: 2,
+            view: View::Tree,
+            input: None,
+            sort: Sort::Total,
+            history: None,
+            rows: Vec::new(),
+            selection: TableState::default(),
+            approved: vec![approved],
+            results: Vec::new(),
+            message: String::new(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 30))?;
+        explorer.open_candidates(&mut terminal, false)?;
+        assert_eq!(explorer.rows.len(), 1);
+        assert_eq!(explorer.rows[0].usage.logical_bytes, 6);
+
+        fs::write(existing.join("artifact.bin"), [0u8; 8192])?;
+        fs::create_dir_all(added.join("debug"))?;
+        fs::write(
+            root.join("added/Cargo.toml"),
+            "[package]\nname = 'fixture'\n",
+        )?;
+        fs::write(added.join(".rustc_info.json"), b"{}")?;
+        fs::write(added.join("debug/artifact.bin"), [0u8; 16384])?;
+        explorer.open_candidates(&mut terminal, true)?;
+
+        assert!(explorer.view == View::Candidates);
+        assert_eq!(explorer.roots, vec![root.clone()]);
+        assert_eq!((explorer.root, explorer.saved_roots), (0, 1));
+        assert_eq!(explorer.rows.len(), 2);
+        assert!(explorer
+            .rows
+            .iter()
+            .any(|row| row.path == existing && row.usage.logical_bytes == 8192));
+        assert!(explorer
+            .rows
+            .iter()
+            .any(|row| row.path == added && row.usage.logical_bytes == 16386));
+        assert!(explorer.approved.is_empty());
+        assert!(explorer.findings.is_none());
+        assert!(explorer.external_rows.is_empty());
+        assert!(existing.is_dir() && added.is_dir());
         Ok(())
     }
 }
