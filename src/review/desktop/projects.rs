@@ -137,14 +137,18 @@ fn candidate_header(ui: &mut egui::Ui, japanese: bool) {
         ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(egui::vec2(8., 0.))));
     let width = header.available_width();
     let status_width = if width >= 460. { 92. } else { 64. };
-    let name_width =
-        (width - 24. - 82. - status_width - 3. * header.spacing().item_spacing.x).max(40.);
+    let name_width = (width
+        - super::controls::HEIGHT
+        - 82.
+        - status_width
+        - 3. * header.spacing().item_spacing.x)
+        .max(40.);
     header.horizontal(|ui| {
         ui.allocate_ui_with_layout(
-            egui::vec2(24., 28.),
+            egui::vec2(super::controls::HEIGHT, 28.),
             egui::Layout::left_to_right(Align::Center),
             |ui| {
-                ui.set_width(24.);
+                ui.set_width(super::controls::HEIGHT);
             },
         );
         for (label, width, align) in [
@@ -465,15 +469,18 @@ impl App {
                         }
                         let width = row.available_width();
                         let status_width = if width >= 460. { 92. } else { 64. };
-                        let name_width =
-                            (width - 24. - 82. - status_width - 3. * row.spacing().item_spacing.x)
-                                .max(40.);
+                        let name_width = (width
+                            - super::controls::HEIGHT
+                            - 82.
+                            - status_width
+                            - 3. * row.spacing().item_spacing.x)
+                            .max(40.);
                         row.horizontal(|ui| {
                             ui.allocate_ui_with_layout(
-                                egui::vec2(24., 42.),
+                                egui::vec2(super::controls::HEIGHT, 42.),
                                 egui::Layout::left_to_right(Align::Center),
                                 |ui| {
-                                    ui.set_width(24.);
+                                    ui.set_width(super::controls::HEIGHT);
                                     let mut checked = self.marked.contains(path);
                                     if ui
                                         .add_enabled(
