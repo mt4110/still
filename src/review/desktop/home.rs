@@ -82,7 +82,7 @@ impl App {
     }
 
     fn home_content(&mut self, ui: &mut egui::Ui) {
-        use super::{ACCENT, INK, LINE, MUTED, PAPER};
+        use super::{ACCENT, INK, LINE, MUTED};
         use egui::RichText;
 
         ui.label(
@@ -212,22 +212,12 @@ impl App {
                 }
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 ui.add_space(8.0);
-                ui.add_enabled(
-                    self.job.is_none(),
-                    egui::Button::new(
-                        RichText::new(if self.japanese_reasons {
-                            format!("{name} を調べる")
-                        } else {
-                            format!("Scan {name}")
-                        })
-                        .color(PAPER)
-                        .strong(),
-                    )
-                    .fill(ACCENT)
-                    .corner_radius(7)
-                    .min_size(egui::vec2(0.0, super::controls::HEIGHT)),
-                )
-                .clicked()
+                let label = if self.japanese_reasons {
+                    format!("{name} を調べる")
+                } else {
+                    format!("Scan {name}")
+                };
+                super::controls::button(ui, &label, true, self.job.is_none()).clicked()
             })
             .inner;
         if open {

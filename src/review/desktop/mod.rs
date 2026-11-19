@@ -115,6 +115,7 @@ fn configure_ui(ctx: &egui::Context) {
         style.spacing.window_margin = egui::Margin::same(22);
         style.spacing.interact_size.y = controls::HEIGHT;
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.icon_spacing = 8.0;
         style.spacing.button_padding = egui::vec2(controls::PADDING_X, 8.0);
         style.animation_time = if reduce_motion() { 0.0 } else { 0.12 };
     });
@@ -126,21 +127,46 @@ fn configure_ui(ctx: &egui::Context) {
         .join("YuGothM.ttc");
     if let Ok(data) = std::fs::read(font) {
         let mut fonts = egui::FontDefinitions::default();
+        let japanese = egui::FontData::from_owned(data);
         #[cfg(target_os = "macos")]
-        if let Ok(data) = std::fs::read("/System/Library/Fonts/SFNS.ttf") {
-            fonts
-                .font_data
-                .insert("system-ui".into(), egui::FontData::from_owned(data).into());
+        let mut japanese = japanese;
+        #[cfg(target_os = "macos")]
+        {
+            // Hiragino's UI face uses 1083 units/em, matching SF's cap/x-height.
+            // The default TTC face is for documents and has a larger character face.
+            japanese.index = 1;
+            japanese.tweak.y_offset_factor = 0.24;
+            if let Ok(data) = std::fs::read("/System/Library/Fonts/SFNS.ttf") {
+                let mut latin = egui::FontData::from_owned(data);
+                // Match visible Latin ascenders to the Japanese UI face; advances
+                // and line heights are measured after this optical adjustment.
+                latin.tweak.scale = 1.1;
+                latin.tweak.coords = egui::epaint::text::VariationCoords::new([("opsz", 17.0)]);
+                fonts.font_data.insert("system-ui".into(), latin.into());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .insert(0, "system-ui".into());
+            }
+        }
+        fonts
+            .font_data
+            .insert("system-japanese".into(), japanese.into());
+        #[cfg(target_os = "macos")]
+        {
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
                 .or_default()
-                .insert(0, "system-ui".into());
+                .insert(1, "system-japanese".into());
+            fonts
+                .families
+                .entry(egui::FontFamily::Monospace)
+                .or_default()
+                .push("system-japanese".into());
         }
-        fonts.font_data.insert(
-            "system-japanese".into(),
-            egui::FontData::from_owned(data).into(),
-        );
+        #[cfg(not(target_os = "macos"))]
         for family in fonts.families.values_mut() {
             family.push("system-japanese".into());
         }

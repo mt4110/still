@@ -26,6 +26,24 @@ The existing Rust/egui implementation and cleanup contracts remain in use.
 - The selection summary and review action stay beneath the list. Narrow windows
   put details below the list instead of compressing the entire inspector.
 
+## Mixed Japanese and Latin typography
+
+The Mac UI uses the Hiragino UI face (TTC index 1), paired with SF's small-text
+optical size. The document face (index 0) has a larger em and different leading.
+SF's visible Latin ascenders are optically adjusted to the Japanese UI face;
+layout widths and line heights are measured after that adjustment.
+
+For the workspace action, header menu, sidebar and language control, alignment
+uses the visible glyph mesh rather than only the line box. This includes leading
+underscores and descenders in names such as `_workspace`. The language control
+sizes to its label and chevron instead of reserving an arbitrary empty width.
+Native egui buttons/popups retain keyboard, focus and accessibility behavior;
+the common label painter supplies the visible text placement.
+
+Regression checks cover mixed-script visible heights, centered ink bounds at 1x
+and 2x scale, and the control frame heights. Native Mac checks include opening
+and dismissing the header menu and changing Japanese/English.
+
 ## Interaction states
 
 | State | Presentation and behavior |
