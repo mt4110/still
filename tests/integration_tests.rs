@@ -167,7 +167,7 @@ fn test_safety_scope_rejection() {
         "created_at": {{ "secs_since_epoch": 0, "nanos_since_epoch": 0 }},
         "entries": [
             {{
-                "path": "{}",
+                "path": {},
                 "size": 4,
                 "modified": {{ "secs_since_epoch": 0, "nanos_since_epoch": 0 }},
                 "entry_type": "File",
@@ -178,7 +178,7 @@ fn test_safety_scope_rejection() {
             }}
         ]
     }}"#,
-        bad_path.to_string_lossy()
+        serde_json::to_string(&bad_path).unwrap()
     );
 
     fs::write(&plan_path, json).unwrap();

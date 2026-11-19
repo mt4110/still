@@ -90,9 +90,13 @@ mod tests {
     use std::path::PathBuf;
     use std::time::SystemTime;
 
+    fn absolute(relative: &str) -> PathBuf {
+        Path::new(if cfg!(windows) { r"C:\" } else { "/" }).join(relative)
+    }
+
     fn make_entry(action: ActionType) -> Entry {
         Entry {
-            path: PathBuf::from("/test/path"),
+            path: absolute("test/path"),
             size: 100,
             modified: SystemTime::UNIX_EPOCH,
             entry_type: EntryType::File,
@@ -105,9 +109,7 @@ mod tests {
 
     fn default_ctx() -> ValidationContext {
         ValidationContext {
-            allowed_scopes: vec![PathBuf::from(
-                "/Users/masakitakemura/_workspace/still/test_scope",
-            )],
+            allowed_scopes: vec![absolute("test_scope")],
             allow_outside_scope: true, // Allow by default for simple tests unless testing scope
         }
     }
@@ -147,7 +149,7 @@ mod tests {
 
     #[test]
     fn test_validate_scope_containment() {
-        let allowed = PathBuf::from("/allowed");
+        let allowed = absolute("allowed");
         let ctx = ValidationContext {
             allowed_scopes: vec![allowed.clone()],
             allow_outside_scope: false,
@@ -155,7 +157,7 @@ mod tests {
 
         // Good path
         let mut entry = make_entry(ActionType::Keep);
-        entry.path = PathBuf::from("/allowed/child");
+        entry.path = absolute("allowed/child");
         let plan_good = Plan {
             schema_version: "2.0".to_string(),
             generated_by: "test".to_string(),
@@ -165,7 +167,7 @@ mod tests {
         assert!(validate(&plan_good, &ctx).is_ok());
 
         // Bad path but Action::Keep -> Should PASS now (Safe by default)
-        entry.path = PathBuf::from("/forbidden/child");
+        entry.path = absolute("forbidden/child");
         let plan_bad_keep = Plan {
             schema_version: "2.0".to_string(),
             generated_by: "test".to_string(),
@@ -202,19 +204,19 @@ mod tests {
 
     #[test]
     fn test_lexical_subpath() {
-        let base = PathBuf::from("/base");
+        let base = absolute("base");
 
-        assert!(is_subpath(&PathBuf::from("/base/child"), &base));
-        assert!(is_subpath(&PathBuf::from("/base/child/grandchild"), &base));
-        assert!(is_subpath(&PathBuf::from("/base"), &base)); // Equal is subpath
+        assert!(is_subpath(&absolute("base/child"), &base));
+        assert!(is_subpath(&absolute("base/child/grandchild"), &base));
+        assert!(is_subpath(&absolute("base"), &base)); // Equal is subpath
 
         // Dot normalization
-        assert!(is_subpath(&PathBuf::from("/base/./child"), &base));
-        assert!(is_subpath(&PathBuf::from("/base/foo/../child"), &base));
+        assert!(is_subpath(&absolute("base/./child"), &base));
+        assert!(is_subpath(&absolute("base/foo/../child"), &base));
 
         // Outside
-        assert!(!is_subpath(&PathBuf::from("/other"), &base));
-        assert!(!is_subpath(&PathBuf::from("/bas"), &base)); // Prefix substring check should fail
-        assert!(!is_subpath(&PathBuf::from("/base_sibling"), &base));
+        assert!(!is_subpath(&absolute("other"), &base));
+        assert!(!is_subpath(&absolute("bas"), &base)); // Prefix substring check should fail
+        assert!(!is_subpath(&absolute("base_sibling"), &base));
     }
 }

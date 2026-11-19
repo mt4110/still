@@ -28,6 +28,14 @@ description = "Cache files larger than 100MB"
 # Logs are historical records. We keep recent ones for debugging.
 
 [[rules]]
+name = "Logs: work evidence"
+scopes = ["~/Library/Logs"]
+includes = ["**/Library/Logs/{Slack,Teams,Microsoft Teams,com.tinyspeck.slackmacgap,com.microsoft.teams,com.microsoft.teams2}", "**/Library/Logs/{Slack,Teams,Microsoft Teams,com.tinyspeck.slackmacgap,com.microsoft.teams,com.microsoft.teams2}/**"]
+min_size_bytes = 0
+recommended_action = "Keep"
+description = "Slack and Teams logs can be needed as work evidence"
+
+[[rules]]
 name = "Logs: Old"
 scopes = ["~/Library/Logs"]
 older_than_days = 14

@@ -2,9 +2,18 @@
 name = "still"
 version = "0.2.0-beta.1"
 edition = "2021"
+default-run = "still"
 authors = ["Antigravity"]
 description = "Local storage explorer and review-first cleanup tool"
 license-file = "LICENSE" # Source-available as requested
+
+[features]
+desktop = ["dep:eframe", "dep:rfd", "dep:wgpu"]
+
+[[bin]]
+name = "still-desktop"
+path = "src/bin/still-desktop.rs"
+required-features = ["desktop"]
 
 [dependencies]
 anyhow = "1.0"
@@ -26,8 +35,16 @@ trash = "3.2"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 tempfile = "3.8"
 
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+rfd = { version = "=0.17.2", default-features = false, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "=0.34.1", default-features = false, features = ["accesskit", "default_fonts", "glow"], optional = true }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
+eframe = { version = "=0.34.1", default-features = false, features = ["accesskit", "default_fonts", "wgpu_no_default_features"], optional = true }
+wgpu = { version = "29", default-features = false, features = ["dx12", "wgsl"], optional = true }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }

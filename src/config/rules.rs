@@ -96,9 +96,7 @@ pub fn expand_path(path_str: &str) -> Result<PathBuf> {
             let home = user_dirs.home_dir();
             let without_tilde = path_str.strip_prefix("~").unwrap_or(path_str);
             // Handle ~/.foo vs ~/foo
-            let suffix = without_tilde
-                .strip_prefix(std::path::MAIN_SEPARATOR_STR)
-                .unwrap_or(without_tilde);
+            let suffix = without_tilde.trim_start_matches(std::path::is_separator);
             return Ok(home.join(suffix));
         }
     }
@@ -114,9 +112,12 @@ mod tests {
 
     #[test]
     fn test_expand_path() {
-        let expanded = expand_path("~/Library").unwrap();
-        assert!(expanded.is_absolute());
-        assert!(expanded.ends_with("Library"));
+        let dirs = directories::UserDirs::new().unwrap();
+        let expected = dirs.home_dir().join("Library");
+        assert_eq!(expand_path("~/Library").unwrap(), expected);
+        assert_eq!(expand_path("~").unwrap(), dirs.home_dir());
+        #[cfg(windows)]
+        assert_eq!(expand_path(r"~\Library").unwrap(), expected);
     }
 
     #[test]

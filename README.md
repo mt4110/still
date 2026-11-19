@@ -11,6 +11,18 @@
 - **Library の隔離**: 保管庫（Vault）へ移した項目を復元できます。
 - **ローカル優先**: GitHub の PR 照合は `--github-pr` を指定した時に実行します。
 
+## プライバシー
+
+**still はユーザーデータや利用状況を開発元に送信しません。テレメトリー、利用分析、クラッシュレポートの自動送信はありません。** スキャン結果は端末内で処理します。週次プロファイルや比較用の履歴も端末内に保存します。
+
+**「Find old files…」と `still stale` の検索範囲は、自分のホームフォルダ（`~/`）内だけです。** 既定の **Home (~)** で **Scan** を押すと、フォルダを個別に選ばずに調べられます。OS の権限に従って走査し、読み取れなかった項目数を結果に表示します。ファイル本文は読み込まず、パス・サイズ・日時などを確認します。隠し項目、`Library`、`node_modules` は対象外で、シンボリックリンクやジャンクションをたどりません。
+
+Mac ではワークスペース調査もホーム内に限ります。保存済みプロファイルや CLI でも、`/`、`/tmp`、`/nix/store` などホーム外のフォルダは指定できません。Windows のワークスペース調査は指定したフォルダを使います。`still review` でフォルダを省略した場合は、コマンドを実行したディレクトリが対象です。
+
+macOS の「ファイルとフォルダ」の許可は、デスクトップ、書類、ダウンロードなどの場所ごとに管理されます。普段の調査を開発フォルダに絞るには、**Choose folder…** で `~/_workspace` などを選べます。
+
+Docker と Kubernetes の調査は指定したローカルの接続先を使い、`--github-pr` を指定した場合は `gh` で GitHub に照会します。
+
 ## インストール
 
 ```bash
@@ -21,6 +33,70 @@ cargo build --release
 # 通常のCargo
 cargo install --path .
 ```
+
+### デスクトップアプリ（macOS / Windows）
+
+初期表示は日本語です。Mac は左下、Windows は右上の言語メニューで英語にも切り替えられます。**ヘルプ** は、候補の調べ方、保留理由、削除確認、権限とプライバシーをアプリ内で説明します。
+
+Mac のサイドバーの **ディスク** では、ホームフォルダがあるボリュームの使用率と空き容量、その物理ディスクの読み込み・書き込み速度を確認できます。この画面を開いている間に約2秒間隔で計測します。**Docker** では、現在のローカル接続先、または指定した接続先のコンテナ・イメージ・ボリューム・ビルドキャッシュを容量順に表示します。名前・ID・状態で絞り込み、行を選ぶと参照数やマウントなどの詳細を確認できます。Docker 内のサイズは、SSD の実際の回収量と異なる場合があります。
+
+Mac は左のナビゲーションから各画面を開き、候補一覧の右側で判定理由と削除後の影響を確認できます。保留や保護の項目も名前と容量を読みやすく表示し、選択した分だけ確認画面に進みます。選択とホバーの色は短く変化し、macOS の「視差効果を減らす」が有効なら起動時に動きを抑えます。画面構成と状態の扱いは [デスクトップの UX](docs/DESKTOP_UX.md) にまとめています。
+
+フォルダ調査中は、確認済みのファイル数・フォルダ数・論理容量・調査している場所を表示します。容量の集計後は、掃除候補の安全性確認へ切り替わります。Library の残り物の所有元推定と週次提案、Before／After の記録は [整理アルゴリズムと製品プラン](docs/CLEANUP_STRATEGY.md) にまとめています。
+
+macOS では `still.app`、Windows ではスタートメニューの `stilll` から開きます。Mac は **調査先とプロファイル → 調査フォルダを追加…**、Windows は **その他の操作 → 調査フォルダを追加…** で調査先を選び、プロジェクトごとの容量と候補を確認します。フォルダ探索では容量順の表示とパスの再帰検索を利用できます。**別名で保存…** で週次プロファイルを保存できます。CLI の `still review --save-profile` で保存したプロファイルも開けます。
+
+**Cleanup candidates** で候補のサイズと理由を確認します。チェックを付けて **Review … selected** を押すと対象の詳細が開き、最終確認の **Delete selected** を押したときだけ、選んだ生成物を削除します。削除はゴミ箱を経由しません。**Candidate sources** で再生成できる専用出力先、Git リポジトリ、ローカル Docker 接続先を追加できます。Git と Docker の候補はアプリで調査でき、削除は専用の CLI で確認して行います。
+
+候補が多いときはパスで絞り、**Select all eligible** で表示条件に合う候補をまとめて選べます。親子の候補は親にまとめます。**Scan … selected** は選択分を読み取り専用で調べ、**Review … selected → Delete selected** で最終確認したフォルダを最大2件ずつ削除します。候補一覧を操作中は10秒おきに表示行の存在を確かめます。Mac では現在地のパスの各階層や選択した行から Finder を開けます。**Find old files…** の結果は容量順・更新日の古い順・作成日の古い順に切り替えられます。
+
+Mac ではホームの「_workspace を調べる」から開始できます。直下のフォルダをプロジェクトとして、使用量・候補容量・前回比を一覧表示します。プロジェクトを開くと、個別の生成物の説明、保留理由、「Finder で開く」と「この項目を再確認」が表示されます。初回の走査が比較の基準になります。
+
+標準の Cargo `target` が保留になった場合、`debug`・`release` 直下の `incremental` と `deps` は個別に検査します。Cargo の痕跡と中身の形式を確認できたフォルダだけが選択でき、証明書・ログ・結果など判別できない項目を含むフォルダは保留になります。
+
+別の場所に置いた Cargo 出力も、ビルド痕跡が揃えば表示します。対応するプロジェクトが確認できない場合や、Git 追跡ファイル・リンク・保護項目などがある場合は、一覧の **Status** に保留理由が出ます。削除時には内容の変化や使用中のファイルを再確認します。
+言語メニューで、画面や保留理由を英語・日本語に切り替えられます。行をクリックすると、長いパスを含む理由の全文が出ます。
+
+**Find old files…** で、ホーム配下から更新・アクセス・作成のうち、取得できた最新の日時が指定の日数より古いファイルを容量順に探せます。対象フォルダや最小サイズを指定して、結果をパスで絞れます。ターミナルでは `still stale --older-than-days 180 --min-mib 512` を実行し、`--root` でホーム配下のフォルダを指定できます。更新日・最終アクセス日・論理サイズ・上位候補の使用中チェックを表示します。開いているプロセスが見つからなくても、不要とは限りません。隠し項目、`Library`、`node_modules` は走査対象外です。
+
+```sh
+# ソースからウィンドウを起動（macOS / Windows）
+cargo run --locked --features desktop --bin still-desktop
+
+# macOS のローカル配布用 .app
+cargo build --locked --release --features desktop --bins
+scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.2.0 target/still.app
+```
+
+別の Apple Silicon Mac に渡すときは、`still.app` を ZIP にまとめて転送し、展開したアプリを「アプリケーション」に入れます。転送先で Rust や Nix をインストールする必要はありません。週次プロファイルは端末ごとのパスを使うため、転送先で **Add workspace… → Save as…** から作成します。
+
+```sh
+ditto -c -k --sequesterRsrc --keepParent target/still.app target/still-macos-arm64.zip
+```
+
+PR の **Rust CI → build (macos-15)** が成功すると、実行結果の **Artifacts → still-macos-arm64** からアプリの ZIP を取得できます。既定のローカル作成版と CI 作成版は自己利用向けのアドホック署名で、公証は行っていません。
+
+組織管理の Mac 向けには、キーチェーンにある **Developer ID Application** 証明書を明示して署名し、Apple の公証を受けた ZIP を用意できます。`Apple Development` 証明書はこの配布用の指定に使えません。
+
+```sh
+STILL_SIGNING_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
+  scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.2.0 target/still-signed.app
+scripts/notarize-macos-app.sh target/still-signed.app still-notary target/still-notarized.zip
+```
+
+`still-notary` は、利用者が `notarytool` に登録済みのキーチェーンプロファイル名です。公証スクリプトはアプリのコピーを Apple に提出し、承認、チケット添付、Gatekeeper の検証が成功した場合に配布 ZIP を作成します。既存の入力アプリや出力ファイルは上書きしません。組織のセキュリティ製品には、その組織の許可設定が追加で必要な場合があります。[Apple の Developer ID](https://developer.apple.com/developer-id/)、[公証の公式ガイド](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
+
+Windows の MSIX は [パッケージ作成スクリプト](scripts/build-windows-msix.ps1) に両方の実行ファイルを渡します。Smart App Control がオンの PC には、Microsoft Store が署名したパッケージを使用します。
+
+### アプリと SDK の容量（Mac）
+
+**App storage…** で、Android NDK の版ごとの容量、Unity Asset Store のダウンロード済みパッケージ、Unreal Engine のローカル DDC、ブラウザのキャッシュ、Slack・Teams のログ、Notion のローカルデータを確認できます。既知のホーム内の場所を対象に容量だけを調べ、ログやデータベースの本文には触れません。Xcode のインストール済みランタイムは、チェックを入れた場合に Xcode の一覧を取得します。
+
+CLI では `still app-storage`、Xcode の一覧も含めるなら `still app-storage --xcode-runtimes` を実行します。この画面は確認専用です。SDK の版は各管理ツールで利用状況を確認してください。Notion のローカルデータや仕事の証跡になりうるログは保護表示します。ワークスペース調査では Unity の元アセットとキャッシュ、Unreal Engine 本体、元アセット、自動保存、ログ、生成キャッシュも判別して表示します。
+
+Mac 版の **App storage… → Review Xcode & NDK versions…** では、版ごとの容量と候補／保護の理由を表示します。古いランタイムは最終利用記録、端末の状態、テスト設定を確認し、利用記録がある場合は45日を目安にします。プロジェクト設定と NDK のビルド記録は、開いているプロファイルのフォルダ、`~/_workspace`、`~/AndroidStudioProjects` を調べます。候補を選んで **Review … selected → Uninstall … selected** と進むと、再確認できた版だけを各管理ツールでアンインストールします。結果には Mac のデータボリュームの前後の空き容量と、実測した差が出ます。
+
+Xcode の削除処理後は、利用可能ランタイムの一覧と、対象ビルドのイメージも照合します。残っている場合は **一部残存** と表示し、確認できたイメージの使用量を、データボリューム全体で実測した空き容量の差と別に示します。
 
 ## 使い方：3ステップ・ワークフロー
 
@@ -40,13 +116,23 @@ still review --cleanup-root ~/_workspace --output ~/_workspace/my-project/genera
 still review --root ~/_workspace --search .next --format json
 ```
 
-`Enter` でディレクトリを開き、`←` で親に戻ります。`/` で現在地以下を検索し、`o` で別の調査先を開きます。`s` で合計容量順と最大ファイル順を切り替えます。
+毎週同じ範囲を見たい場合は、初回にプロファイルを保存します。
 
-`Tab` に Cargo、Next.js、Vite の生成物候補が出ます。`Space` で選ぶと、Git の追跡状態と配下のファイルを確認します。`D` で実際に削除する対象を確認し、`y` で実行します。削除はゴミ箱を経由しません。`--output` は再生成できる専用出力先に指定してください。
+```sh
+still review --save-profile weekly --cleanup-root ~/_workspace
+still review --profile weekly
+```
+`--root` だけで保存すると容量調査用のプロファイルになります。初回は比較元を記録し、次回から差分を表示します。差分の `*` は一部を走査できなかったときの観測値です。`--format json` などのレポート出力は走査履歴を更新しません。
+
+`Enter` でディレクトリを開き、`←` で親に戻ります。`/` で現在地以下を検索し、`o` で別の調査先を開きます。`s` で合計容量順、最大ファイル順、前回からの増加順を切り替えます。増加順はプロファイルの前回走査があるときに使えます。
+
+`Tab` に Cargo、Next.js、Vite の生成物候補と、対応するソースがある CPython のバイトコードキャッシュが出ます。`Space` で選ぶと、Git の追跡状態と配下のファイルを確認します。`D` で実際に削除する対象を確認し、`y` で実行します。削除はゴミ箱を経由しません。`--output` は再生成できる専用出力先に指定してください。Unity の `Library` は容量と保護理由を表示します。
 
 選択後に中身が変わった出力、リンクや保護対象を含む出力は保留されます。エラーで `.still-stage-*` が残った場合、`original-path.txt` が元の場所、`payload` が残ったデータです。空き容量の増減はストレージ全体の観測値です。
 
-`--docker-context colima` などを追加すると、指定したローカルの Docker 接続先にあるコンテナの bind mount と重なる出力を保護します。
+`--git-repo` に元の Git チェックアウトを指定すると、同じ候補画面にリンク済みワークツリーと判定理由が出ます。既定の比較先はローカルの `main` です。取得済みのリモート追跡ブランチを使うなら `--git-base refs/remotes/origin/main` を指定します。
+
+`--docker-context colima` を指定すると、同じ画面で Docker の候補を確認できます。BuildKit は `--docker-cache` で調査します。指定した接続先のコンテナの bind mount と重なる出力は保護します。候補画面の `f`、`g`、`d` はファイル、Git、Docker への移動です。回収量は観測値からの目安で、Docker の表示は Docker 内の容量です。Git と Docker の削除には、それぞれ `still worktrees` と `still docker` を使います。各オプションは `--save-profile` で保存できます。
 
 ### マージ済み Git ワークツリー
 
@@ -68,6 +154,16 @@ still docker --context colima --remove 'image:sha256:表示された完全なID'
 ```
 
 停止中も含むコンテナから参照されていない、取得元の digest があるイメージを表示します。一時用途のコンテナは作成時の `still.disposable=true` ラベルで識別します。`--include-cache` はローカルの組み込みビルダーの古いキャッシュを表示します。削除は表示された個別 ID を対象にします。サイズは Docker 内の値です。
+
+未参照ボリュームはデータが残る可能性があるため、保護状態として表示します。
+
+### ローカル Kubernetes / K3s
+
+```sh
+still kube --kubeconfig ~/kube-local.yaml --context my-local --namespace dev
+```
+
+終了済み Job と Pod を読み取り専用で確認できます。終了から7日以上経過し、`still.disposable=true` ラベルがある成功済みリソースがレビュー対象です。失敗済みやコントローラー管理下のリソースは保護理由を表示します。デスクトップの **Candidate sources**、または `still review` の `--kubeconfig`、`--kube-context`、`--kube-namespace` でも追加できます。接続先は TLS を検証できるループバックの API に限定されます。
 
 ### Library の既存ワークフロー
 

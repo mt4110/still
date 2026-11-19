@@ -1,3 +1,4 @@
+use super::message::Message;
 use super::{bytes, filesystem, git, inventory};
 use crate::cli::{ListFormat, WorktreeArgs};
 use anyhow::{bail, Context, Result};
@@ -23,6 +24,14 @@ struct Observation {
     reason: String,
     removable: bool,
     logical_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ReviewCandidate {
+    pub path: PathBuf,
+    pub repo: PathBuf,
+    pub reason: Message,
+    pub removable: bool,
 }
 
 #[derive(Deserialize)]
@@ -52,44 +61,20 @@ struct Repository {
 }
 
 pub fn run(args: &WorktreeArgs) -> Result<()> {
-    let repo = inventory::safe_dir(&args.repo)?;
-    let root = inventory::safe_dir(&args.root)?;
-    if !args.base.starts_with("refs/") {
-        bail!("Use a full Git reference, such as refs/heads/main");
-    }
-    git::check(
-        git::run(&repo, ["check-ref-format", &args.base])?,
-        "check-ref-format",
-    )?;
-    let grafts = git::check(
-        git::run(&repo, ["rev-parse", "--git-path", "info/grafts"])?,
-        "git-path",
-    )?;
-    let grafts = repo.join(os_string(grafts.strip_suffix(b"\n").unwrap_or(&grafts))?);
-    match grafts.symlink_metadata() {
-        Ok(_) => bail!("The repository uses a grafted commit graph"),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-    let baseline = resolve(&repo, &args.base)?;
+    let repo = inventory::safe_workspace_dir(&args.repo)?;
+    let root = inventory::safe_workspace_dir(&args.root)?;
+    let baseline = resolve_baseline(&repo, &args.base)?;
     let pr_data = pull_requests(&repo, &args.github_prs)?;
-    let entries = list(&repo)?;
-    if !entries
-        .first()
-        .is_some_and(|entry| entry.path.canonicalize().is_ok_and(|p| p == repo))
-    {
-        bail!("--repo must be the primary checkout");
-    }
-    let mut scoped = entries.iter().skip(1).filter(|entry| {
-        entry.path != root
-            && (entry.path.starts_with(&root)
-                || entry
-                    .path
-                    .canonicalize()
-                    .is_ok_and(|p| p != root && p.starts_with(&root)))
-    });
+    let entries = linked_worktrees(&repo)?;
+    let roots = std::slice::from_ref(&root);
+    let mut scoped = entries
+        .iter()
+        .filter(|entry| in_review_scope(&entry.path, roots));
     if let Some(path) = &args.remove {
-        let path = inventory::safe_dir(path)?;
+        let path = inventory::safe_workspace_dir(path)?;
+        if !strictly_below_root(&path, roots) {
+            bail!("Not a linked worktree beneath --root");
+        }
         let entry = scoped
             .find(|entry| entry.path.canonicalize().is_ok_and(|p| p == path))
             .context("Not a linked worktree beneath --root")?;
@@ -114,7 +99,7 @@ pub fn run(args: &WorktreeArgs) -> Result<()> {
 
     let observations: Vec<_> = scoped
         .map(|entry| {
-            let outcome = inventory::safe_dir(&entry.path)
+            let outcome = inventory::safe_workspace_dir(&entry.path)
                 .and_then(|path| eligible(&repo, entry, &path, &args.base, &baseline, &pr_data));
             let removable = outcome.is_ok();
             let logical_bytes = if removable {
@@ -155,6 +140,133 @@ pub fn run(args: &WorktreeArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(super) fn review_candidates(
+    repo: &Path,
+    cleanup_roots: &[PathBuf],
+    base: &str,
+) -> Result<Vec<ReviewCandidate>> {
+    if cleanup_roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let repo = inventory::safe_dir(repo)?;
+    let entries: Vec<_> = linked_worktrees(&repo)?
+        .into_iter()
+        .filter(|entry| {
+            in_review_scope(&entry.path, cleanup_roots) || is_codex_managed(&entry.path)
+        })
+        .collect();
+    let baseline = entries
+        .iter()
+        .any(|entry| !is_codex_managed(&entry.path))
+        .then(|| {
+            resolve_baseline(&repo, base)
+                .with_context(|| format!("Could not verify the local baseline {base}"))
+        })
+        .transpose()?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            if is_codex_managed(&entry.path) {
+                return ReviewCandidate {
+                    path: entry.path,
+                    repo: repo.clone(),
+                    reason: Message::new(
+                        "Codex-managed worktree; managed in the associated chat",
+                        "Codex 管理のワークツリーです。紐づいたチャットから管理してください。",
+                    ),
+                    removable: false,
+                };
+            }
+            let outcome = inventory::safe_dir(&entry.path).and_then(|path| {
+                if !strictly_below_root(&path, cleanup_roots) {
+                    return Err(Message::new(
+                        "Resolved path is outside the configured cleanup roots",
+                        "解決したパスが設定済みの掃除対象外にあります。",
+                    )
+                    .into());
+                }
+                let baseline = baseline
+                    .as_deref()
+                    .context("Git integration baseline unavailable")?;
+                let reason = eligible(&repo, &entry, &path, base, baseline, &[])?;
+                filesystem::ensure_not_open(&path)?;
+                Ok((path, reason))
+            });
+            let (path, reason, removable) = match outcome {
+                Ok((path, reason)) => (
+                    path,
+                    Message::new(reason, format!("{base} への取り込みを確認しました。")),
+                    true,
+                ),
+                Err(err) => (entry.path, Message::from_error(&err), false),
+            };
+            ReviewCandidate {
+                path,
+                repo: repo.clone(),
+                reason,
+                removable,
+            }
+        })
+        .collect())
+}
+
+fn resolve_baseline(repo: &Path, base: &str) -> Result<String> {
+    if !base.starts_with("refs/") {
+        bail!("Use a full Git reference, such as refs/heads/main");
+    }
+    git::check(
+        git::run(repo, ["check-ref-format", base])?,
+        "check-ref-format",
+    )?;
+    let grafts = git::check(
+        git::run(repo, ["rev-parse", "--git-path", "info/grafts"])?,
+        "git-path",
+    )?;
+    let grafts = repo.join(os_string(grafts.strip_suffix(b"\n").unwrap_or(&grafts))?);
+    match grafts.symlink_metadata() {
+        Ok(_) => bail!("The repository uses a grafted commit graph"),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+    resolve(repo, base)
+}
+
+fn linked_worktrees(repo: &Path) -> Result<Vec<Worktree>> {
+    let entries = list(repo)?;
+    if !entries
+        .first()
+        .is_some_and(|entry| entry.path.canonicalize().is_ok_and(|p| p == repo))
+    {
+        bail!("--repo must be the primary checkout");
+    }
+    Ok(entries.into_iter().skip(1).collect())
+}
+
+fn in_review_scope(path: &Path, roots: &[PathBuf]) -> bool {
+    strictly_below_root(path, roots)
+        || path
+            .canonicalize()
+            .is_ok_and(|resolved| strictly_below_root(&resolved, roots))
+}
+
+fn strictly_below_root(path: &Path, roots: &[PathBuf]) -> bool {
+    roots
+        .iter()
+        .any(|root| path != root && path.starts_with(root))
+}
+
+fn is_codex_managed(path: &Path) -> bool {
+    let configured = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+    let default = directories::UserDirs::new().map(|dirs| dirs.home_dir().join(".codex"));
+    configured.into_iter().chain(default).any(|home| {
+        let worktrees = home.join("worktrees");
+        path.starts_with(&worktrees)
+            || worktrees
+                .canonicalize()
+                .is_ok_and(|root| path.starts_with(root))
+    })
 }
 
 fn list(repo: &Path) -> Result<Vec<Worktree>> {
@@ -224,7 +336,11 @@ fn ancestor(repo: &Path, head: &str, base: &str) -> Result<bool> {
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => bail!("Git could not verify ancestry"),
+        _ => Err(Message::new(
+            "Git could not verify ancestry",
+            "Git でコミットの取り込み関係を確認できませんでした。",
+        )
+        .into()),
     }
 }
 
@@ -244,22 +360,21 @@ fn eligible(
         .as_deref()
         .and_then(|b| b.strip_prefix("refs/heads/"));
     if item.unavailable || branch == Some("main") || (branch.is_some() && branch == base_branch) {
-        bail!("Locked, prunable, bare, or integration branch");
+        return Err(Message::new(
+            "Locked, prunable, bare, or integration branch",
+            "このワークツリーはロック済み、参照切れ、ベア、または統合先ブランチです。",
+        )
+        .into());
     }
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| directories::UserDirs::new().map(|dirs| dirs.home_dir().join(".codex")));
-    if codex_home.is_some_and(|home| {
-        let worktrees = home.join("worktrees");
-        path.starts_with(&worktrees)
-            || worktrees
-                .canonicalize()
-                .is_ok_and(|root| path.starts_with(root))
-    }) {
-        bail!("Codex-managed. Use its worktree lifecycle to preserve the chat association.");
+    if is_codex_managed(path) {
+        return Err(Message::new("Codex-managed. Use its worktree lifecycle to preserve the chat association.", "Codex 管理のワークツリーです。チャットとの紐づきを保つため Codex 側で管理してください。").into());
     }
     if std::env::current_dir()?.starts_with(path) {
-        bail!("The current working directory is inside the worktree");
+        return Err(Message::new(
+            "The current working directory is inside the worktree",
+            "現在の作業フォルダがワークツリーの中にあります。",
+        )
+        .into());
     }
     let reason = if ancestor(repo, &item.head, baseline)? {
         format!("HEAD is reachable from {base_ref}")
@@ -276,7 +391,10 @@ fn eligible(
                 }
             }
         }
-        matched.context("No matching commit or merged PR on the chosen baseline")?
+        matched.context(Message::new(
+            "No matching commit or merged PR on the chosen baseline",
+            "指定した統合先で、該当コミットの取り込みやマージ済みの PR を確認できませんでした。",
+        ))?
     };
 
     verify_local_state(path, item, baseline)?;
@@ -286,12 +404,33 @@ fn eligible(
 fn verify_local_state(path: &Path, item: &Worktree, baseline: &str) -> Result<()> {
     let marker = fs::symlink_metadata(path.join(".git"))?;
     if !marker.is_file() || inventory::is_link(&marker) {
-        bail!("Expected a linked-worktree .git file");
+        return Err(Message::new(
+            "Expected a linked-worktree .git file",
+            "リンク済みワークツリーの .git ファイルを確認できません。",
+        )
+        .into());
     }
     if resolve(path, "HEAD")? != item.head {
-        bail!("Worktree HEAD changed");
+        return Err(Message::new(
+            "Worktree HEAD changed",
+            "ワークツリーの HEAD が変わりました。再スキャンしてください。",
+        )
+        .into());
     }
     let root_meta = fs::symlink_metadata(path)?;
+    #[cfg(target_os = "linux")]
+    let mount = {
+        let parent = path.parent().context("Worktree parent missing")?;
+        let mount = filesystem::mount_id(parent)?;
+        if filesystem::mount_id(path)? != mount {
+            return Err(Message::new(
+                "The worktree root is a Linux mount point",
+                "ワークツリーが別にマウントされた領域にあります。",
+            )
+            .into());
+        }
+        mount
+    };
     let mut pending = vec![path.to_owned()];
     while let Some(dir) = pending.pop() {
         for entry in fs::read_dir(&dir)? {
@@ -300,15 +439,24 @@ fn verify_local_state(path: &Path, item: &Worktree, baseline: &str) -> Result<()
                 continue;
             }
             let metadata = fs::symlink_metadata(entry.path())?;
+            #[cfg(target_os = "linux")]
+            if filesystem::mount_id(&entry.path())? != mount {
+                bail!(
+                    "Worktree contains a separate Linux mount: {}",
+                    inventory::display(&entry.path())
+                );
+            }
             if inventory::is_link(&metadata)
                 || !inventory::same_device(&root_meta, &metadata)
                 || super::artifacts::protected(&entry.path())
                 || (!metadata.is_dir() && !metadata.is_file())
             {
-                bail!(
-                    "Worktree contains a protected or unsupported entry: {}",
-                    inventory::display(&entry.path())
-                );
+                let entry = inventory::display(&entry.path());
+                return Err(Message::new(
+                    format!("Worktree contains a protected or unsupported entry: {entry}"),
+                    format!("保護対象または確認できない項目を含みます: {entry}"),
+                )
+                .into());
             }
             if metadata.is_dir() {
                 pending.push(entry.path());
@@ -322,7 +470,11 @@ fn verify_local_state(path: &Path, item: &Worktree, baseline: &str) -> Result<()
         ["config", "--get-regexp", r"^filter\..*\.(clean|process)$"],
     )?;
     if !filters.stdout.is_empty() || filters.status.code() != Some(1) {
-        bail!("Executable Git filters are configured or Git config could not be verified");
+        return Err(Message::new(
+            "Executable Git filters are configured or Git config could not be verified",
+            "外部処理を実行する Git フィルタがあるか、Git の設定を確認できませんでした。",
+        )
+        .into());
     }
     let state = git::check(
         git::run(
@@ -339,7 +491,11 @@ fn verify_local_state(path: &Path, item: &Worktree, baseline: &str) -> Result<()
         "status",
     )?;
     if !state.is_empty() {
-        bail!("Has modified, untracked, or ignored files. Review generated outputs separately.");
+        return Err(Message::new(
+            "Has modified, untracked, or ignored files. Review generated outputs separately.",
+            "変更済み・未追跡・無視対象のファイルが残っています。生成物は個別に確認してください。",
+        )
+        .into());
     }
     let tracked = git::check(
         git::run(path, ["ls-files", "--stage", "-z"])?,
@@ -349,7 +505,11 @@ fn verify_local_state(path: &Path, item: &Worktree, baseline: &str) -> Result<()
         .split(|&byte| byte == 0)
         .any(|entry| entry.starts_with(b"160000 "))
     {
-        bail!("Contains Git submodules");
+        return Err(Message::new(
+            "Contains Git submodules",
+            "Git サブモジュールを含むため保護しています。",
+        )
+        .into());
     }
     let flags = git::check(git::run(path, ["ls-files", "-v", "-z"])?, "ls-files -v")?;
     if flags.split(|&byte| byte == 0).any(|entry| {
@@ -357,7 +517,11 @@ fn verify_local_state(path: &Path, item: &Worktree, baseline: &str) -> Result<()
             .first()
             .is_some_and(|flag| *flag == b'S' || flag.is_ascii_lowercase())
     }) {
-        bail!("Contains sparse-checkout or assume-unchanged entries");
+        return Err(Message::new(
+            "Contains sparse-checkout or assume-unchanged entries",
+            "一部を展開しない設定か、変更検出から除外されたファイルがあります。",
+        )
+        .into());
     }
     let admin = git::check(
         git::run(path, ["rev-parse", "--absolute-git-dir"])?,
@@ -376,7 +540,11 @@ fn verify_local_state(path: &Path, item: &Worktree, baseline: &str) -> Result<()
         "BISECT_LOG",
     ] {
         if admin.join(name).symlink_metadata().is_ok() {
-            bail!("Git has private configuration or an operation in progress");
+            return Err(Message::new(
+                "Git has private configuration or an operation in progress",
+                "ワークツリー固有の Git 設定があるか、Git の操作が進行中です。",
+            )
+            .into());
         }
     }
     let private_refs = git::check(
@@ -393,7 +561,11 @@ fn verify_local_state(path: &Path, item: &Worktree, baseline: &str) -> Result<()
         "private refs",
     )?;
     if !private_refs.is_empty() {
-        bail!("Worktree has private Git references");
+        return Err(Message::new(
+            "Worktree has private Git references",
+            "ワークツリー固有の Git 参照が残っています。",
+        )
+        .into());
     }
     let reflog = git::check(
         git::run(path, ["reflog", "show", "--format=%H", "HEAD"])?,
@@ -408,7 +580,11 @@ fn verify_local_state(path: &Path, item: &Worktree, baseline: &str) -> Result<()
         if !ancestor(path, oid, retained.as_deref().unwrap_or(baseline))?
             && !ancestor(path, oid, baseline)?
         {
-            bail!("The worktree reflog contains local-only history");
+            return Err(Message::new(
+                "The worktree reflog contains local-only history",
+                "ワークツリーの履歴にローカルだけのコミットがあります。",
+            )
+            .into());
         }
     }
     Ok(())
