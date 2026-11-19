@@ -3,6 +3,26 @@ use super::egui;
 pub(super) const HEIGHT: f32 = 36.0;
 pub(super) const PADDING_X: f32 = 12.0;
 
+#[cfg(target_os = "macos")]
+pub(super) fn cell<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    height: f32,
+    align: egui::Align,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let layout = if align == egui::Align::Max {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    ui.allocate_ui_with_layout(egui::vec2(width, height), layout, |ui| {
+        ui.set_width(width);
+        content(ui)
+    })
+    .inner
+}
+
 pub(super) fn field<'a>(ui: &egui::Ui, value: &'a mut String) -> egui::TextEdit<'a> {
     let font = egui::TextStyle::Button.resolve(ui.style());
     let line_height = ui.fonts_mut(|fonts| fonts.row_height(&font));

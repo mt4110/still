@@ -598,16 +598,28 @@ impl Panel {
                 "No matching resources",
             ));
         }
+        let name_width = ui.available_width() - 220.0;
         ui.horizontal(|ui| {
-            ui.add_sized(
-                [ui.available_width() - 220.0, 20.0],
-                egui::Label::new(text(japanese, "名前", "Name")).halign(egui::Align::Min),
+            super::controls::cell(ui, name_width, 28.0, egui::Align::Min, |ui| {
+                ui.add_space(super::controls::PADDING_X);
+                ui.label(
+                    egui::RichText::new(text(japanese, "名前", "Name"))
+                        .size(12.0)
+                        .color(MUTED),
+                );
+            });
+            super::controls::cell(ui, 90.0, 28.0, egui::Align::Max, |ui| {
+                ui.label(
+                    egui::RichText::new(text(japanese, "容量", "Size"))
+                        .size(12.0)
+                        .color(MUTED),
+                );
+            });
+            ui.label(
+                egui::RichText::new(text(japanese, "状態・参照", "State / references"))
+                    .size(12.0)
+                    .color(MUTED),
             );
-            ui.add_sized(
-                [90.0, 20.0],
-                egui::Label::new(text(japanese, "容量", "Size")).halign(egui::Align::Max),
-            );
-            ui.label(text(japanese, "状態・参照", "State / references"));
         });
         let table_height = (ui.available_height() - 160.0).clamp(180.0, 420.0);
         egui::ScrollArea::vertical()
@@ -636,10 +648,9 @@ impl Panel {
                             {
                                 self.selected = Some((item.id.clone(), item.name.clone()));
                             }
-                            ui.add_sized(
-                                [90.0, 28.0],
-                                egui::Label::new(&item.size).halign(egui::Align::Max),
-                            );
+                            super::controls::cell(ui, 90.0, 28.0, egui::Align::Max, |ui| {
+                                ui.label(&item.size);
+                            });
                             ui.label(resource_state(*kind, item, japanese));
                         });
                     });

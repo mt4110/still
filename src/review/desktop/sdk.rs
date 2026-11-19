@@ -318,20 +318,31 @@ fn sdk_rows(
     enabled: bool,
     detail_height: f32,
 ) {
-    let width = ui.available_width();
-    let name_width = (width - 294.0).max(115.0);
-    ui.horizontal(|ui| {
-        ui.add_space(30.0);
-        ui.add_sized(
-            [name_width, 22.0],
-            egui::Label::new(text(japanese, "項目", "Version")).halign(egui::Align::Min),
-        );
-        ui.add_sized(
-            [90.0, 22.0],
-            egui::Label::new(text(japanese, "容量", "Size")).halign(egui::Align::Max),
-        );
-        ui.label(text(japanese, "状態", "Status"));
-    });
+    use super::controls::{cell, HEIGHT};
+    let name_width =
+        (ui.available_width() - 8.0 - HEIGHT - 90.0 - 150.0 - 3.0 * ui.spacing().item_spacing.x)
+            .max(115.0);
+    let (header_rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    let mut header = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(header_rect.shrink2(egui::vec2(4.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    cell(&mut header, HEIGHT, 28.0, egui::Align::Min, |_| {});
+    for (title, width, align) in [
+        (
+            text(japanese, "項目", "Version"),
+            name_width,
+            egui::Align::Min,
+        ),
+        (text(japanese, "容量", "Size"), 90.0, egui::Align::Max),
+        (text(japanese, "状態", "Status"), 150.0, egui::Align::Min),
+    ] {
+        cell(&mut header, width, 28.0, align, |ui| {
+            ui.label(RichText::new(title).size(12.0).color(MUTED));
+        });
+    }
     ui.separator();
     let notes_height = if report.notes.is_empty() { 0.0 } else { 32.0 };
     let height = (ui.available_height() - detail_height - notes_height).max(96.0);
@@ -370,7 +381,7 @@ fn sdk_rows(
                 let mut row = ui.new_child(
                     egui::UiBuilder::new()
                         .id_salt(("sdk-version", index))
-                        .max_rect(rect.shrink2(egui::vec2(4.0, 7.0)))
+                        .max_rect(rect.shrink2(egui::vec2(4.0, 6.0)))
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 );
                 row.set_clip_rect(row.clip_rect().intersect(rect));
@@ -394,17 +405,16 @@ fn sdk_rows(
                     }
                     *focused = Some(item.target.clone());
                 }
-                let name_response = row
-                    .add_sized(
-                        [name_width, 28.0],
-                        egui::Label::new(RichText::new(&item.label).color(INK))
+                let name_response = cell(&mut row, name_width, HEIGHT, egui::Align::Min, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&item.label).size(15.0).color(INK))
                             .selectable(false)
                             .sense(egui::Sense::click())
-                            .halign(egui::Align::Min)
                             .truncate(),
                     )
                     .on_hover_text(&item.label)
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                });
                 name_response.widget_info(|| {
                     egui::WidgetInfo::selected(
                         egui::WidgetType::SelectableLabel,
@@ -416,17 +426,21 @@ fn sdk_rows(
                 if name_response.clicked() {
                     *focused = Some(item.target.clone());
                 }
-                row.add_sized(
-                    [90.0, 28.0],
-                    egui::Label::new(
-                        RichText::new(item.size.map_or_else(|| "—".into(), bytes)).color(INK),
-                    )
-                    .halign(egui::Align::Max)
-                    .truncate(),
-                );
+                cell(&mut row, 90.0, HEIGHT, egui::Align::Max, |ui| {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(item.size.map_or_else(|| "—".into(), bytes)).color(INK),
+                        )
+                        .truncate(),
+                    );
+                });
                 let status = item_status(item, japanese);
-                row.add(egui::Label::new(RichText::new(&status).color(INK)).truncate())
+                cell(&mut row, 150.0, HEIGHT, egui::Align::Min, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&status).size(13.0).color(INK)).truncate(),
+                    )
                     .on_hover_text(format!("{status} · {}", item.reason.text(japanese)));
+                });
                 if response.clicked() {
                     *focused = Some(item.target.clone());
                 }
