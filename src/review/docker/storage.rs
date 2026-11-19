@@ -47,7 +47,7 @@ const FORMAT: &str = r#"{
 "Images":[{{range $i,$v := .Images}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json (printf "%s:%s" $v.Repository $v.Tag)}},"Size":{{json $v.Size}},"Status":{{json $v.Containers}},"SharedSize":{{json $v.SharedSize}},"UniqueSize":{{json $v.UniqueSize}}}{{end}}],
 "Containers":[{{range $i,$v := .Containers}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json $v.Names}},"Size":{{json $v.Size}},"Status":{{json $v.State}},"Detail":{{json $v.Image}},"Mounts":{{json $v.Mounts}}}{{end}}],
 "Volumes":[{{range $i,$v := .Volumes}}{{if $i}},{{end}}{"ID":{{json $v.Name}},"Name":{{json $v.Name}},"Size":{{json $v.Size}},"Status":{{json $v.Links}},"Detail":{{json $v.Driver}}}{{end}}],
-"BuildCache":[{{range $i,$v := .BuildCache}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json $v.CacheType}},"Size":{{json $v.Size}},"Status":{{json $v.InUse}},"Detail":{{json $v.Shared}}}{{end}}]
+"BuildCache":[{{range $i,$v := .BuildCache}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json (printf "%s · %s" $v.CacheType $v.ID)}},"Size":{{json $v.Size}},"Status":{{json $v.InUse}},"Detail":{{json $v.Shared}}}{{end}}]
 }"#;
 
 pub(crate) fn inspect(context: &str) -> Result<Report> {

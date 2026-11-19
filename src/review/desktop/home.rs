@@ -1,4 +1,4 @@
-use super::{bytes, display, egui, App, Profile};
+use super::{bytes, display, egui, text, App, Profile};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
 use directories::{BaseDirs, ProjectDirs};
@@ -90,10 +90,14 @@ impl App {
         use egui::RichText;
 
         ui.label(
-            RichText::new("この Mac の空き容量")
-                .size(19.0)
-                .strong()
-                .color(INK),
+            RichText::new(text(
+                self.japanese_reasons,
+                "この Mac の空き容量",
+                "Free space on this Mac",
+            ))
+            .size(19.0)
+            .strong()
+            .color(INK),
         );
         if let Some((free, total)) = self.home.capacity {
             ui.horizontal_wrapped(|ui| {
@@ -111,9 +115,20 @@ impl App {
             let used_bar =
                 egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * used, bar.height()));
             ui.painter().rect_filled(used_bar, 4, ACCENT);
-            ui.label(RichText::new(format!("{:.0}% 使用中", used * 100.0)).color(MUTED));
+            ui.label(
+                RichText::new(format!(
+                    "{:.0}% {}",
+                    used * 100.0,
+                    text(self.japanese_reasons, "使用中", "used")
+                ))
+                .color(MUTED),
+            );
         } else {
-            ui.label("空き容量を取得できませんでした");
+            ui.label(text(
+                self.japanese_reasons,
+                "空き容量を取得できませんでした",
+                "Could not read free space",
+            ));
         }
         ui.add_space(24.0);
         let workspace = self
@@ -143,25 +158,49 @@ impl App {
                 ui.set_min_width(ui.available_width());
 
                 if let Some(last) = &self.home.recent {
-                    ui.label(RichText::new("前回調べた場所").color(MUTED));
+                    ui.label(
+                        RichText::new(text(
+                            self.japanese_reasons,
+                            "前回調べた場所",
+                            "Previous workspace",
+                        ))
+                        .color(MUTED),
+                    );
                     ui.label(RichText::new(&path_label).size(22.0).strong().color(INK));
                     let completed = last
                         .completed
                         .with_timezone(&Local)
                         .format("%Y/%m/%d %H:%M")
                         .to_string();
-                    ui.label(RichText::new(format!("前回のスキャン　{completed}")).color(MUTED));
+                    ui.label(
+                        RichText::new(format!(
+                            "{}　{completed}",
+                            text(self.japanese_reasons, "前回のスキャン", "Last scanned")
+                        ))
+                        .color(MUTED),
+                    );
                 } else {
-                    ui.label(RichText::new("開発ワークスペース").color(MUTED));
+                    ui.label(
+                        RichText::new(text(
+                            self.japanese_reasons,
+                            "開発ワークスペース",
+                            "Development workspace",
+                        ))
+                        .color(MUTED),
+                    );
                     ui.label(RichText::new(&path_label).size(22.0).strong().color(INK));
                 }
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 ui.add_space(8.0);
                 ui.add(
                     egui::Button::new(
-                        RichText::new(format!("{name} を調べる"))
-                            .color(PAPER)
-                            .strong(),
+                        RichText::new(if self.japanese_reasons {
+                            format!("{name} を調べる")
+                        } else {
+                            format!("Scan {name}")
+                        })
+                        .color(PAPER)
+                        .strong(),
                     )
                     .fill(ACCENT)
                     .corner_radius(7)
@@ -172,10 +211,17 @@ impl App {
             .inner;
         if open {
             if let Err(error) = self.resume_scan(ui.ctx(), path.clone()) {
-                self.status = format!("{error:#}");
+                self.status = super::display_error(&error, self.japanese_reasons);
             }
         } else if let Some(workspace) = workspace.filter(|workspace| *workspace != path) {
-            if ui.link("_workspace を調べる").clicked() {
+            if ui
+                .link(text(
+                    self.japanese_reasons,
+                    "_workspace を調べる",
+                    "Scan _workspace",
+                ))
+                .clicked()
+            {
                 self.start_workspace_scan(ui.ctx(), workspace);
             }
         }
@@ -205,7 +251,7 @@ impl App {
             .iter()
             .position(|root| root == &path)
             .context(
-            "前回の場所がプロファイルから外れています。Open profile から調査先を選んでください。",
+            text(self.japanese_reasons, "前回の場所がプロファイルから外れています。Open profile から調査先を選んでください。", "The previous workspace is no longer in the profile. Choose a workspace from Open profile."),
         )?;
         self.profile = profile;
         self.profile_name = last.name.clone();

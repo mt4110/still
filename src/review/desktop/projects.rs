@@ -1,6 +1,6 @@
 use super::super::{artifacts::Producer, history::Delta};
 use super::{bytes, display, egui, open_in_finder, App, Confirmation, Message, Outcome, Scan};
-use super::{ACCENT, LINE, MUTED, PAPER};
+use super::{text, ACCENT, LINE, MUTED, PAPER};
 use egui::{Align, RichText, Stroke};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -61,7 +61,10 @@ fn name(path: &Path) -> String {
     display(path.file_name().map(Path::new).unwrap_or(path))
 }
 
-fn effect(p: Producer) -> &'static str {
+fn effect(p: Producer, japanese: bool) -> &'static str {
+    if !japanese {
+        return p.explanation().0;
+    }
     match p {
         Producer::Cargo | Producer::CargoRelocated => {
             "Cargo のビルド出力。次回のビルドで作り直します。"
@@ -189,7 +192,11 @@ impl App {
         let scan = self.scan.as_ref().unwrap();
         let project = &self.projects.rows[index];
         if ui
-            .link(format!("‹ {} の一覧へ", name(&scan.root)))
+            .link(if self.japanese_reasons {
+                format!("‹ {} の一覧へ", name(&scan.root))
+            } else {
+                format!("‹ Back to {}", name(&scan.root))
+            })
             .clicked()
         {
             self.projects.selected = None;
@@ -199,18 +206,41 @@ impl App {
         ui.add_space(6.);
         ui.label(RichText::new(name(&project.path)).size(26.).strong());
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("使用量  {}", bytes(project.size))).color(MUTED));
             ui.label(
-                RichText::new(format!("候補容量  {}", bytes(project.reclaim)))
-                    .color(ACCENT)
-                    .strong(),
+                RichText::new(format!(
+                    "{}  {}",
+                    text(self.japanese_reasons, "使用量", "Used"),
+                    bytes(project.size)
+                ))
+                .color(MUTED),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{}  {}",
+                    text(self.japanese_reasons, "候補容量", "Candidates"),
+                    bytes(project.reclaim)
+                ))
+                .color(ACCENT)
+                .strong(),
             );
         });
         ui.add_space(14.);
-        ui.label(RichText::new("掃除候補と保留理由").size(20.).strong());
+        ui.label(
+            RichText::new(text(
+                self.japanese_reasons,
+                "掃除候補と保留理由",
+                "Cleanup candidates and hold reasons",
+            ))
+            .size(20.)
+            .strong(),
+        );
         divider(ui);
         if project.files.is_empty() {
-            ui.label("このフォルダで確認できた生成物候補はありません。");
+            ui.label(text(
+                self.japanese_reasons,
+                "このフォルダで確認できた生成物候補はありません。",
+                "No generated-output candidates found in this folder.",
+            ));
         }
         let mut inspect = None;
         let mut missing = BTreeSet::new();
@@ -332,10 +362,24 @@ impl App {
                             format!("{scope} · {}", reason.text(self.japanese_reasons))
                         }
                         Some(reason) => {
-                            format!("保留 · {}", reason.text(self.japanese_reasons))
+                            format!(
+                                "{} · {}",
+                                text(self.japanese_reasons, "保留", "On hold"),
+                                reason.text(self.japanese_reasons)
+                            )
                         }
-                        None if c.producer == Producer::DeclaredOutput => effect(c.producer).into(),
-                        None => format!("{} Git 追跡ファイルなし。", effect(c.producer)),
+                        None if c.producer == Producer::DeclaredOutput => {
+                            effect(c.producer, self.japanese_reasons).into()
+                        }
+                        None => format!(
+                            "{} {}",
+                            effect(c.producer, self.japanese_reasons),
+                            text(
+                                self.japanese_reasons,
+                                "Git 追跡ファイルなし。",
+                                "No Git-tracked files."
+                            )
+                        ),
                     };
                     let mut body = row.new_child(egui::UiBuilder::new().max_rect(line_rect(
                         title.bottom() + 2.,
@@ -346,14 +390,26 @@ impl App {
                         .on_hover_text(&reason);
                     let actions = |ui: &mut egui::Ui| {
                         ui.spacing_mut().button_padding = egui::vec2(12., 4.);
-                        if ui.add(primary("Finder で開く ↗")).clicked() {
+                        if ui
+                            .add(primary(text(
+                                self.japanese_reasons,
+                                "Finder で開く ↗",
+                                "Open in Finder ↗",
+                            )))
+                            .clicked()
+                        {
                             if let Err(err) = open_in_finder(path) {
-                                self.status = err.to_string();
+                                self.status = super::display_error(&err, self.japanese_reasons);
                             }
                         }
                         if ui
                             .add(
-                                egui::Button::new("この項目を再確認").min_size(egui::vec2(0., 34.)),
+                                egui::Button::new(text(
+                                    self.japanese_reasons,
+                                    "この項目を再確認",
+                                    "Inspect this item",
+                                ))
+                                .min_size(egui::vec2(0., 34.)),
                             )
                             .clicked()
                         {
@@ -384,11 +440,19 @@ impl App {
                 })
                 .fold(0u64, |sum, c| sum.saturating_add(c.row.usage.size()));
             review = ui
-                .add(primary(format!(
-                    "選んだ {} 件を確認 · 見込み {}",
-                    self.marked.len(),
-                    bytes(estimate)
-                )))
+                .add(primary(if self.japanese_reasons {
+                    format!(
+                        "選んだ {} 件を確認 · 見込み {}",
+                        self.marked.len(),
+                        bytes(estimate)
+                    )
+                } else {
+                    format!(
+                        "Review {} selected · estimated {}",
+                        self.marked.len(),
+                        bytes(estimate)
+                    )
+                }))
                 .clicked();
         }
         if !missing.is_empty() {
@@ -404,24 +468,34 @@ impl App {
         if let Some(path) = inspect {
             let policy = scan.policy.clone();
             let ja = self.japanese_reasons;
-            self.spawn(ui.ctx(), "候補を再確認中…", false, move || {
-                let detail = match policy.prepare(&path) {
-                    Ok(p) => format!(
-                        "{} · {} ファイル · {}",
-                        effect(p.producer),
-                        p.files(),
-                        bytes(p.logical_bytes())
-                    ),
-                    Err(e) => Message::from_error(&e).text(ja).to_owned(),
-                };
-                Outcome::Inspection(vec![format!("{} · {detail}", display(&path))])
-            });
+            self.spawn(
+                ui.ctx(),
+                text(ja, "候補を再確認中…", "Inspecting candidate…"),
+                false,
+                move || {
+                    let detail = match policy.prepare(&path) {
+                        Ok(p) => format!(
+                            "{} · {} {} · {}",
+                            effect(p.producer, ja),
+                            p.files(),
+                            text(ja, "ファイル", "files"),
+                            bytes(p.logical_bytes())
+                        ),
+                        Err(e) => Message::from_error(&e).text(ja).to_owned(),
+                    };
+                    Outcome::Inspection(vec![format!("{} · {detail}", display(&path))])
+                },
+            );
         } else if review {
             let policy = scan.policy.clone();
             let paths = self.marked.iter().cloned().collect();
             self.spawn(
                 ui.ctx(),
-                "選択した候補を確認中…",
+                text(
+                    self.japanese_reasons,
+                    "選択した候補を確認中…",
+                    "Checking selected candidates…",
+                ),
                 false,
                 move || Outcome::Review(Confirmation::prepare(policy, paths)),
             );
@@ -441,7 +515,12 @@ impl App {
         {
             ui.label(
                 RichText::new(format!(
-                    "前回から最も増えたフォルダ　{}（{}）",
+                    "{}　{}（{}）",
+                    text(
+                        self.japanese_reasons,
+                        "前回から最も増えたフォルダ",
+                        "Largest increase since last scan"
+                    ),
                     name(&p.path),
                     delta.label()
                 ))
@@ -449,23 +528,40 @@ impl App {
             );
         } else if scan.previous.is_none() {
             ui.label(
-                RichText::new("初回のスキャンです。次回から前回比を表示します。").color(MUTED),
+                RichText::new(text(
+                    self.japanese_reasons,
+                    "初回のスキャンです。次回から前回比を表示します。",
+                    "First scan. Changes will appear from the next scan.",
+                ))
+                .color(MUTED),
             );
         }
         ui.add_space(18.);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("プロジェクト").size(20.).strong());
+            ui.label(
+                RichText::new(text(self.japanese_reasons, "プロジェクト", "Projects"))
+                    .size(20.)
+                    .strong(),
+            );
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 let mut by_candidate = self.projects.by_candidate;
                 egui::ComboBox::from_id_salt("project-sort")
                     .selected_text(if by_candidate {
-                        "候補容量が多い順"
+                        text(self.japanese_reasons, "候補容量が多い順", "Candidate size")
                     } else {
-                        "使用量が多い順"
+                        text(self.japanese_reasons, "使用量が多い順", "Used space")
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut by_candidate, false, "使用量が多い順");
-                        ui.selectable_value(&mut by_candidate, true, "候補容量が多い順");
+                        ui.selectable_value(
+                            &mut by_candidate,
+                            false,
+                            text(self.japanese_reasons, "使用量が多い順", "Used space"),
+                        );
+                        ui.selectable_value(
+                            &mut by_candidate,
+                            true,
+                            text(self.japanese_reasons, "候補容量が多い順", "Candidate size"),
+                        );
                     });
                 if by_candidate != self.projects.by_candidate {
                     self.projects.by_candidate = by_candidate;
@@ -474,9 +570,13 @@ impl App {
             });
         });
         ui.label(
-            RichText::new(format!("直下のフォルダ {} 件", self.projects.rows.len()))
-                .size(14.)
-                .color(MUTED),
+            RichText::new(if self.japanese_reasons {
+                format!("直下のフォルダ {} 件", self.projects.rows.len())
+            } else {
+                format!("{} immediate folders", self.projects.rows.len())
+            })
+            .size(14.)
+            .color(MUTED),
         );
         ui.add_space(4.);
         divider(ui);
@@ -491,9 +591,14 @@ impl App {
         ];
         ui.horizontal(|ui| {
             ui.add_space(6.);
-            for (i, label) in ["プロジェクト名", "使用量", "候補容量", "前回比"]
-                .iter()
-                .enumerate()
+            for (i, label) in [
+                text(self.japanese_reasons, "プロジェクト名", "Project"),
+                text(self.japanese_reasons, "使用量", "Used"),
+                text(self.japanese_reasons, "候補容量", "Candidates"),
+                text(self.japanese_reasons, "前回比", "Change"),
+            ]
+            .iter()
+            .enumerate()
             {
                 let align = if i == 0 { Align::Min } else { Align::Max };
                 ui.allocate_ui_with_layout(
@@ -507,7 +612,11 @@ impl App {
             }
         });
         if self.projects.rows.is_empty() {
-            ui.label("直下にプロジェクトフォルダはありません。");
+            ui.label(text(
+                self.japanese_reasons,
+                "直下にプロジェクトフォルダはありません。",
+                "No project folders directly inside this workspace.",
+            ));
         }
         egui::ScrollArea::vertical().id_salt("projects").show_rows(
             ui,
