@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Avoid rejecting a staged file solely because its metadata change time changed after staging; verify its identity and contents before removal.
 - Keep stage review controls visible for long paths and allow carefully verified Cargo cache subfolders to be reviewed when target markers were lost.
+- Match equivalent ordinary and extended-length Windows drive paths when applying scan scopes and glob rules, without changing apply-time authorization.
 - Display recognized Docker sizes in binary units and translate known relative dates on the Japanese screen.
 - Inspect stopped containers with bind mounts or null labels without losing Docker metadata, while continuing to protect managed and explicitly retained containers.
 

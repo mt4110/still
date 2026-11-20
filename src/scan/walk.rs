@@ -27,6 +27,87 @@ use crate::scan::classify::determine_entry_type;
 use crate::config::rules::{expand_path, Rule};
 use globset::{Glob, GlobSetBuilder};
 
+/// Compare scopes lexically. On Windows, a canonicalized local path may have a
+/// verbatim drive prefix while the same path from current_dir does not. Only
+/// bridge those spellings when every component has ordinary Win32 semantics;
+/// do not resolve links or change the apply-time authorization checks.
+pub(crate) fn scope_contains(path: &Path, scope: &Path) -> bool {
+    if path.starts_with(scope) {
+        return true;
+    }
+    #[cfg(windows)]
+    return match (alternate_windows_path(path), alternate_windows_path(scope)) {
+        (Some(_), Some(alternate_scope)) => path.starts_with(alternate_scope),
+        _ => false,
+    };
+    #[cfg(not(windows))]
+    false
+}
+
+#[cfg(windows)]
+fn alternate_windows_path(path: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let Component::Prefix(prefix) = components.next()? else {
+        return None;
+    };
+    let mut alternative = match prefix.kind() {
+        Prefix::Disk(drive) => PathBuf::from(format!(r"\\?\{}:\", drive as char)),
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!(r"{}:\", drive as char)),
+        _ => return None,
+    };
+    if components.next()? != Component::RootDir {
+        return None;
+    }
+    for component in components {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        let name_text = name.to_str()?;
+        if name_text.ends_with(['.', ' '])
+            || name_text
+                .chars()
+                .any(|ch| ch.is_control() || "<>:\"/\\|?*".contains(ch))
+        {
+            return None;
+        }
+        let stem = name_text
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(' ')
+            .to_ascii_uppercase();
+        if matches!(
+            stem.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) {
+            return None;
+        }
+        for prefix in ["COM", "LPT"] {
+            if let Some(suffix) = stem.strip_prefix(prefix) {
+                if matches!(
+                    suffix,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                ) {
+                    return None;
+                }
+            }
+        }
+        alternative.push(name);
+    }
+    Some(alternative)
+}
+
+pub(crate) fn glob_matches(path: &Path, matches: impl Fn(&Path) -> bool) -> bool {
+    if matches(path) {
+        return true;
+    }
+    #[cfg(windows)]
+    return alternate_windows_path(path).is_some_and(|alternative| matches(&alternative));
+    #[cfg(not(windows))]
+    false
+}
+
 pub struct Scanner {
     base_path: PathBuf,
     rules: Vec<Rule>,
@@ -65,7 +146,7 @@ impl Scanner {
             let applies = rule.scopes.iter().any(|s| {
                 if let Ok(sp) = expand_path(s) {
                     // Rule applies if we are scanning inside the scope, or the scope is inside what we are scanning
-                    self.base_path.starts_with(&sp) || sp.starts_with(&self.base_path)
+                    scope_contains(&self.base_path, &sp) || scope_contains(&sp, &self.base_path)
                 } else {
                     false
                 }
@@ -97,7 +178,7 @@ impl Scanner {
             .follow_links(false)
             .filter_entry(move |entry| {
                 if let Some(set) = &exclude_set {
-                    if set.is_match(entry.path()) {
+                    if glob_matches(entry.path(), |path| set.is_match(path)) {
                         return false;
                     }
                 }
@@ -203,7 +284,7 @@ pub(crate) fn recommend(
         // Check scope
         let in_scope = rule.scopes.iter().any(|s| {
             if let Ok(sp) = expand_path(s) {
-                path.starts_with(&sp)
+                scope_contains(path, &sp)
             } else {
                 false
             }
@@ -218,7 +299,8 @@ pub(crate) fn recommend(
             let mut matched_exclude = false;
             for pattern in excludes {
                 if let Ok(glob) = Glob::new(pattern) {
-                    if glob.compile_matcher().is_match(path) {
+                    let matcher = glob.compile_matcher();
+                    if glob_matches(path, |path| matcher.is_match(path)) {
                         matched_exclude = true;
                         break;
                     }
@@ -234,7 +316,8 @@ pub(crate) fn recommend(
             let mut matched_include = false;
             for pattern in includes {
                 if let Ok(glob) = Glob::new(pattern) {
-                    if glob.compile_matcher().is_match(path) {
+                    let matcher = glob.compile_matcher();
+                    if glob_matches(path, |path| matcher.is_match(path)) {
                         matched_include = true;
                         break;
                     }

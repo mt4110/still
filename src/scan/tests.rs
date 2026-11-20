@@ -4,6 +4,98 @@ use crate::scan::walk::recommend;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+#[cfg(windows)]
+#[test]
+fn equivalent_windows_drive_prefixes_remain_confined_to_ordinary_components() {
+    use crate::scan::walk::scope_contains;
+    use std::path::Path;
+    let check = |path: &str, scope: &str| scope_contains(Path::new(path), Path::new(scope));
+    assert!(check(r"C:\work\project\target.dat", r"\\?\C:\work\project"));
+    assert!(check(r"\\?\C:\work\project\target.dat", r"C:\work\project"));
+    assert!(!check(
+        r"C:\work\project-other\target.dat",
+        r"\\?\C:\work\project"
+    ));
+    assert!(!check(
+        r"D:\work\project\target.dat",
+        r"\\?\C:\work\project"
+    ));
+    assert!(!check(
+        r"C:\work\project\..\private",
+        r"\\?\C:\work\project"
+    ));
+    assert!(!check(r"C:\work\project.\data", r"\\?\C:\work\project."));
+    assert!(!check(r"C:\work\CON\data", r"\\?\C:\work\CON"));
+    assert!(!check(r"C:\work\CON .txt", r"\\?\C:\work"));
+    assert!(!check(r"C:\work\file:stream", r"\\?\C:\work"));
+    assert!(!check(r"work\project\target.dat", r"\\?\C:\work\project"));
+    assert!(!check(r"\\server\share\data", r"\\?\UNC\server\share"));
+    assert!(!check(r"\\.\PhysicalDrive0\data", r"\\?\C:\"));
+    assert!(!check(r"C:work\project", r"\\?\C:\work"));
+}
+
+#[cfg(windows)]
+#[test]
+fn glob_matches_equivalent_drive_paths_without_expanding_unsafe_paths() {
+    use crate::scan::walk::glob_matches;
+    use std::path::Path;
+    let ordinary = globset::Glob::new(r"C:\work\project\*.txt")
+        .unwrap()
+        .compile_matcher();
+    let verbatim = globset::Glob::new(r"\\?\C:\work\project\*.txt")
+        .unwrap()
+        .compile_matcher();
+    assert!(glob_matches(
+        Path::new(r"\\?\C:\work\project\file.txt"),
+        |path| ordinary.is_match(path)
+    ));
+    assert!(glob_matches(
+        Path::new(r"C:\work\project\file.txt"),
+        |path| verbatim.is_match(path)
+    ));
+    assert!(!glob_matches(
+        Path::new(r"\\?\C:\work\project-other\file.txt"),
+        |path| ordinary.is_match(path)
+    ));
+    assert!(!glob_matches(
+        Path::new(r"\\?\C:\work\project\file.txt:stream"),
+        |path| ordinary.is_match(path)
+    ));
+    assert!(!glob_matches(
+        Path::new(r"\\?\UNC\host\share\file.txt"),
+        |path| ordinary.is_match(path)
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn canonical_scope_applies_recommendation_and_excludes_to_ordinary_scan() -> anyhow::Result<()> {
+    use crate::scan::walk::Scanner;
+    let temp = tempfile::tempdir()?;
+    let ordinary_root = temp.path().to_path_buf();
+    let canonical_root = ordinary_root.canonicalize()?;
+    std::fs::write(ordinary_root.join("candidate.txt"), b"candidate")?;
+    std::fs::create_dir(ordinary_root.join("skip"))?;
+    std::fs::write(ordinary_root.join("skip").join("secret.txt"), b"secret")?;
+    let mut rule = make_rule(
+        "matching scope",
+        canonical_root.to_str().unwrap(),
+        None,
+        None,
+    );
+    rule.excludes = Some(vec![format!(r"{}\skip*", canonical_root.display())]);
+    rule.includes = Some(vec![format!(r"{}\candidate*", canonical_root.display())]);
+    let entries = Scanner::new(ordinary_root, vec![rule]).scan()?;
+    let candidate = entries
+        .iter()
+        .find(|entry| entry.path.ends_with("candidate.txt"))
+        .unwrap();
+    assert_eq!(candidate.recommended_action, ActionType::Quarantine);
+    assert_eq!(candidate.selected_action, ActionType::Keep);
+    assert!(!entries.iter().any(|entry| entry.path.ends_with("skip")));
+    Ok(())
+}
+
 // Helper to create a basic rule
 fn make_rule(name: &str, scope: &str, older: Option<u64>, size: Option<u64>) -> Rule {
     Rule {
