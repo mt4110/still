@@ -74,10 +74,24 @@ recommended_action = "Trash"
     assert!(entries
         .iter()
         .all(|entry| entry["selected_action"] == "Keep"));
-    let target = entries
-        .iter_mut()
-        .find(|entry| entry["path"].as_str() == target_file.to_str())
-        .unwrap();
+    // Windows may report the working directory without the extended-length
+    // prefix returned by canonicalize. Compare the resolved files, not their
+    // platform-dependent string spellings.
+    let target_canonical = target_file.canonicalize().unwrap();
+    let matching: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let path = std::path::Path::new(entry["path"].as_str()?);
+            (path.canonicalize().ok().as_ref() == Some(&target_canonical)).then_some(index)
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "Expected exactly one target file in the plan"
+    );
+    let target = &mut entries[matching[0]];
     assert_eq!(target["recommended_action"], "Trash");
     // Simulate explicitly selecting only this item in the TUI.
     target["selected_action"] = serde_json::json!("Trash");
