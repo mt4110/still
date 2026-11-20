@@ -3,7 +3,7 @@ use anyhow::ensure;
 use std::collections::{BTreeMap, BTreeSet};
 
 const LIMIT: usize = 2048;
-const PROJECTION: &str = r#"{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},"auto_remove":{{json .HostConfig.AutoRemove}},"created":{{json .Created}},"state":{{json .State.Status}},"running":{{json .State.Running}},"paused":{{json .State.Paused}},"restarting":{{json .State.Restarting}},"started":{{json .State.StartedAt}},"finished":{{json .State.FinishedAt}},"restart_count":{{json .RestartCount}},"restart_policy":{{json .HostConfig.RestartPolicy.Name}},"mounts":[{{range $i,$v := .Mounts}}{{if $i}},{{end}}{"kind":{{json $v.Type}},"name":{{json $v.Name}},"source":{{json $v.Source}},"destination":{{json $v.Destination}},"rw":{{json $v.RW}}}{{end}}],"keep":{{json (index .Config.Labels "still.keep")}},"kubernetes":{{json (index .Config.Labels "io.kubernetes.pod.name")}},"kubernetes_uid":{{json (index .Config.Labels "io.kubernetes.pod.uid")}},"kubernetes_container":{{json (index .Config.Labels "io.kubernetes.container.name")}},"swarm":{{json (index .Config.Labels "com.docker.swarm.service.id")}},"swarm_task":{{json (index .Config.Labels "com.docker.swarm.task.id")}},"swarm_node":{{json (index .Config.Labels "com.docker.swarm.node.id")}},"compose_project":{{json (index .Config.Labels "com.docker.compose.project")}},"compose_service":{{json (index .Config.Labels "com.docker.compose.service")}}}"#;
+const PROJECTION: &str = r#"{"id":{{json .Id}},"name":{{json .Name}},"image":{{json .Image}},"auto_remove":{{json .HostConfig.AutoRemove}},"created":{{json .Created}},"state":{{json .State.Status}},"running":{{json .State.Running}},"paused":{{json .State.Paused}},"restarting":{{json .State.Restarting}},"started":{{json .State.StartedAt}},"finished":{{json .State.FinishedAt}},"restart_count":{{json .RestartCount}},"restart_policy":{{json .HostConfig.RestartPolicy.Name}},"mounts":[{{range $i,$v := .Mounts}}{{if $i}},{{end}}{"kind":{{json $v.Type}},"name":{{if eq $v.Type "volume"}}{{json $v.Name}}{{else}}null{{end}},"source":{{json $v.Source}},"destination":{{json $v.Destination}},"rw":{{json $v.RW}}}{{end}}],"keep":{{with .Config.Labels}}{{json (index . "still.keep")}}{{else}}null{{end}},"kubernetes":{{with .Config.Labels}}{{json (index . "io.kubernetes.pod.name")}}{{else}}null{{end}},"kubernetes_uid":{{with .Config.Labels}}{{json (index . "io.kubernetes.pod.uid")}}{{else}}null{{end}},"kubernetes_container":{{with .Config.Labels}}{{json (index . "io.kubernetes.container.name")}}{{else}}null{{end}},"swarm":{{with .Config.Labels}}{{json (index . "com.docker.swarm.service.id")}}{{else}}null{{end}},"swarm_task":{{with .Config.Labels}}{{json (index . "com.docker.swarm.task.id")}}{{else}}null{{end}},"swarm_node":{{with .Config.Labels}}{{json (index . "com.docker.swarm.node.id")}}{{else}}null{{end}},"compose_project":{{with .Config.Labels}}{{json (index . "com.docker.compose.project")}}{{else}}null{{end}},"compose_service":{{with .Config.Labels}}{{json (index . "com.docker.compose.service")}}{{else}}null{{end}}}"#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Pin {
@@ -471,6 +471,76 @@ impl Review {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn inspect_template_handles_optional_fields_without_weakening_guards() -> Result<()> {
+        if Command::new("go").arg("version").output().is_err() {
+            ensure!(
+                std::env::var_os("CI").is_none(),
+                "Go is required in CI for the Docker inspect template fixture test"
+            );
+            eprintln!("Go is unavailable; Docker inspect template fixture test skipped");
+            return Ok(());
+        }
+        let fixture = serde_json::json!({
+            "Id": "a".repeat(64), "Name": "/fixture", "Image": "sha256:fixture",
+            "Config": {"Labels": null},
+            "HostConfig": {"AutoRemove": false, "RestartPolicy": {"Name": "no"}},
+            "Created": "2026-01-01T00:00:00Z", "RestartCount": 0,
+            "State": {"Status":"exited", "Running":false, "Paused":false, "Restarting":false,
+                "StartedAt":"2026-01-01T00:00:01Z", "FinishedAt":"2026-01-01T00:00:02Z"},
+            "Mounts": [{"Type":"bind", "Source":"/host", "Destination":"/data", "RW":true}]
+        });
+        let mut volume = fixture.clone();
+        volume["Mounts"] = serde_json::json!([{"Type":"volume", "Name":"my-volume", "Source":"/vol", "Destination":"/data", "RW":true}]);
+        volume["Config"]["Labels"] = serde_json::json!({"still.keep":"true"});
+        let mut kubernetes = fixture.clone();
+        kubernetes["Config"]["Labels"] = serde_json::json!({"io.kubernetes.pod.name":"pod"});
+        let mut incomplete = fixture.clone();
+        incomplete["State"]
+            .as_object_mut()
+            .unwrap()
+            .remove("Running");
+        let request = serde_json::json!({"template": PROJECTION, "fixtures": [fixture, volume, kubernetes, incomplete]});
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/docker_projection/main.go");
+        let mut child = Command::new("go")
+            .args(["run", path.to_str().context("invalid fixture path")?])
+            .env("GOWORK", "off")
+            .env("GOTOOLCHAIN", "local")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        serde_json::to_writer(child.stdin.as_mut().context("fixture stdin")?, &request)?;
+        child.stdin.take().context("fixture stdin")?.flush()?;
+        let output = child.wait_with_output()?;
+        ensure!(
+            output.status.success(),
+            "Go template fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(rows.len(), 4);
+        for row in &rows[..3] {
+            assert_eq!(row["error"], "");
+        }
+        let bind: Metadata =
+            serde_json::from_str(rows[0]["output"].as_str().context("bind output")?)?;
+        assert!(bind.eligible());
+        assert_eq!(bind.mounts[0].name, None);
+        let vol: Metadata =
+            serde_json::from_str(rows[1]["output"].as_str().context("volume output")?)?;
+        assert_eq!(vol.mounts[0].name.as_deref(), Some("my-volume"));
+        assert!(!vol.eligible());
+        let managed: Metadata =
+            serde_json::from_str(rows[2]["output"].as_str().context("managed output")?)?;
+        assert!(!managed.eligible());
+        assert!(!rows[3]["error"].as_str().unwrap_or_default().is_empty());
+        Ok(())
+    }
     #[derive(Default)]
     struct Stub {
         calls: RefCell<Vec<Vec<String>>>,

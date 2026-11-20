@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Include bounded Docker CLI error details when an inspection fails.
 - Match Buildx cache records against Engine metadata when Buildx returns human-readable dates, and verify filter behavior before attempting an exact cache removal.
 
+### Fixed
+
+- Inspect stopped containers with bind mounts or null labels without losing Docker metadata, while continuing to protect managed and explicitly retained containers.
+
 ## [0.2.0-beta.1] - 2026-11-16
 
 ### Added
