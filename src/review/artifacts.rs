@@ -1,4 +1,5 @@
 mod cargo_cache;
+mod vendor;
 
 use super::message::Message;
 use super::{filesystem, git, inventory};
@@ -236,7 +237,7 @@ impl Policy {
 
     pub fn prepare(&self, path: &Path) -> Result<Prepared> {
         let (path, producer) = self.review_path(path)?;
-        let tree = stamp_output(&path, producer.is_partial_cargo())?;
+        let tree = stamp_output(&path, producer)?;
         Ok(Prepared {
             path,
             producer,
@@ -325,12 +326,17 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
             if let Some(paths) = mount_paths {
                 super::docker::check_bind_mounts(&path, paths)?;
             }
-            walk_tree(&path, |_, relative, meta| {
-                if producer.is_partial_cargo() {
-                    cargo_cache::verify_entry(&path, relative, meta)?;
-                }
-                Ok(())
-            })
+            let mut vendor = vendor::Fixtures::new(&path, producer);
+            walk_tree(
+                &path,
+                |relative| vendor.digest(relative),
+                |_, relative, meta, _| {
+                    if producer.is_partial_cargo() {
+                        cargo_cache::verify_entry(&path, relative, meta)?;
+                    }
+                    Ok(())
+                },
+            )
         })();
         FileCandidate {
             row: row.clone(),
@@ -419,6 +425,8 @@ impl Prepared {
 pub struct Tree {
     pub parent: filesystem::Identity,
     pub entries: BTreeMap<PathBuf, Stamp>,
+    pub fixture_digests: BTreeMap<PathBuf, [u8; 32]>,
+    producer: Producer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -432,37 +440,49 @@ pub struct Stamp {
 }
 
 #[cfg(windows)]
-pub fn stamp_tree(path: &Path) -> Result<Tree> {
-    stamp_output(path, false)
+pub fn stamp_tree(path: &Path, reviewed: &Tree) -> Result<Tree> {
+    stamp_output(path, reviewed.producer)
 }
 
-fn stamp_output(path: &Path, partial_cargo: bool) -> Result<Tree> {
+fn stamp_output(path: &Path, producer: Producer) -> Result<Tree> {
     let parent = path.parent().context("Cannot stage a filesystem root")?;
     let parent_identity = filesystem::identity(parent, &fs::symlink_metadata(parent)?)?;
     let mut entries = BTreeMap::new();
-    walk_tree(path, |entry, relative, metadata| {
-        if partial_cargo {
-            cargo_cache::verify_entry(path, relative, metadata)?;
-        }
-        let stamp = filesystem::stamp(entry, metadata)?;
-        if stamp.identity.device != parent_identity.device {
-            bail!(
-                "Output crosses a filesystem boundary: {}",
-                inventory::display(relative)
-            );
-        }
-        entries.insert(relative.to_owned(), stamp);
-        Ok(())
-    })?;
+    let mut fixture_digests = BTreeMap::new();
+    let mut vendor = vendor::Fixtures::new(path, producer);
+    walk_tree(
+        path,
+        |relative| vendor.digest(relative),
+        |entry, relative, metadata, fixture| {
+            if producer.is_partial_cargo() {
+                cargo_cache::verify_entry(path, relative, metadata)?;
+            }
+            let stamp = filesystem::stamp(entry, metadata, fixture)?;
+            if stamp.identity.device != parent_identity.device {
+                bail!(
+                    "Output crosses a filesystem boundary: {}",
+                    inventory::display(relative)
+                );
+            }
+            if let Some(digest) = fixture {
+                fixture_digests.insert(relative.to_owned(), digest);
+            }
+            entries.insert(relative.to_owned(), stamp);
+            Ok(())
+        },
+    )?;
     Ok(Tree {
+        producer,
         parent: parent_identity,
         entries,
+        fixture_digests,
     })
 }
 
 fn walk_tree(
     path: &Path,
-    mut visit: impl FnMut(&Path, &Path, &fs::Metadata) -> Result<()>,
+    mut verified_fixture: impl FnMut(&Path) -> Option<[u8; 32]>,
+    mut visit: impl FnMut(&Path, &Path, &fs::Metadata, Option<[u8; 32]>) -> Result<()>,
 ) -> Result<()> {
     let parent = path.parent().context("Cannot stage a filesystem root")?;
     #[cfg(target_os = "linux")]
@@ -518,7 +538,14 @@ fn walk_tree(
         if evidence_name(&entry) {
             return Err(evidence_reason(name).into());
         }
-        if !relative.as_os_str().is_empty() && (protected(&entry) || game_storage(&entry).is_some())
+        let needs_protection = !relative.as_os_str().is_empty() && protected(&entry);
+        let fixture = if needs_protection && metadata.is_file() && vendor::eligible_name(relative) {
+            verified_fixture(relative)
+        } else {
+            None
+        };
+        if (needs_protection && fixture.is_none())
+            || (!relative.as_os_str().is_empty() && game_storage(&entry).is_some())
         {
             let (english, japanese) = if entry
                 .file_name()
@@ -551,7 +578,7 @@ fn walk_tree(
             )
             .into());
         }
-        visit(&entry, relative, &metadata)?;
+        visit(&entry, relative, &metadata, fixture)?;
         if metadata.is_dir() {
             let read = || {
                 Message::new(
@@ -569,22 +596,52 @@ fn walk_tree(
 
 pub fn verify_staged(tree: &Tree, payload: &Path) -> Result<()> {
     let mut seen = 0;
-    walk_tree(payload, |entry, relative, metadata| {
-        let expected = tree
-            .entries
-            .get(relative)
-            .context("An unreviewed entry appeared in staging")?;
-        let mut actual = filesystem::stamp(entry, metadata)?;
-        if relative.as_os_str().is_empty() {
-            // Moving the root into staging can change its ctime.
-            actual.changed = expected.changed;
-        }
-        if actual != *expected {
-            bail!("The staged output differs from what was reviewed");
-        }
-        seen += 1;
-        Ok(())
-    })?;
+    #[cfg(target_os = "macos")]
+    let (mut changed_directories, mut finder_parents) = (HashSet::new(), HashSet::new());
+    walk_tree(
+        payload,
+        |relative| tree.fixture_digests.get(relative).copied(),
+        |entry, relative, metadata, fixture| {
+            #[cfg(target_os = "macos")]
+            if !tree.entries.contains_key(relative) && filesystem::finder::recognized(entry) {
+                finder_parents.insert(
+                    relative
+                        .parent()
+                        .context("Missing metadata parent")?
+                        .to_owned(),
+                );
+                return Ok(());
+            }
+            let expected = tree
+                .entries
+                .get(relative)
+                .context("An unreviewed entry appeared in staging")?;
+            let mut actual = filesystem::stamp(entry, metadata, fixture)?;
+            if relative.as_os_str().is_empty() {
+                // Moving the root into staging can change its ctime.
+                actual.changed = expected.changed;
+            }
+            #[cfg(target_os = "macos")]
+            if actual != *expected
+                && actual.is_dir
+                && expected.is_dir
+                && actual.identity == expected.identity
+            {
+                changed_directories.insert(relative.to_owned());
+                seen += 1;
+                return Ok(());
+            }
+            if actual != *expected {
+                bail!("The staged output differs from what was reviewed");
+            }
+            seen += 1;
+            Ok(())
+        },
+    )?;
+    #[cfg(target_os = "macos")]
+    if !changed_directories.is_subset(&finder_parents) {
+        bail!("Staged directory changed after review");
+    }
     if seen != tree.entries.len() {
         bail!("A reviewed entry is missing from staging");
     }
@@ -628,23 +685,7 @@ pub fn protected(path: &Path) -> bool {
         .unwrap_or_default()
         .to_string_lossy()
         .to_lowercase();
-    matches!(
-        name.as_str(),
-        ".git"
-            | ".env"
-            | ".envrc"
-            | ".ssh"
-            | ".still-active"
-            | ".keep"
-            | ".gitkeep"
-            | "id_rsa"
-            | "id_ed25519"
-            | ".docker"
-            | ".colima"
-            | "docker.raw"
-            | "docker.qcow2"
-    ) || name.starts_with(".env.")
-        || name.starts_with(".still-stage-")
+    protected_name(&name)
         || matches!(
             path.extension()
                 .and_then(|ext| ext.to_str())
@@ -664,6 +705,26 @@ pub fn protected(path: &Path) -> bool {
                     | "dump"
             )
         )
+}
+
+fn protected_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".env"
+            | ".envrc"
+            | ".ssh"
+            | ".still-active"
+            | ".keep"
+            | ".gitkeep"
+            | "id_rsa"
+            | "id_ed25519"
+            | ".docker"
+            | ".colima"
+            | "docker.raw"
+            | "docker.qcow2"
+    ) || name.starts_with(".env.")
+        || name.starts_with(".still-stage-")
 }
 
 fn regular_file(path: &Path) -> bool {
@@ -839,6 +900,21 @@ mod tests {
             docker_context: None,
         };
         (temporary, output, policy)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_verification_accepts_only_new_regular_finder_metadata() -> Result<()> {
+        let (_temp, output, policy) = fixture();
+        fs::create_dir(output.join("debug"))?;
+        let prepared = policy.prepare(&output)?;
+        let staged = output.with_file_name("payload");
+        fs::rename(output, &staged)?;
+        fs::write(staged.join("debug/.DS_Store"), b"\0\0\0\x01Bud1metadata")?;
+        verify_staged(&prepared.tree, &staged)?;
+        fs::write(staged.join("debug/keep.txt"), b"user file")?;
+        assert!(verify_staged(&prepared.tree, &staged).is_err());
+        Ok(())
     }
 
     #[test]

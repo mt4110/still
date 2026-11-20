@@ -111,7 +111,9 @@ fn codegen_object(name: &str) -> bool {
         return false;
     };
     crate_name(unit)
-        && hex_hash(hash)
+        // rustc prints the codegen disambiguator without leading zeroes.
+        && (1..=16).contains(&hash.len())
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
         && !number.is_empty()
         && number.bytes().all(|b| b.is_ascii_digit())
 }
@@ -234,6 +236,14 @@ mod tests {
         ] {
             assert!(!dependency(&cache, name));
         }
+        assert!(dependency(
+            &cache,
+            "security_framework-5ac6dfa4e4b5edff.security_framework.183edbe068cce04-cgu.3.rcgu.o"
+        ));
+        assert!(!dependency(
+            &cache,
+            "demo-0123456789abcdef.demo.notes-cgu.2.rcgu.o"
+        ));
         let unit = "demo-0123456789abc";
         let generation = "s-ho9wx39w3k-0u5spzg-0xny0l54dee30tk2bxf7bttju";
         assert!(incremental(&[unit, generation, "work-products.bin"], false));

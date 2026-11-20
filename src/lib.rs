@@ -210,6 +210,8 @@ pub fn run_cli() -> Result<()> {
         Some(Commands::Kube(args)) => review::kube::run(args)?,
         Some(Commands::Stale(args)) => review::stale::run(args)?,
         Some(Commands::AppStorage(args)) => review::app_storage::run(args)?,
+        #[cfg(target_os = "macos")]
+        Some(Commands::StageCleanup(args)) => review::recover_stage(args)?,
         Some(Commands::CleanupHistory(args)) => review::cleanup_history::run(args)?,
         Some(Commands::Tui(args)) => {
             println!("Starting TUI with plan: {:?}", args.plan);
