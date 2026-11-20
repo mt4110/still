@@ -207,43 +207,30 @@ pub fn scan_with_progress(
         }
     }
 
-    // Parents precede descendants in path order. Fold each subtree into its parent once.
-    let mut paths: Vec<_> = directories.keys().cloned().collect();
-    paths.sort_unstable();
-    for path in paths.iter().rev() {
-        if path != root {
-            let usage = directories[path].clone();
-            if let Some(parent) = path.parent() {
-                directories
-                    .entry(parent.to_owned())
-                    .or_default()
-                    .add(&usage);
-            }
-        }
-    }
-
+    let mut directories: Vec<_> = directories
+        .into_iter()
+        .map(|(path, usage)| Row {
+            path,
+            is_dir: true,
+            usage,
+        })
+        .collect();
+    directories.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+    accumulate_directories(&mut directories);
+    let mut directory_matches = 0;
     if let Some(query) = query.as_deref() {
-        for path in &paths {
-            if matches_query(path, query) {
-                match_count_dir(&mut matches, path, &directories[path]);
+        for directory in &directories {
+            if matches_query(&directory.path, query) {
+                directory_matches += 1;
+                matches.push(directory.clone());
+                trim_matches(&mut matches);
             }
         }
     }
     sort_rows(&mut matches, false);
-    let directory_matches = query.as_ref().map_or(0, |query| {
-        paths.iter().filter(|p| matches_query(p, query)).count()
-    });
     matches.truncate(MATCH_LIMIT);
-
     let inventory = Inventory {
-        directories: paths
-            .into_iter()
-            .map(|path| Row {
-                usage: directories.remove(&path).expect("known directory"),
-                path,
-                is_dir: true,
-            })
-            .collect(),
+        directories,
         omitted_matches: (match_count + directory_matches).saturating_sub(matches.len()),
         cargo_marker_dirs,
         matches,
@@ -346,6 +333,11 @@ impl Drop for Worker<'_> {
     fn drop(&mut self) {
         self.pending_progress.publish(self.progress, None);
         let mut results = self.results.lock().expect("walker results");
+        // Reuse the larger hash table rather than allocating another table of
+        // comparable size while the worker-owned one is still resident.
+        if self.batch.directories.len() > results.directories.len() {
+            std::mem::swap(&mut self.batch.directories, &mut results.directories);
+        }
         for (path, usage) in self.batch.directories.drain() {
             results.directories.entry(path).or_default().add(&usage);
         }
@@ -382,13 +374,26 @@ fn remember_hardlink(
     }
 }
 
-fn match_count_dir(matches: &mut Vec<Row>, path: &Path, usage: &Usage) {
-    matches.push(Row {
-        path: path.to_owned(),
-        is_dir: true,
-        usage: usage.clone(),
-    });
-    trim_matches(matches);
+// Directory order is preorder: each parent precedes its contiguous subtree.
+// Close finished subtrees into their parents as the next sibling is reached.
+// This keeps one owned path per directory throughout aggregation.
+fn accumulate_directories(rows: &mut [Row]) {
+    let mut ancestors: Vec<usize> = Vec::new();
+    for next in 0..=rows.len() {
+        while let Some(&last) = ancestors.last() {
+            if rows.get(next).and_then(|r| r.path.parent()) == Some(rows[last].path.as_path()) {
+                break;
+            }
+            ancestors.pop();
+            if let Some(&ancestor) = ancestors.last() {
+                let (parents, child) = rows.split_at_mut(last);
+                parents[ancestor].usage.add(&child[0].usage);
+            }
+        }
+        if next < rows.len() {
+            ancestors.push(next);
+        }
+    }
 }
 
 fn trim_matches(rows: &mut Vec<Row>) {

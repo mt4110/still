@@ -30,6 +30,9 @@ pub enum Commands {
     AppStorage(AppStorageArgs),
     #[command(about = "Read locally recorded desktop cleanup results")]
     CleanupHistory(CleanupHistoryArgs),
+    #[cfg(target_os = "macos")]
+    #[command(about = "Review Finder metadata left in a cleanup stage")]
+    StageCleanup(StageCleanupArgs),
     #[command(about = crate::lang::text().tui)]
     Tui(TuiArgs),
     #[command(about = crate::lang::text().apply)]
@@ -38,6 +41,19 @@ pub enum Commands {
     Vault(VaultArgs),
     #[command(about = crate::lang::text().init)]
     Init,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Args, Debug)]
+pub struct StageCleanupArgs {
+    /// Review exactly one .still-stage-UUID folder.
+    pub stage: PathBuf,
+    /// Explicitly authorized workspace containing the stage.
+    #[arg(long)]
+    pub cleanup_root: PathBuf,
+    /// Permanently remove the reviewed metadata and empty stage directories.
+    #[arg(long)]
+    pub apply: bool,
 }
 
 #[derive(Args, Debug)]

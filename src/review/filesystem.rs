@@ -1,3 +1,8 @@
+#[cfg(target_os = "macos")]
+pub(super) mod finder;
+#[cfg(target_os = "macos")]
+pub(super) mod recovery;
+
 use super::{artifacts, inventory};
 use anyhow::{bail, Context, Result};
 use std::fs::Metadata;
@@ -42,7 +47,11 @@ fn windows_identity(handle: &std::fs::File) -> Result<Identity> {
     })
 }
 
-pub fn stamp(path: &Path, metadata: &Metadata) -> Result<artifacts::Stamp> {
+pub fn stamp(
+    path: &Path,
+    metadata: &Metadata,
+    fixture: Option<[u8; 32]>,
+) -> Result<artifacts::Stamp> {
     #[cfg(unix)]
     let (identity, changed, contents) = {
         use std::os::unix::fs::MetadataExt;
@@ -62,7 +71,7 @@ pub fn stamp(path: &Path, metadata: &Metadata) -> Result<artifacts::Stamp> {
             {
                 bail!("File changed during inspection: {path:?}");
             }
-            let hash = contents_hash(&mut file, before.len())?;
+            let hash = contents_hash(&mut file, before.len(), fixture)?;
             let after = file.metadata()?;
             if after.len() != before.len()
                 || after.modified()? != before.modified()?
@@ -110,7 +119,7 @@ pub fn stamp(path: &Path, metadata: &Metadata) -> Result<artifacts::Stamp> {
         // NTFS can report identical timestamps for successive same-size writes.
         // Hash regular files only when reviewing or applying a selection.
         let contents = if current.is_file() {
-            Some(contents_hash(&mut handle, current.len())?)
+            Some(contents_hash(&mut handle, current.len(), fixture)?)
         } else {
             None
         };
@@ -132,20 +141,30 @@ pub fn stamp(path: &Path, metadata: &Metadata) -> Result<artifacts::Stamp> {
     })
 }
 
-fn contents_hash(file: &mut std::fs::File, mut len: u64) -> Result<u64> {
+fn contents_hash(file: &mut std::fs::File, mut len: u64, fixture: Option<[u8; 32]>) -> Result<u64> {
     use std::hash::{BuildHasher, Hasher, RandomState};
     use std::io::Read;
     use std::sync::LazyLock;
 
     // Review stamps are compared only within the process that created them.
     static KEY: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+    use sha2::{Digest, Sha256};
+    let mut published = fixture.map(|_| Sha256::new());
     let mut hash = KEY.build_hasher();
     let mut buffer = [0u8; 64 * 1024];
     while len != 0 {
         let count = len.min(buffer.len() as u64) as usize;
         file.read_exact(&mut buffer[..count])?;
         hash.write(&buffer[..count]);
+        if let Some(digest) = &mut published {
+            digest.update(&buffer[..count]);
+        }
         len -= count as u64;
+    }
+    if let (Some(digest), Some(expected)) = (published, fixture) {
+        if digest.finalize().as_slice() != expected {
+            bail!("Published fixture changed during review");
+        }
     }
     Ok(hash.finish())
 }
@@ -290,6 +309,14 @@ pub fn remove_output(path: &Path, tree: &artifacts::Tree) -> Result<()> {
         )
     })?;
     fs::unlinkat(&stage, "original-path.txt", AtFlags::empty())?;
+    #[cfg(target_os = "macos")]
+    finder::finish(&parent, stage_name.as_ref(), &stage).with_context(|| {
+        format!(
+            "Check staged residue using still stage-cleanup: {}",
+            inventory::display(&stage_path)
+        )
+    })?;
+    #[cfg(not(target_os = "macos"))]
     fs::unlinkat(&parent, stage_name.as_str(), AtFlags::REMOVEDIR)?;
     Ok(())
 }
@@ -347,6 +374,11 @@ fn remove_tree(
             }
         }
         for child in children {
+            #[cfg(target_os = "macos")]
+            if !tree.entries.contains_key(&relative.join(&child)) {
+                finder::remove_metadata(&directory, &child)?;
+                continue;
+            }
             remove_tree(
                 &directory,
                 &child,
@@ -356,6 +388,9 @@ fn remove_tree(
                 unlinked,
             )?;
         }
+        #[cfg(target_os = "macos")]
+        finder::finish(parent, name, &directory)?;
+        #[cfg(not(target_os = "macos"))]
         fs::unlinkat(parent, name, AtFlags::REMOVEDIR)?;
     } else if !expected.is_dir && kind == FileType::RegularFile {
         let modified = std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(
@@ -380,7 +415,12 @@ fn remove_tree(
             bail!("Staged file was replaced: {relative:?}");
         }
         let mut file = std::fs::File::from(file);
-        if Some(contents_hash(&mut file, expected.len)?) != expected.contents {
+        if Some(contents_hash(
+            &mut file,
+            expected.len,
+            tree.fixture_digests.get(relative).copied(),
+        )?) != expected.contents
+        {
             bail!("Staged file contents changed: {relative:?}");
         }
         let after = fs::fstat(&file)?;
@@ -436,7 +476,7 @@ pub fn remove_output(path: &Path, tree: &artifacts::Tree) -> Result<()> {
     if identity(parent, &fs::symlink_metadata(parent)?)? != tree.parent {
         bail!("Output parent changed after review");
     }
-    if &artifacts::stamp_tree(path)? != tree {
+    if &artifacts::stamp_tree(path, tree)? != tree {
         bail!("Output changed after review");
     }
     let stage = parent.join(format!(".still-stage-{}", uuid::Uuid::new_v4()));

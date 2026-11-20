@@ -65,6 +65,36 @@ fn session(value: &str) -> bool {
         (Some("s"), Some(timestamp), Some(nonce), None) if base36(timestamp, 10) && base36(nonce, 7))
 }
 
+/// Identify an individual compiler unit only under a recognized Cargo cache.
+pub(super) fn incremental_unit(path: &Path) -> Option<&Path> {
+    let parent = path.parent()?;
+    if !parent.ends_with("incremental") {
+        return None;
+    }
+    let name = path.file_name()?.to_str()?;
+    if !incremental(&[name], true) {
+        return None;
+    }
+    let target = cache_root(parent)?;
+    // A known-looking directory name alone is not a completed compilation.
+    // Match a finalized session with its lock and compiler dependency graph.
+    let has_session = fs::read_dir(path).ok()?.any(|entry| {
+        let Ok(entry) = entry else { return false };
+        let file_name = entry.file_name();
+        let Some(generation) = file_name.to_str() else {
+            return false;
+        };
+        let Some((key, _)) = generation.rsplit_once('-') else {
+            return false;
+        };
+        incremental(&[name, generation], true)
+            && directory(&entry.path())
+            && regular_file(&entry.path().join("dep-graph.bin"))
+            && regular_file(&path.join(format!("{key}.lock")))
+    });
+    has_session.then_some(target)
+}
+
 fn incremental(parts: &[&str], is_dir: bool) -> bool {
     let Some((krate, hash)) = parts[0].rsplit_once('-') else {
         return false;
@@ -111,7 +141,9 @@ fn codegen_object(name: &str) -> bool {
         return false;
     };
     crate_name(unit)
-        && hex_hash(hash)
+        // rustc prints the codegen disambiguator without leading zeroes.
+        && (1..=16).contains(&hash.len())
+        && hash.bytes().all(|b| b.is_ascii_hexdigit())
         && !number.is_empty()
         && number.bytes().all(|b| b.is_ascii_digit())
 }
@@ -142,7 +174,34 @@ fn dependency(cache: &Path, file: &str) -> bool {
     }
 }
 
+pub(super) fn protect_unfinished(relative: &Path, metadata: &fs::Metadata) -> Result<()> {
+    if metadata.is_dir()
+        && relative
+            .parent()
+            .and_then(Path::parent)
+            .is_some_and(|p| p.ends_with("incremental"))
+        && relative
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_suffix("-working"))
+            .is_some_and(session)
+    {
+        let label = inventory::display(relative);
+        return Err(Message::new(
+            format!("Contains an unfinished Rust compilation session: {label}"),
+            format!("完了を確認できない Rust コンパイル作業域があるため保留: {label}"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 pub(super) fn verify_entry(cache: &Path, relative: &Path, metadata: &fs::Metadata) -> Result<()> {
+    // Unit candidates use exactly the same entry grammar as the full cache.
+    if let Some(parent) = cache.parent().filter(|p| p.ends_with("incremental")) {
+        let unit = cache.file_name().expect("child of incremental");
+        return verify_entry(parent, &Path::new(unit).join(relative), metadata);
+    }
     let unsupported = || {
         Message::new(
             format!(
@@ -234,6 +293,14 @@ mod tests {
         ] {
             assert!(!dependency(&cache, name));
         }
+        assert!(dependency(
+            &cache,
+            "security_framework-5ac6dfa4e4b5edff.security_framework.183edbe068cce04-cgu.3.rcgu.o"
+        ));
+        assert!(!dependency(
+            &cache,
+            "demo-0123456789abcdef.demo.notes-cgu.2.rcgu.o"
+        ));
         let unit = "demo-0123456789abc";
         let generation = "s-ho9wx39w3k-0u5spzg-0xny0l54dee30tk2bxf7bttju";
         assert!(incremental(&[unit, generation, "work-products.bin"], false));

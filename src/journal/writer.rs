@@ -13,7 +13,7 @@ lazy_static::lazy_static! {
 }
 
 pub fn init() -> Result<()> {
-    let dirs = directories::ProjectDirs::from("com", "antigravity", "still")
+    let dirs = crate::storage_paths::project_dirs()
         .or_else(|| directories::ProjectDirs::from("com", "user", "still"))
         .ok_or(anyhow::anyhow!("Could not determine data directory"))?;
     let path = dirs.data_local_dir().join("journal.jsonl");

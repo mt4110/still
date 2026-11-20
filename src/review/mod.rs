@@ -6,6 +6,8 @@ pub mod cleanup_history;
 pub mod desktop;
 pub mod docker;
 mod filesystem;
+#[cfg(target_os = "macos")]
+pub(crate) use filesystem::recovery::run as recover_stage;
 mod git;
 mod history;
 mod inventory;

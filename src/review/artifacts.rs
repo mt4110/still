@@ -1,4 +1,5 @@
 mod cargo_cache;
+mod vendor;
 
 use super::message::Message;
 use super::{filesystem, git, inventory};
@@ -124,6 +125,9 @@ impl Policy {
                 Producer::CargoDependencies
             });
         }
+        if cargo_cache::incremental_unit(path).is_some_and(|target| self.permits(target)) {
+            return Some(Producer::CargoIncremental);
+        }
         let parent = path.parent()?;
         match path.file_name()?.to_str()? {
             "node_modules"
@@ -165,13 +169,22 @@ impl Policy {
     }
 
     fn review_path(&self, path: &Path) -> Result<(PathBuf, Producer)> {
+        let (path, producer) = self.check_location(path)?;
+        git::protect_tracked(&path, producer == Producer::DeclaredOutput)?;
+        Ok((path, producer))
+    }
+
+    fn check_location(&self, path: &Path) -> Result<(PathBuf, Producer)> {
         let path = inventory::safe_dir(path)?;
         let producer = self.producer(&path).context(Message::new(
             "No verified output producer",
             "何が生成したフォルダか確認できませんでした。",
         ))?;
         if producer.is_partial_cargo() {
-            for parent in path.ancestors().skip(1).take(2) {
+            let unit = path
+                .parent()
+                .is_some_and(|parent| parent.ends_with("incremental"));
+            for parent in path.ancestors().skip(1).take(if unit { 3 } else { 2 }) {
                 for marker in [".still-active", ".keep", ".gitkeep", ".git"] {
                     match fs::symlink_metadata(parent.join(marker)) {
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -207,7 +220,6 @@ impl Policy {
             )
             .into());
         }
-        git::protect_tracked(&path, producer == Producer::DeclaredOutput)?;
         Ok((path, producer))
     }
 
@@ -235,12 +247,34 @@ impl Policy {
     }
 
     pub fn prepare(&self, path: &Path) -> Result<Prepared> {
+        self.prepare_reporting(path, |_| {})
+    }
+
+    pub(super) fn prepare_reporting(
+        &self,
+        path: &Path,
+        mut checked: impl FnMut(u64),
+    ) -> Result<Prepared> {
         let (path, producer) = self.review_path(path)?;
-        let tree = stamp_output(&path, producer.is_partial_cargo())?;
+        let mut files = 0;
+        let mut logical_bytes = 0u64;
+        let tree = stamp_reporting(
+            &path,
+            producer,
+            |_, _, _| Ok(()),
+            |size| {
+                files += 1;
+                logical_bytes = logical_bytes.saturating_add(size);
+                checked(size);
+            },
+        )?;
         Ok(Prepared {
             path,
             producer,
             tree,
+            files,
+            #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+            logical_bytes,
         })
     }
 
@@ -315,9 +349,15 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
         .as_deref()
         .map(super::docker::bind_mount_paths)
         .transpose();
-    let inspect = |row: &inventory::Row, producer: Producer| {
+    let inspect = |row: &inventory::Row, producer: Producer, git_checked_parent: Option<&Path>| {
         let preflight = (|| -> Result<()> {
-            let (path, _) = policy.review_path(&row.path)?;
+            let (path, _) = if git_checked_parent.is_some_and(|parent| {
+                row.path.parent() == Some(parent) && parent.ends_with("incremental")
+            }) {
+                policy.check_location(&row.path)?
+            } else {
+                policy.review_path(&row.path)?
+            };
             let mount_paths = mounts.as_ref().map_err(|e| Message::new(
                 format!("Could not verify Docker bind mounts: {e:#}"),
                 "Docker に接続してマウント先を確認できませんでした。接続先を確認して再スキャンしてください。",
@@ -325,12 +365,12 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
             if let Some(paths) = mount_paths {
                 super::docker::check_bind_mounts(&path, paths)?;
             }
-            walk_tree(&path, |_, relative, meta| {
-                if producer.is_partial_cargo() {
-                    cargo_cache::verify_entry(&path, relative, meta)?;
-                }
-                Ok(())
-            })
+            let mut vendor = vendor::Fixtures::new(&path, producer);
+            walk_tree(
+                &path,
+                |relative| vendor.digest(relative),
+                |_, relative, meta, _| verify_cargo_entry(producer, &path, relative, meta),
+            )
         })();
         FileCandidate {
             row: row.clone(),
@@ -347,7 +387,7 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
                 scope.spawn(move || {
                     chunk
                         .iter()
-                        .map(|&(row, producer)| inspect(row, producer))
+                        .map(|&(row, producer)| inspect(row, producer, None))
                         .collect::<Vec<_>>()
                 })
             })
@@ -376,7 +416,32 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
                 continue;
             }
             if let Some(producer) = policy.producer(&row.path).filter(|p| p.is_partial_cargo()) {
-                files.push(inspect(row, producer));
+                files.push(inspect(row, producer, None));
+            }
+        }
+    }
+    // A stopped build can leave one unfinished compilation among hundreds of
+    // completed units. Verify the parent's Git scope once for discovery. Each
+    // selected unit gets its own Git check again during review and removal.
+    let held_incremental: HashSet<_> = files
+        .iter()
+        .filter(|candidate| {
+            candidate.producer == Producer::CargoIncremental
+                && candidate.row.path.ends_with("incremental")
+                && candidate.blocked_reason.is_some()
+                && policy.review_path(&candidate.row.path).is_ok()
+        })
+        .map(|candidate| candidate.row.path.clone())
+        .collect();
+    if !held_incremental.is_empty() {
+        for row in &scan.directories {
+            let Some(parent) = row.path.parent() else {
+                continue;
+            };
+            if held_incremental.contains(parent)
+                && policy.producer(&row.path) == Some(Producer::CargoIncremental)
+            {
+                files.push(inspect(row, Producer::CargoIncremental, Some(parent)));
             }
         }
     }
@@ -394,24 +459,19 @@ pub struct Prepared {
     pub path: PathBuf,
     pub producer: Producer,
     tree: Tree,
+    files: usize,
+    #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+    logical_bytes: u64,
 }
 
 impl Prepared {
     pub fn files(&self) -> usize {
-        self.tree
-            .entries
-            .values()
-            .filter(|stamp| !stamp.is_dir)
-            .count()
+        self.files
     }
 
     #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
     pub fn logical_bytes(&self) -> u64 {
-        self.tree
-            .entries
-            .values()
-            .filter(|stamp| !stamp.is_dir)
-            .fold(0, |bytes, stamp| bytes.saturating_add(stamp.len))
+        self.logical_bytes
     }
 }
 
@@ -419,6 +479,8 @@ impl Prepared {
 pub struct Tree {
     pub parent: filesystem::Identity,
     pub entries: BTreeMap<PathBuf, Stamp>,
+    pub fixture_digests: BTreeMap<PathBuf, [u8; 32]>,
+    producer: Producer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -432,37 +494,80 @@ pub struct Stamp {
 }
 
 #[cfg(windows)]
-pub fn stamp_tree(path: &Path) -> Result<Tree> {
-    stamp_output(path, false)
+pub fn stamp_tree(path: &Path, reviewed: &Tree) -> Result<Tree> {
+    stamp_with(path, reviewed.producer, |_, _, _| Ok(()))
 }
 
-fn stamp_output(path: &Path, partial_cargo: bool) -> Result<Tree> {
+fn verify_cargo_entry(
+    producer: Producer,
+    path: &Path,
+    relative: &Path,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    if producer.is_partial_cargo() {
+        cargo_cache::verify_entry(path, relative, metadata)
+    } else if matches!(producer, Producer::Cargo | Producer::CargoRelocated) {
+        cargo_cache::protect_unfinished(relative, metadata)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(windows, all(target_os = "macos", feature = "desktop")))]
+pub(super) fn stamp_with(
+    path: &Path,
+    producer: Producer,
+    inspect: impl FnMut(&Path, &Path, &fs::Metadata) -> Result<()>,
+) -> Result<Tree> {
+    stamp_reporting(path, producer, inspect, |_| {})
+}
+
+fn stamp_reporting(
+    path: &Path,
+    producer: Producer,
+    mut inspect: impl FnMut(&Path, &Path, &fs::Metadata) -> Result<()>,
+    mut checked: impl FnMut(u64),
+) -> Result<Tree> {
     let parent = path.parent().context("Cannot stage a filesystem root")?;
     let parent_identity = filesystem::identity(parent, &fs::symlink_metadata(parent)?)?;
     let mut entries = BTreeMap::new();
-    walk_tree(path, |entry, relative, metadata| {
-        if partial_cargo {
-            cargo_cache::verify_entry(path, relative, metadata)?;
-        }
-        let stamp = filesystem::stamp(entry, metadata)?;
-        if stamp.identity.device != parent_identity.device {
-            bail!(
-                "Output crosses a filesystem boundary: {}",
-                inventory::display(relative)
-            );
-        }
-        entries.insert(relative.to_owned(), stamp);
-        Ok(())
-    })?;
+    let mut fixture_digests = BTreeMap::new();
+    let mut vendor = vendor::Fixtures::new(path, producer);
+    walk_tree(
+        path,
+        |relative| vendor.digest(relative),
+        |entry, relative, metadata, fixture| {
+            verify_cargo_entry(producer, path, relative, metadata)?;
+            inspect(entry, relative, metadata)?;
+            let stamp = filesystem::stamp(entry, metadata, fixture)?;
+            if stamp.identity.device != parent_identity.device {
+                bail!(
+                    "Output crosses a filesystem boundary: {}",
+                    inventory::display(relative)
+                );
+            }
+            if let Some(digest) = fixture {
+                fixture_digests.insert(relative.to_owned(), digest);
+            }
+            if !stamp.is_dir {
+                checked(stamp.len);
+            }
+            entries.insert(relative.to_owned(), stamp);
+            Ok(())
+        },
+    )?;
     Ok(Tree {
+        producer,
         parent: parent_identity,
         entries,
+        fixture_digests,
     })
 }
 
 fn walk_tree(
     path: &Path,
-    mut visit: impl FnMut(&Path, &Path, &fs::Metadata) -> Result<()>,
+    mut verified_fixture: impl FnMut(&Path) -> Option<[u8; 32]>,
+    mut visit: impl FnMut(&Path, &Path, &fs::Metadata, Option<[u8; 32]>) -> Result<()>,
 ) -> Result<()> {
     let parent = path.parent().context("Cannot stage a filesystem root")?;
     #[cfg(target_os = "linux")]
@@ -518,7 +623,14 @@ fn walk_tree(
         if evidence_name(&entry) {
             return Err(evidence_reason(name).into());
         }
-        if !relative.as_os_str().is_empty() && (protected(&entry) || game_storage(&entry).is_some())
+        let needs_protection = !relative.as_os_str().is_empty() && protected(&entry);
+        let fixture = if needs_protection && metadata.is_file() && vendor::eligible_name(relative) {
+            verified_fixture(relative)
+        } else {
+            None
+        };
+        if (needs_protection && fixture.is_none())
+            || (!relative.as_os_str().is_empty() && game_storage(&entry).is_some())
         {
             let (english, japanese) = if entry
                 .file_name()
@@ -551,7 +663,7 @@ fn walk_tree(
             )
             .into());
         }
-        visit(&entry, relative, &metadata)?;
+        visit(&entry, relative, &metadata, fixture)?;
         if metadata.is_dir() {
             let read = || {
                 Message::new(
@@ -569,22 +681,52 @@ fn walk_tree(
 
 pub fn verify_staged(tree: &Tree, payload: &Path) -> Result<()> {
     let mut seen = 0;
-    walk_tree(payload, |entry, relative, metadata| {
-        let expected = tree
-            .entries
-            .get(relative)
-            .context("An unreviewed entry appeared in staging")?;
-        let mut actual = filesystem::stamp(entry, metadata)?;
-        if relative.as_os_str().is_empty() {
-            // Moving the root into staging can change its ctime.
-            actual.changed = expected.changed;
-        }
-        if actual != *expected {
-            bail!("The staged output differs from what was reviewed");
-        }
-        seen += 1;
-        Ok(())
-    })?;
+    #[cfg(target_os = "macos")]
+    let (mut changed_directories, mut finder_parents) = (HashSet::new(), HashSet::new());
+    walk_tree(
+        payload,
+        |relative| tree.fixture_digests.get(relative).copied(),
+        |entry, relative, metadata, fixture| {
+            #[cfg(target_os = "macos")]
+            if !tree.entries.contains_key(relative) && filesystem::finder::recognized(entry) {
+                finder_parents.insert(
+                    relative
+                        .parent()
+                        .context("Missing metadata parent")?
+                        .to_owned(),
+                );
+                return Ok(());
+            }
+            let expected = tree
+                .entries
+                .get(relative)
+                .context("An unreviewed entry appeared in staging")?;
+            let mut actual = filesystem::stamp(entry, metadata, fixture)?;
+            if relative.as_os_str().is_empty() {
+                // Moving the root into staging can change its ctime.
+                actual.changed = expected.changed;
+            }
+            #[cfg(target_os = "macos")]
+            if actual != *expected
+                && actual.is_dir
+                && expected.is_dir
+                && actual.identity == expected.identity
+            {
+                changed_directories.insert(relative.to_owned());
+                seen += 1;
+                return Ok(());
+            }
+            if actual != *expected {
+                bail!("The staged output differs from what was reviewed");
+            }
+            seen += 1;
+            Ok(())
+        },
+    )?;
+    #[cfg(target_os = "macos")]
+    if !changed_directories.is_subset(&finder_parents) {
+        bail!("Staged directory changed after review");
+    }
     if seen != tree.entries.len() {
         bail!("A reviewed entry is missing from staging");
     }
@@ -628,23 +770,7 @@ pub fn protected(path: &Path) -> bool {
         .unwrap_or_default()
         .to_string_lossy()
         .to_lowercase();
-    matches!(
-        name.as_str(),
-        ".git"
-            | ".env"
-            | ".envrc"
-            | ".ssh"
-            | ".still-active"
-            | ".keep"
-            | ".gitkeep"
-            | "id_rsa"
-            | "id_ed25519"
-            | ".docker"
-            | ".colima"
-            | "docker.raw"
-            | "docker.qcow2"
-    ) || name.starts_with(".env.")
-        || name.starts_with(".still-stage-")
+    protected_name(&name)
         || matches!(
             path.extension()
                 .and_then(|ext| ext.to_str())
@@ -664,6 +790,26 @@ pub fn protected(path: &Path) -> bool {
                     | "dump"
             )
         )
+}
+
+fn protected_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | ".env"
+            | ".envrc"
+            | ".ssh"
+            | ".still-active"
+            | ".keep"
+            | ".gitkeep"
+            | "id_rsa"
+            | "id_ed25519"
+            | ".docker"
+            | ".colima"
+            | "docker.raw"
+            | "docker.qcow2"
+    ) || name.starts_with(".env.")
+        || name.starts_with(".still-stage-")
 }
 
 fn regular_file(path: &Path) -> bool {
@@ -841,6 +987,21 @@ mod tests {
         (temporary, output, policy)
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn staged_verification_accepts_only_new_regular_finder_metadata() -> Result<()> {
+        let (_temp, output, policy) = fixture();
+        fs::create_dir(output.join("debug"))?;
+        let prepared = policy.prepare(&output)?;
+        let staged = output.with_file_name("payload");
+        fs::rename(output, &staged)?;
+        fs::write(staged.join("debug/.DS_Store"), b"\0\0\0\x01Bud1metadata")?;
+        verify_staged(&prepared.tree, &staged)?;
+        fs::write(staged.join("debug/keep.txt"), b"user file")?;
+        assert!(verify_staged(&prepared.tree, &staged).is_err());
+        Ok(())
+    }
+
     #[test]
     fn mutation_after_selection_invalidates_approval() {
         let (_temporary, output, policy) = fixture();
@@ -935,6 +1096,79 @@ mod tests {
         fs::remove_file(&log)?;
         assert!(policy.prepare(&target).is_err());
         assert!(result.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn finished_units_remain_reviewable_beside_an_unfinished_build() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().canonicalize()?;
+        let target = root.join("target");
+        let profile = target.join("debug");
+        let incremental = profile.join("incremental");
+        let completed = incremental.join("demo-0123456789abc");
+        let running = incremental.join("other-0123456789abc");
+        let session = "s-ho9wx39w3k-0u5spzg";
+        let generation = format!("{session}-0xny0l54dee30tk2bxf7bttju");
+        for unit in [&completed, &running] {
+            fs::create_dir_all(unit.join(&generation))?;
+            fs::write(unit.join(&generation).join("dep-graph.bin"), b"generated")?;
+            fs::write(unit.join(format!("{session}.lock")), b"")?;
+        }
+        let working = running.join(format!("{session}-working"));
+        fs::create_dir(&working)?;
+        fs::create_dir(profile.join(".fingerprint"))?;
+        fs::write(profile.join(".cargo-lock"), b"")?;
+        fs::write(target.join(".rustc_info.json"), b"{}")?;
+        fs::write(root.join("Cargo.toml"), b"[workspace]")?;
+        fs::write(root.join(".gitignore"), b"/target/")?;
+        git::check(git::run(&root, ["init", "-q"])?, "init")?;
+        let policy = Policy {
+            roots: vec![root.clone()],
+            outputs: vec![],
+            docker_context: None,
+        };
+        let scan = inventory::scan(&root, 2, None)?;
+        let rows = file_candidates(&scan, &policy);
+        let eligible = |path: &Path| {
+            rows.iter()
+                .any(|row| row.row.path == path && row.blocked_reason.is_none())
+        };
+        assert!(eligible(&completed));
+        for path in [&running, &incremental, &target] {
+            assert!(!eligible(path));
+            assert!(policy.prepare(path).is_err());
+        }
+        let declared = Policy {
+            roots: vec![root.clone()],
+            outputs: vec![completed.clone()],
+            docker_context: None,
+        };
+        let listed = file_candidates(&scan, &declared);
+        let matches: Vec<_> = listed
+            .iter()
+            .filter(|row| row.row.path == completed)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].producer, Producer::DeclaredOutput);
+        let reviewed = policy.prepare(&completed)?;
+        fs::write(target.join(".keep"), b"keep all outputs")?;
+        assert!(policy.remove(&reviewed).is_err());
+        assert!(completed.is_dir());
+        fs::remove_file(target.join(".keep"))?;
+        fs::write(completed.join("my-notes.txt"), b"preserve")?;
+        assert!(policy.remove(&reviewed).is_err());
+        assert!(working.is_dir());
+        assert!(completed.join("my-notes.txt").is_file());
+        fs::remove_file(completed.join("my-notes.txt"))?;
+        git::check(
+            git::run(&root, ["add", "-f", "--", completed.to_str().unwrap()])?,
+            "add fixture",
+        )?;
+        assert!(policy.prepare(&completed).is_err());
+        assert!(!file_candidates(&scan, &policy)
+            .iter()
+            .any(|c| c.row.path == completed && c.blocked_reason.is_none()));
         Ok(())
     }
 

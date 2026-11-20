@@ -26,6 +26,30 @@ The existing Rust/egui implementation and cleanup contracts remain in use.
 - The selection summary and review action stay beneath the list. Narrow windows
   put details below the list instead of compressing the entire inspector.
 
+## Returning to a workspace
+
+The overview highlights the recent workspace, its most recent measured change
+in volume free space, and the three largest positive project changes at the
+last scan. The growth comparison uses the saved scan baseline. A shortcut
+opens that project, rescanning first if its inventory has been closed.
+
+Workspace totals and Select all use the same set of eligible paths. An
+eligible parent includes its children once. A held parent can have separately
+reviewable children. Selection spans projects; clicking the name, size, or
+checkbox changes a row's selection. Review lists each selected path, its
+allocated space at scan time when available, its reviewed logical size, and
+its regeneration impact.
+
+The inspector's Keep action saves the exact folder path for future Mac
+workspace scans. Enclosing and nested cleanup candidates stay on hold.
+Removing the keep rule triggers a fresh scan; ordinary safety checks still
+apply. If the settings cannot be read, workspace cleanup stays unavailable.
+
+After a cleanup the refreshed project retains its filter and position when
+the project is still present. Close scan in the workspace menu releases the
+in-memory inventory, comparison snapshots, and result tables, and opens the
+overview. The saved scan history remains available for the next scan.
+
 ## Mixed Japanese and Latin typography
 
 The Mac UI uses the Hiragino UI face (TTC index 1), paired with SF's small-text
@@ -52,9 +76,9 @@ and dismissing the header menu and changing Japanese/English.
 | Scanning | Stable navigation, real file/folder counts and current path. No invented percentage. Scope-changing and cleanup actions are guarded while the job runs. |
 | No matches | Search stays visible, with an explicit empty state. |
 | Candidate selected | A short background transition acknowledges focus. The inspector explains the actual evidence. |
-| Protected or held | Name and size retain normal contrast. Only the cleanup checkbox is disabled, with a readable reason in the inspector. |
+| Protected or held | Name and size retain normal contrast. A lock replaces the checkbox. Clicking a held row opens its reason without changing the cleanup selection. |
 | Final confirmation | Names, scope and effects appear before a separate destructive action. Cancelling keeps data intact. |
-| Completed | Actual measured volume free-space change and individual results. SDK residue remains partial, including its remaining size. |
+| Completed | Actual measured volume free-space change and individual results. The workspace receipt can be dismissed and clears when the next scan starts. SDK residue remains partial, including its remaining size. |
 | Inspection failure | Show the failed operation and available details. Unknown state is not a successful cleanup or a verified unused item. |
 
 ## Motion

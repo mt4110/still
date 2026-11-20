@@ -96,7 +96,7 @@ Windows の MSIX は [パッケージ作成スクリプト](scripts/build-window
 
 **App storage…** で、Android NDK の版ごとの容量、Unity Asset Store のダウンロード済みパッケージ、Unreal Engine のローカル DDC、ブラウザのキャッシュ、Slack・Teams のログ、Notion のローカルデータを確認できます。既知のホーム内の場所を対象に容量だけを調べ、ログやデータベースの本文には触れません。Xcode のインストール済みランタイムは、チェックを入れた場合に Xcode の一覧を取得します。
 
-CLI では `still app-storage`、Xcode の一覧も含めるなら `still app-storage --xcode-runtimes` を実行します。この画面は確認専用です。SDK の版は各管理ツールで利用状況を確認してください。Notion のローカルデータや仕事の証跡になりうるログは保護表示します。ワークスペース調査では Unity の元アセットとキャッシュ、Unreal Engine 本体、元アセット、自動保存、ログ、生成キャッシュも判別して表示します。
+CLI では `still app-storage`、Xcode の一覧も含めるなら `still app-storage --xcode-runtimes` を実行します。CLI は読み取り専用です。Mac アプリでは、Chrome を終了してから「既定プロファイルの HTTP キャッシュを確認…」を選べます。対象は Google Chrome の Default プロファイルの `Cache_Data` のみです。確認画面には容量・件数・再取得の影響が表示され、実行結果は `still cleanup-history` に残ります。「Library の整理で残す」は次回の調査にも反映されます。SDK の版は各管理ツールで利用状況を確認してください。Notion のローカルデータや仕事の証跡になりうるログは保護表示します。ワークスペース調査では Unity の元アセットとキャッシュ、Unreal Engine 本体、元アセット、自動保存、ログ、生成キャッシュも判別して表示します。
 
 Mac 版の **App storage… → Review Xcode & NDK versions…** では、版ごとの容量と候補／保護の理由を表示します。古いランタイムは最終利用記録、端末の状態、テスト設定を確認し、利用記録がある場合は45日を目安にします。プロジェクト設定と NDK のビルド記録は、開いているプロファイルのフォルダ、`~/_workspace`、`~/AndroidStudioProjects` を調べます。候補を選んで **Review … selected → Uninstall … selected** と進むと、再確認できた版だけを各管理ツールでアンインストールします。結果には Mac のデータボリュームの前後の空き容量と、実測した差が出ます。
 
@@ -136,7 +136,14 @@ still review --profile weekly
 
 `--git-repo` に元の Git チェックアウトを指定すると、同じ候補画面にリンク済みワークツリーと判定理由が出ます。既定の比較先はローカルの `main` です。取得済みのリモート追跡ブランチを使うなら `--git-base refs/remotes/origin/main` を指定します。
 
+Rust の差分コンパイル用キャッシュ全体が保留でも、完了したコンパイル単位を個別に選べます。未完了の作業域・用途不明のファイル・保護マーカーがある単位は保持し、選択後の変更や使用中のファイルは実行前に再確認します。
+
 デスクトップの生成物削除結果は、対象パス・結果・論理容量とボリュームの空き容量の前後値を端末内に記録します。`still cleanup-history` または `still cleanup-history --format json` で参照できます。保存に失敗した場合は結果画面に表示します。削除が未完了の場合、元のパスが残っていなくてもステージ領域に残っている可能性があります。履歴はコンテナや SDK の操作をまだ含みません。
+
+Macで一部残存と表示されたときは、再スキャン後にワークスペースのメニューから「残ったステージを確認…」を開きます。場所を選ぶと内容を検査し、空のフォルダ・認識できたFinderメタデータ・元の場所の記録だけであれば、確認画面から片付けられます。CLIでは `still stage-cleanup --cleanup-root <整理ルート> <ステージのパス>` が確認のみ、同じ指定に `--apply` を付けると削除します。
+
+「アプリと SDK」→「アプリの保存容量」でLibraryを選ぶと、保存先の分類、配下のファイルで観測した最新日時、前回の調査からの容量差を確認できます。フォルダ名が登録済みアプリのbundle IDと正確に一致した場合は、そのアプリの場所と観測できた起動状態を表示します。共有コンテナや対応を確認できなかった場所は確認専用です。プロフィール・履歴・Vaultは従来の保存先を使います。
+
 
 `--docker-context colima` を指定すると、同じ画面で Docker の候補を確認できます。BuildKit は `--docker-cache` で調査します。指定した接続先のコンテナの bind mount と重なる出力は保護します。候補画面の `f`、`g`、`d` はファイル、Git、Docker への移動です。回収量は観測値からの目安で、Docker の表示は Docker 内の容量です。Git と Docker の削除には、それぞれ `still worktrees` と `still docker` を使います。各オプションは `--save-profile` で保存できます。
 

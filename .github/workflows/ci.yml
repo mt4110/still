@@ -53,3 +53,22 @@ jobs:
         name: still-macos-arm64
         path: target/still-macos-arm64.zip
         if-no-files-found: error
+    - name: Verify Windows package layout
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: |
+        $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+        $tool = Get-ChildItem "$sdk\*\x64\makeappx.exe" -File |
+          Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
+          Select-Object -First 1
+        if (-not $tool) { throw 'Windows SDK MakeAppx not found' }
+        $package = 'target\still-ci.msix'
+        .\scripts\build-windows-msix.ps1 -BinaryPath target\release\still.exe -DesktopBinaryPath target\release\still-desktop.exe -PackageName Still.PackageTest -Publisher 'CN=Still Package Test' -PublisherDisplayName 'Still Package Test' -DisplayName still -Version 1.0.0.0 -MakeAppxPath $tool.FullName -OutputPath $package
+        $unpacked = Join-Path $env:RUNNER_TEMP 'still-package-test'
+        & $tool.FullName unpack /p $package /d $unpacked
+        if ($LASTEXITCODE -ne 0) { throw 'MakeAppx unpack failed' }
+        foreach ($exe in 'still.exe','still-desktop.exe') {
+          if ((Get-FileHash "target\release\$exe").Hash -ne (Get-FileHash "$unpacked\$exe").Hash) {
+            throw "Packaged executable differs from release build: $exe"
+          }
+        }

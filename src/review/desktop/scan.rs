@@ -3,15 +3,20 @@ use super::super::{
 };
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 pub(super) const THREADS: u16 = 4;
 pub(super) type Baseline = Option<Arc<history::Snapshot>>;
 
 pub(super) struct Scan {
+    #[cfg(target_os = "macos")]
+    pub kept: Option<super::keep::KeepRules>,
     pub root: PathBuf,
     pub policy: Arc<artifacts::Policy>,
-    pub inventory: inventory::Inventory,
+    pub directories: super::folder_index::Directories,
     pub previous: Baseline,
     pub recorded: bool,
     pub files: Vec<artifacts::FileCandidate>,
@@ -94,10 +99,42 @@ impl Scan {
             None
         };
         let files = artifacts::file_candidates(&inventory, &policy);
+        #[cfg(target_os = "macos")]
+        let (files, kept) = {
+            let mut files = files;
+            let kept = if read_only {
+                None
+            } else {
+                match super::keep::KeepRules::load() {
+                    Ok(rules) => {
+                        for c in &mut files {
+                            if c.blocked_reason.is_none() {
+                                c.blocked_reason = rules.reason(&c.row.path);
+                            }
+                        }
+                        Some(rules)
+                    }
+                    Err(error) => {
+                        let reason = super::Message::new(
+                            format!("Could not read keep settings: {error}"),
+                            format!("「残す」設定を読み取れません · {error}"),
+                        );
+                        notes.push(reason.to_string());
+                        for c in &mut files {
+                            c.blocked_reason.get_or_insert_with(|| reason.clone());
+                        }
+                        None
+                    }
+                }
+            };
+            (files, kept)
+        };
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            kept,
+            directories: super::folder_index::Directories::from_inventory(&root, inventory),
             root,
             policy: Arc::new(policy),
-            inventory,
             previous,
             recorded,
             files,
@@ -122,15 +159,63 @@ pub(super) struct CleanupReceipt {
 pub(super) struct Confirmation {
     policy: Arc<artifacts::Policy>,
     items: Vec<artifacts::Prepared>,
+    totals: Vec<ReviewSize>,
+}
+
+pub(super) struct ReviewSize {
+    pub files: usize,
+    pub logical_bytes: u64,
+    pub scanned_allocated: Option<u64>,
+}
+
+#[derive(Default)]
+pub(super) struct ReviewProgress {
+    files: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl ReviewProgress {
+    fn checked(&self, size: u64) {
+        self.bytes.fetch_add(size, Ordering::Relaxed);
+        self.files.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn label(&self, japanese: bool) -> String {
+        let files = self.files.load(Ordering::Relaxed);
+        let logical = bytes(self.bytes.load(Ordering::Relaxed));
+        if japanese {
+            format!("内容照合済み {files} ファイル · 論理容量 {logical}")
+        } else {
+            format!("Verified contents of {files} files · {logical} logical")
+        }
+    }
 }
 
 impl Confirmation {
+    #[cfg(test)]
     pub fn prepare(policy: Arc<artifacts::Policy>, paths: Vec<PathBuf>) -> Result<Self> {
+        Self::prepare_reporting(policy, paths, &ReviewProgress::default())
+    }
+
+    pub(super) fn prepare_reporting(
+        policy: Arc<artifacts::Policy>,
+        paths: Vec<PathBuf>,
+        progress: &ReviewProgress,
+    ) -> Result<Self> {
         if paths.is_empty() {
             bail!("Choose a generated folder to review.");
         }
+        #[cfg(target_os = "macos")]
+        {
+            let rules = super::keep::KeepRules::load()?;
+            for path in &paths {
+                rules.check(path)?;
+            }
+        }
         let items = run_in_pairs(&paths, |path| {
-            policy.prepare(path).with_context(|| display(path))
+            policy
+                .prepare_reporting(path, |size| progress.checked(size))
+                .with_context(|| display(path))
         })
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
@@ -142,11 +227,50 @@ impl Confirmation {
                 display(pair[1])
             );
         }
-        Ok(Self { policy, items })
+        // Size and count were accumulated while each file was stamped.
+        let totals = items
+            .iter()
+            .map(|item| ReviewSize {
+                files: item.files(),
+                logical_bytes: item.logical_bytes(),
+                scanned_allocated: None,
+            })
+            .collect();
+        Ok(Self {
+            policy,
+            items,
+            totals,
+        })
     }
 
     pub fn items(&self) -> &[artifacts::Prepared] {
         &self.items
+    }
+
+    pub fn match_scan_sizes(&mut self, scan: &Scan) {
+        let sizes: std::collections::HashMap<_, _> = scan
+            .files
+            .iter()
+            .filter_map(|c| {
+                c.row
+                    .usage
+                    .allocated_bytes
+                    .map(|size| (c.row.path.as_path(), size))
+            })
+            .collect();
+        for (item, summary) in self.items.iter().zip(&mut self.totals) {
+            summary.scanned_allocated = sizes.get(item.path.as_path()).copied();
+        }
+    }
+
+    pub fn summaries(&self) -> impl Iterator<Item = (&artifacts::Prepared, &ReviewSize)> {
+        self.items.iter().zip(&self.totals)
+    }
+
+    fn remove_reviewed(&self, item: &artifacts::Prepared) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        super::keep::KeepRules::load()?.check(&item.path)?;
+        self.policy.remove(item)
     }
 
     pub fn remove(self, root: &Path) -> CleanupReceipt {
@@ -154,8 +278,7 @@ impl Confirmation {
         let before = super::super::filesystem::available(root);
         let outcomes = run_in_pairs(&self.items, |item| {
             let result = self
-                .policy
-                .remove(item)
+                .remove_reviewed(item)
                 .map_err(|err| super::Message::from_error(&err));
             (display(&item.path), result)
         });
@@ -321,6 +444,71 @@ mod tests {
             .text(false)
             .contains("changed after review"));
         assert_eq!(fs::read(&file)?, b"after");
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod measurements {
+    use super::*;
+    use std::fs;
+    use std::time::Instant;
+
+    /// Run this by itself in release mode. It only opens the supplied generated
+    /// fixture for reading. Setup and OS file-cache behavior are outside the timer.
+    #[test]
+    #[ignore = "requires a generated workspace fixture"]
+    fn measure_workspace_review() -> Result<()> {
+        let root = PathBuf::from(
+            std::env::var_os("STILL_MEASURE_WORKSPACE").context("fixture root required")?,
+        )
+        .canonicalize()?;
+        let output = root.join("project/target");
+        let policy = Arc::new(artifacts::Policy {
+            roots: vec![root.clone()],
+            outputs: vec![output.clone()],
+            docker_context: None,
+        });
+        let resident_kib = || -> Result<u64> {
+            let res = std::process::Command::new("/bin/ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()?;
+            Ok(std::str::from_utf8(&res.stdout)?.trim().parse()?)
+        };
+        let heap_kib = || {
+            let mut stats = std::mem::MaybeUninit::uninit();
+            // Apple's malloc.h documents a null zone as the sum of all zones.
+            unsafe {
+                libc::malloc_zone_statistics(std::ptr::null_mut(), stats.as_mut_ptr());
+                stats.assume_init().size_in_use / 1024
+            }
+        };
+        let before = resident_kib()?;
+        let heap_before = heap_kib();
+        let scan = Scan::run(
+            Profile {
+                roots: vec![root.clone()],
+                cleanup_roots: vec![root.clone()],
+                outputs: vec![output.clone()],
+                ..Default::default()
+            },
+            0,
+            None,
+            Some(None),
+            false,
+            false,
+            &Default::default(),
+        )?;
+        let idle = resident_kib()?;
+        let heap_after = heap_kib();
+        for _ in 0..3 {
+            let start = Instant::now();
+            let confirmation = Confirmation::prepare(policy.clone(), vec![output.clone()])?;
+            let (_, size) = confirmation.summaries().next().unwrap();
+            eprintln!("review_ms={} files={} logical_bytes={} rss_before_kib={before} rss_after_scan_kib={idle} live_heap_delta_kib={}", start.elapsed().as_millis(), size.files, size.logical_bytes, heap_after.saturating_sub(heap_before));
+            std::hint::black_box(&scan);
+        }
+        assert!(fs::metadata(output)?.is_dir());
         Ok(())
     }
 }

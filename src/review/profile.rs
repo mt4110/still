@@ -1,5 +1,4 @@
 use anyhow::{bail, Context, Result};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
@@ -118,7 +117,7 @@ fn profile_path(name: &str) -> Result<PathBuf> {
 }
 
 fn profile_directory() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("com", "antigravity", "still")
+    let dirs = crate::storage_paths::project_dirs()
         .context("Could not determine the still configuration directory")?;
     Ok(dirs.config_dir().join("review-profiles"))
 }

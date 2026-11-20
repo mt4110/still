@@ -1,10 +1,16 @@
 mod controls;
+mod folder_index;
 mod help;
 #[cfg(target_os = "macos")]
 mod home;
 mod icons;
+mod instance;
+#[cfg(target_os = "macos")]
+mod keep;
+mod library_ui;
 #[cfg(target_os = "macos")]
 mod monitor;
+mod old_files;
 #[cfg(target_os = "macos")]
 mod projects;
 mod scan;
@@ -12,6 +18,8 @@ mod scan;
 mod sdk;
 #[cfg(target_os = "macos")]
 mod shell;
+#[cfg(target_os = "macos")]
+mod stage_recovery;
 
 use super::message::Message;
 use super::{app_storage, bytes, inventory, profile_for, resolve, stale, Profile};
@@ -32,6 +40,10 @@ const MUTED: Color32 = Color32::from_rgb(95, 100, 110);
 const LINE: Color32 = Color32::from_rgb(226, 228, 233);
 
 pub fn run(profile: Option<String>) -> Result<()> {
+    let Some(_instance) = instance::acquire()? else {
+        eprintln!("still はすでに起動しています / still is already running");
+        return Ok(());
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1240.0, 800.0])
@@ -286,9 +298,17 @@ struct TableRow {
 
 enum Outcome {
     Scan(Result<Scan>),
+    #[cfg(target_os = "macos")]
+    StageReview(Result<super::filesystem::recovery::ReviewedStage>),
+    #[cfg(target_os = "macos")]
+    StageRemoval(Result<()>),
     Search(Result<inventory::Inventory>),
     Stale(Result<stale::Report>),
     AppStorage(Result<app_storage::Report>),
+    #[cfg(target_os = "macos")]
+    CachePrepared(Result<app_storage::known_cache::PreparedCache>),
+    #[cfg(target_os = "macos")]
+    CacheFinished(Result<library_ui::SavedReceipt>),
     #[cfg(target_os = "macos")]
     SdkScan(Result<super::sdk_cleanup::Report>),
     #[cfg(target_os = "macos")]
@@ -311,6 +331,7 @@ struct Job {
     label: &'static str,
     removing: bool,
     progress: Option<Arc<inventory::ScanProgress>>,
+    review_progress: Option<Arc<scan::ReviewProgress>>,
 }
 
 struct StaleFiles {
@@ -370,6 +391,9 @@ struct App {
     inspection: Option<Vec<String>>,
     next_presence_check: Option<std::time::Instant>,
     confirmation: Option<Confirmation>,
+    confirmation_page: usize,
+    #[cfg(target_os = "macos")]
+    stages: stage_recovery::Panel,
     job: Option<Job>,
     save_as: Option<String>,
     status: String,
@@ -386,6 +410,8 @@ struct App {
     browse_folders: bool,
     read_only_browse: bool,
     app_storage: Option<Result<app_storage::Report>>,
+    #[cfg(target_os = "macos")]
+    library_panel: library_ui::Panel,
     #[cfg(target_os = "macos")]
     sdk: sdk::Panel,
 }
@@ -409,6 +435,7 @@ impl App {
             label,
             removing,
             progress: None,
+            review_progress: None,
         });
         std::thread::spawn(move || {
             let _ = tx.send(work());
@@ -416,11 +443,42 @@ impl App {
         });
     }
 
+    fn review_selected(
+        &mut self,
+        ctx: &egui::Context,
+        policy: Arc<super::artifacts::Policy>,
+        paths: Vec<PathBuf>,
+    ) {
+        if self.job.is_some() {
+            return;
+        }
+        let progress = Arc::new(scan::ReviewProgress::default());
+        let worker = Arc::clone(&progress);
+        self.spawn(
+            ctx,
+            text(
+                self.japanese_reasons,
+                "選択した候補を照合中…",
+                "Checking selected candidates…",
+            ),
+            false,
+            move || Outcome::Review(Confirmation::prepare_reporting(policy, paths, &worker)),
+        );
+        if let Some(job) = &mut self.job {
+            job.review_progress = Some(progress);
+        }
+    }
+
     fn poll(&mut self, ctx: &egui::Context) {
         let Some(job) = &self.job else { return };
         let result = match job.result.try_recv() {
             Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Empty) => {
+                // A worker can finish after logic has polled this frame. Keep
+                // delivery responsive even if a wake-up coalesces with it.
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                return;
+            }
             Err(TryRecvError::Disconnected) => {
                 self.job = None;
                 self.status = text(
@@ -441,11 +499,22 @@ impl App {
                 self.baseline
                     .insert(result.root.clone(), result.previous.clone());
                 #[cfg(target_os = "macos")]
+                {
+                    self.projects.refresh(&result);
+                    if let Some(path) = self.home.requested_project.take() {
+                        self.projects.open_project(path);
+                    } else if self.browse_folders {
+                        self.projects.active = false;
+                    }
+                }
+                #[cfg(target_os = "macos")]
                 if !self.read_only_browse {
-                    if let Err(err) =
-                        self.home
-                            .remember(&result.root, &self.profile, self.profile_name.clone())
-                    {
+                    if let Err(err) = self.home.remember(
+                        &result.root,
+                        &self.profile,
+                        self.profile_name.clone(),
+                        self.projects.growth(),
+                    ) {
                         self.status = format!(
                             "{} · {err:#}",
                             text(
@@ -457,13 +526,6 @@ impl App {
                     }
                 }
                 self.location = result.root.clone();
-                #[cfg(target_os = "macos")]
-                {
-                    self.projects = projects::Projects::from_scan(&result);
-                    if self.browse_folders {
-                        self.projects.active = false;
-                    }
-                }
                 self.scan = Some(result);
                 self.rebuild();
             }
@@ -484,7 +546,18 @@ impl App {
                     )
                 )
             }
-            Outcome::AppStorage(result) => self.app_storage = Some(result),
+            Outcome::AppStorage(result) => {
+                #[cfg(target_os = "macos")]
+                self.library_panel.scanned(&result);
+                self.app_storage = Some(result);
+            }
+            #[cfg(target_os = "macos")]
+            Outcome::CachePrepared(result) => self.library_panel.review = Some(result),
+            #[cfg(target_os = "macos")]
+            Outcome::CacheFinished(result) => {
+                self.app_storage = None;
+                self.library_panel.receipt = Some(result);
+            }
             #[cfg(target_os = "macos")]
             Outcome::SdkScan(result) => self.sdk.report = Some(result),
             #[cfg(target_os = "macos")]
@@ -497,11 +570,36 @@ impl App {
             Outcome::DockerCacheReview(review) => self.monitor.set_cache_review(review),
             #[cfg(target_os = "macos")]
             Outcome::DockerCacheRemoval(receipt) => self.monitor.set_cache_receipt(receipt),
-            Outcome::Review(Ok(confirmation)) => self.confirmation = Some(confirmation),
+            Outcome::Review(Ok(mut confirmation)) => {
+                if let Some(scan) = self.scan.as_ref() {
+                    confirmation.match_scan_sizes(scan);
+                    self.confirmation_page = 0;
+                    self.confirmation = Some(confirmation);
+                }
+            }
+            #[cfg(target_os = "macos")]
+            Outcome::StageReview(result) => self.stages.review = Some(result),
+            #[cfg(target_os = "macos")]
+            Outcome::StageRemoval(result) => match result {
+                Ok(()) => {
+                    self.refresh(ctx, false);
+                    self.status = text(
+                        self.japanese_reasons,
+                        "ステージを片付けました。",
+                        "Removed the reviewed stage.",
+                    )
+                    .into();
+                }
+                Err(error) => self.status = format!("{error:#}"),
+            },
             Outcome::Inspection(report) => self.inspection = Some(report),
             Outcome::Removal(results) => {
-                self.cleanup_receipt = Some(results);
+                #[cfg(target_os = "macos")]
+                {
+                    self.home.last_measurement = results.before.zip(results.after);
+                }
                 self.refresh(ctx, false);
+                self.cleanup_receipt = Some(results);
             }
             Outcome::Review(Err(err)) => {
                 self.status = Message::from_error(&err)
@@ -509,6 +607,10 @@ impl App {
                     .to_owned();
             }
             Outcome::Scan(Err(err)) | Outcome::Search(Err(err)) => {
+                #[cfg(target_os = "macos")]
+                {
+                    self.home.requested_project = None;
+                }
                 self.status = format!(
                     "{} · {err:#}",
                     text(
@@ -599,6 +701,7 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         self.navigate(shell::Screen::Workspace);
+        self.cleanup_receipt = None;
         self.marked.clear();
         self.matches.clear();
         if self.view == View::Search {
@@ -676,11 +779,9 @@ impl App {
         let Some(scan) = &self.scan else { return };
         let from_row = |row: &inventory::Row| {
             let delta = if self.view == View::Search && row.is_dir {
-                scan.inventory
-                    .directories
-                    .binary_search_by(|dir| dir.path.cmp(&row.path))
-                    .ok()
-                    .and_then(|i| scan.delta(&scan.inventory.directories[i]))
+                scan.directories
+                    .row(&row.path)
+                    .and_then(|snapshot| scan.delta(&snapshot))
             } else {
                 scan.delta(row)
             };
@@ -734,11 +835,9 @@ impl App {
         match self.view {
             View::Folders => {
                 self.rows.extend(
-                    scan.inventory
-                        .directories
-                        .iter()
-                        .filter(|row| row.path.parent() == Some(self.location.as_path()))
-                        .map(from_row),
+                    scan.directories
+                        .children(&self.location)
+                        .map(|row| from_row(&row)),
                 );
                 // The inventory keeps directory totals, not every individual file.
                 // List files only for the folder currently open to avoid retaining
@@ -948,6 +1047,8 @@ impl App {
     }
 
     fn toolbar_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        self.stage_menu(ui);
         if ui
             .button(text(
                 self.japanese_reasons,
@@ -1308,6 +1409,7 @@ impl App {
                     .clicked()
                 {
                     self.projects.active = false;
+                    self.marked.clear();
                     self.browse_folders = true;
                     self.location = self.scan.as_ref().unwrap().root.clone();
                     self.view = View::Folders;
@@ -1537,16 +1639,7 @@ impl App {
         if ui.add_enabled(!self.marked.is_empty(), review).clicked() {
             let paths = self.marked.iter().cloned().collect();
             let policy = self.scan.as_ref().unwrap().policy.clone();
-            self.spawn(
-                ctx,
-                text(
-                    self.japanese_reasons,
-                    "内容を再照合中… 大きなフォルダは時間がかかります",
-                    "Checking contents again… Large folders may take time",
-                ),
-                false,
-                move || Outcome::Review(Confirmation::prepare(policy, paths)),
-            );
+            self.review_selected(ctx, policy, paths);
         }
     }
 
@@ -1772,6 +1865,10 @@ impl App {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        self.stage_dialog(ctx);
+        #[cfg(target_os = "macos")]
+        self.library_confirmation(ctx);
         if self.show_help {
             self.help_dialog(ctx);
         }
@@ -1899,11 +1996,31 @@ impl App {
                         "ゴミ箱を経由せず削除します。再生成の方法と対象を確認してください。",
                         "Deletion bypasses Trash. Check these paths and how to regenerate them.",
                     ));
+                    ui.small(text(self.japanese_reasons,
+                        "一覧はディスク使用量（取得できない場合は論理容量）、以下はファイルの論理容量です。実際の空き容量の変化は削除後に測定します。",
+                        "The list uses allocated space when available. Sizes below are logical file sizes. The change in free space is measured after deletion."));
                     ui.add_space(14.0);
+                    // Long paths wrap to different heights. Page the list so a large
+                    // selection renders bounded work while every path stays readable.
+                    const PAGE_SIZE: usize = 20;
+                    let count = confirmation.items().len();
+                    if count > PAGE_SIZE {
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(self.confirmation_page > 0, egui::Button::new(text(self.japanese_reasons, "前へ", "Previous"))).clicked() {
+                                self.confirmation_page -= 1;
+                            }
+                            let start = self.confirmation_page * PAGE_SIZE;
+                            ui.label(format!("{}–{} / {count}", start + 1, (start + PAGE_SIZE).min(count)));
+                            if ui.add_enabled(start + PAGE_SIZE < count, egui::Button::new(text(self.japanese_reasons, "次へ", "Next"))).clicked() {
+                                self.confirmation_page += 1;
+                            }
+                        });
+                    }
                     egui::ScrollArea::vertical()
+                        .id_salt(("review-paths", self.confirmation_page))
                         .max_height(260.0)
                         .show(ui, |ui| {
-                            for item in confirmation.items() {
+                            for (item, size) in confirmation.summaries().skip(self.confirmation_page * PAGE_SIZE).take(PAGE_SIZE) {
                                 ui.label(
                                     RichText::new(
                                         item.path.file_name().unwrap_or_default().to_string_lossy(),
@@ -1918,16 +2035,19 @@ impl App {
                                 ui.label(if self.japanese_reasons {
                                     format!(
                                         "{} ファイル · 論理容量 {} · {japanese}",
-                                        item.files(),
-                                        bytes(item.logical_bytes())
+                                        size.files,
+                                        bytes(size.logical_bytes)
                                     )
                                 } else {
                                     format!(
                                         "{} files · {} logical · {english}",
-                                        item.files(),
-                                        bytes(item.logical_bytes())
+                                        size.files,
+                                        bytes(size.logical_bytes)
                                     )
                                 });
+                                if let Some(allocated) = size.scanned_allocated {
+                                    ui.small(format!("{} · {}", text(self.japanese_reasons, "スキャン時のディスク使用量", "Allocated at scan"), bytes(allocated)));
+                                }
                                 ui.add_space(8.0);
                                 ui.separator();
                             }
@@ -1995,420 +2115,6 @@ impl App {
                     move || Outcome::Removal(confirmation.remove(&root)),
                 );
             }
-        }
-    }
-
-    fn app_storage_dialog(&mut self, ctx: &egui::Context, page: Option<&mut egui::Ui>) {
-        let busy = self.job.is_some();
-        let mut start = false;
-        let mut close = false;
-        let as_page = page.is_some();
-        #[cfg(target_os = "macos")]
-        let mut review_sdk = false;
-        let render = |ui: &mut egui::Ui| {
-            if !as_page {
-                ui.set_width((ctx.content_rect().width() - 80.0).clamp(590.0, 920.0));
-            }
-            ui.heading(text(
-                self.japanese_reasons,
-                "アプリと SDK の容量",
-                "App storage",
-            ));
-            ui.label(text(
-                self.japanese_reasons,
-                "SDK、ブラウザキャッシュ、アプリのデータを容量順に確認します。",
-                "Review SDKs, browser caches, and protected app data by size.",
-            ));
-            ui.label(text(
-                self.japanese_reasons,
-                "ホーム内の既知の場所から容量を調べます。この画面は確認専用です。",
-                "The scan reads metadata from known folders in your home. This view is read-only.",
-            ));
-            ui.add_enabled_ui(!busy, |ui| {
-                ui.checkbox(
-                    &mut self.xcode_runtimes,
-                    text(
-                        self.japanese_reasons,
-                        "Xcode のインストール済みランタイムも確認する",
-                        "Ask Xcode for installed simulator runtimes",
-                    ),
-                );
-                ui.checkbox(
-                    &mut self.library_inventory,
-                    text(
-                        self.japanese_reasons,
-                        "Library の主な保存先を確認する（時間がかかる場合があります）",
-                        "Inventory major Library folders (may take time)",
-                    ),
-                );
-                start = ui
-                    .button(text(self.japanese_reasons, "調べる", "Scan"))
-                    .clicked();
-                #[cfg(target_os = "macos")]
-                {
-                    review_sdk = ui
-                        .button(text(
-                            self.japanese_reasons,
-                            "Xcode と NDK を版ごとに確認…",
-                            "Review Xcode & NDK versions…",
-                        ))
-                        .clicked();
-                }
-            });
-            if busy && !as_page {
-                ui.spinner();
-            }
-            match &self.app_storage {
-                Some(Ok(report)) => {
-                    ui.label(if self.japanese_reasons {
-                        format!("{} 件", report.rows.len())
-                    } else {
-                        format!("{} items", report.rows.len())
-                    });
-                    egui::ScrollArea::vertical()
-                        .max_height(320.0)
-                        .show(ui, |ui| {
-                            for row in &report.rows {
-                                let size = row.size_bytes.map_or_else(|| "—".into(), bytes);
-                                let partial = if row.partial {
-                                    text(
-                                        self.japanese_reasons,
-                                        " · 一部を読み取れませんでした",
-                                        " · partial read",
-                                    )
-                                } else {
-                                    ""
-                                };
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{}  ·  {size} {}{partial}",
-                                        row.label,
-                                        size_basis(row.size_basis, self.japanese_reasons)
-                                    ))
-                                    .strong(),
-                                );
-                                if let Some(path) = &row.path {
-                                    ui.label(path);
-                                }
-                                ui.label(row.reason.text(self.japanese_reasons));
-                                ui.separator();
-                            }
-                            for note in &report.notes {
-                                ui.label(note);
-                            }
-                        });
-                }
-                Some(Err(error)) => {
-                    ui.label(format!(
-                        "{} · {error:#}",
-                        text(
-                            self.japanese_reasons,
-                            "容量を取得できませんでした",
-                            "Could not read storage usage"
-                        )
-                    ));
-                }
-                None => {}
-            }
-            if !as_page {
-                close = ui
-                    .button(text(self.japanese_reasons, "閉じる", "Close"))
-                    .clicked();
-            }
-        };
-        let should_close = if let Some(ui) = page {
-            egui::Frame::NONE.show(ui, render);
-            false
-        } else {
-            egui::Modal::new(egui::Id::new("app-storage"))
-                .show(ctx, render)
-                .should_close()
-        };
-        if close || should_close {
-            self.show_app_storage = false;
-        }
-        #[cfg(target_os = "macos")]
-        if review_sdk {
-            self.show_app_storage = false;
-            self.app_storage_selected = false;
-            self.navigate(shell::Screen::Apps);
-            self.sdk.open = true;
-            self.scan_sdks(ctx);
-        }
-        if start {
-            self.app_storage = None;
-            let xcode = self.xcode_runtimes;
-            let library = self.library_inventory;
-            self.spawn(
-                ctx,
-                text(
-                    self.japanese_reasons,
-                    "アプリの保存容量を調査中…",
-                    "Scanning app storage…",
-                ),
-                false,
-                move || Outcome::AppStorage(app_storage::scan(xcode, library)),
-            );
-        }
-    }
-
-    fn stale_dialog(&mut self, ctx: &egui::Context, page: Option<&mut egui::Ui>) {
-        let mut start = false;
-        let mut close = false;
-        let as_page = page.is_some();
-        let busy = self.job.is_some();
-        let state = &mut self.stale_files;
-        let render = |ui: &mut egui::Ui| {
-            if !as_page {
-                ui.set_width((ctx.content_rect().width() - 80.0).clamp(590.0, 920.0));
-            }
-            ui.heading(text(
-                self.japanese_reasons,
-                "古いファイルを探す",
-                "Find old files",
-            ));
-            ui.label(text(
-                self.japanese_reasons,
-                "ホーム内の古い大容量ファイルを探します。テレメトリーはありません。",
-                "Search only within your home folder. still has no telemetry.",
-            ));
-            ui.add_enabled_ui(!busy, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(state.root.as_deref().map_or_else(
-                        || text(self.japanese_reasons, "ホーム（~）", "Home (~)").into(),
-                        display,
-                    ));
-                    if ui
-                        .button(text(
-                            self.japanese_reasons,
-                            "フォルダを選ぶ…",
-                            "Choose folder…",
-                        ))
-                        .clicked()
-                    {
-                        let mut picker = rfd::FileDialog::new();
-                        if let Some(root) = state.root.clone().or_else(|| {
-                            directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_owned())
-                        }) {
-                            picker = picker.set_directory(root);
-                        }
-                        if let Some(path) = picker.pick_folder() {
-                            state.root = Some(path);
-                            state.report = None;
-                            state.error.clear();
-                        }
-                    }
-                    if ui
-                        .add_enabled(
-                            state.root.is_some(),
-                            egui::Button::new(text(
-                                self.japanese_reasons,
-                                "ホーム全体に戻す",
-                                "Use home",
-                            )),
-                        )
-                        .clicked()
-                    {
-                        state.root = None;
-                        state.report = None;
-                        state.error.clear();
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(text(
-                        self.japanese_reasons,
-                        "最後の活動からの日数",
-                        "Days since last activity:",
-                    ));
-                    ui.add(egui::DragValue::new(&mut state.days).range(1..=3650));
-                    ui.label(text(
-                        self.japanese_reasons,
-                        "最小容量（MiB）",
-                        "Minimum size (MiB):",
-                    ));
-                    ui.add(egui::DragValue::new(&mut state.mib).range(1..=1_000_000));
-                    start = ui
-                        .button(text(self.japanese_reasons, "調べる", "Scan"))
-                        .clicked();
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(text(self.japanese_reasons, "並べ替え", "Sort by"));
-                    use crate::cli::StaleSort;
-                    for (order, label) in [
-                        (
-                            StaleSort::Size,
-                            text(self.japanese_reasons, "容量が大きい順", "Largest"),
-                        ),
-                        (
-                            StaleSort::Modified,
-                            text(self.japanese_reasons, "更新日が古い順", "Oldest modified"),
-                        ),
-                        (
-                            StaleSort::Created,
-                            text(self.japanese_reasons, "作成日が古い順", "Oldest created"),
-                        ),
-                    ] {
-                        if ui.selectable_value(&mut state.sort, order, label).changed() {
-                            if let Some(report) = &mut state.report {
-                                report.set_order(order);
-                            }
-                        }
-                    }
-                });
-            });
-            if busy && !as_page {
-                ui.spinner();
-            }
-            if !state.error.is_empty() {
-                ui.label(&state.error);
-            }
-            if let Some(report) = &state.report {
-                ui.label(if self.japanese_reasons {
-                    format!(
-                        "{} · 該当 {} 件 · 日時不明で除外 {} 件 · 読み取り不可 {} 件",
-                        report.root,
-                        report.candidates.len() + report.omitted,
-                        report.unknown_age,
-                        report.skipped
-                    )
-                } else {
-                    format!(
-                        "{} · {} matches · {} with unknown dates excluded · {} unread entries",
-                        report.root,
-                        report.candidates.len() + report.omitted,
-                        report.unknown_age,
-                        report.skipped
-                    )
-                });
-                if report.omitted > 0 {
-                    ui.label(text(
-                        self.japanese_reasons,
-                        "選んだ順序の上位100件を表示しています。",
-                        "Showing the first 100 matches in the selected order.",
-                    ));
-                }
-                if !report.candidates.is_empty() {
-                    ui.add(controls::field(ui, &mut state.query).hint_text(text(
-                        self.japanese_reasons,
-                        "パスで絞り込む",
-                        "Filter results by path",
-                    )));
-                    let query = state.query.to_lowercase();
-                    egui::ScrollArea::vertical()
-                        .max_height(260.0)
-                        .show(ui, |ui| {
-                            for row in report.candidates.iter().filter(|row| {
-                                query.is_empty() || row.path.to_lowercase().contains(&query)
-                            }) {
-                                ui.label(RichText::new(&row.path).strong());
-                                ui.horizontal_wrapped(|ui| {
-                                    let open = match row.open_state {
-                                        "currently_open" => text(
-                                            self.japanese_reasons,
-                                            "使用中",
-                                            "Open in a process",
-                                        ),
-                                        "not_seen_open" => text(
-                                            self.japanese_reasons,
-                                            "使用中のプロセスは見つかりません",
-                                            "No open process found",
-                                        ),
-                                        "unknown" => text(
-                                            self.japanese_reasons,
-                                            "使用状況を確認できません",
-                                            "Could not check open processes",
-                                        ),
-                                        _ => text(
-                                            self.japanese_reasons,
-                                            "使用状況は未確認",
-                                            "Open processes unchecked",
-                                        ),
-                                    };
-                                    let dates = format!(
-                                        "{} {} · {} {} · {} {} · {} {}",
-                                        text(self.japanese_reasons, "最終活動", "Latest activity"),
-                                        stale::date(Some(row.last_activity_at)),
-                                        text(self.japanese_reasons, "更新", "Modified"),
-                                        stale::date(row.modified_at),
-                                        text(self.japanese_reasons, "作成", "Created"),
-                                        stale::date(row.created_at),
-                                        text(self.japanese_reasons, "アクセス", "Accessed"),
-                                        stale::date(row.accessed_at),
-                                    );
-                                    ui.label(format!(
-                                        "{} · {dates} · {open}",
-                                        display_size(
-                                            &format!("{} logical", bytes(row.logical_bytes)),
-                                            self.japanese_reasons
-                                        )
-                                    ));
-                                    #[cfg(target_os = "macos")]
-                                    if ui
-                                        .button(if self.japanese_reasons {
-                                            "Finder で表示"
-                                        } else {
-                                            "Show in Finder"
-                                        })
-                                        .clicked()
-                                    {
-                                        if let Err(err) = open_in_finder(&row.native_path) {
-                                            state.error =
-                                                display_error(&err, self.japanese_reasons);
-                                        }
-                                    }
-                                    if ui
-                                        .button(text(
-                                            self.japanese_reasons,
-                                            "パスをコピー",
-                                            "Copy path",
-                                        ))
-                                        .clicked()
-                                    {
-                                        ctx.copy_text(row.path.clone());
-                                    }
-                                });
-                                ui.separator();
-                            }
-                        });
-                }
-            }
-            ui.label(text(
-                self.japanese_reasons,
-                "アクセス日時だけでは未使用と断定できません。内容と用途を確認してください。",
-                "Access dates can be incomplete. Check what a file is before removing it.",
-            ));
-            if !as_page {
-                close = ui
-                    .button(text(self.japanese_reasons, "閉じる", "Close"))
-                    .clicked();
-            }
-        };
-        let should_close = if let Some(ui) = page {
-            egui::Frame::NONE.show(ui, render);
-            false
-        } else {
-            egui::Modal::new(egui::Id::new("old-files"))
-                .show(ctx, render)
-                .should_close()
-        };
-        if close || should_close {
-            self.show_stale_files = false;
-        }
-        if start {
-            let (root, days, mib, sort) = (state.root.clone(), state.days, state.mib, state.sort);
-            state.report = None;
-            state.error.clear();
-            state.query.clear();
-            self.spawn(
-                ctx,
-                text(
-                    self.japanese_reasons,
-                    "古いファイルを検索中…",
-                    "Looking for old files…",
-                ),
-                false,
-                move || Outcome::Stale(stale::scan(root.as_deref(), days, mib, sort)),
-            );
         }
     }
 }
@@ -2489,6 +2195,9 @@ impl eframe::App for App {
                             },
                         );
                     });
+                    if let Some(progress) = &job.review_progress {
+                        ui.small(progress.label(self.japanese_reasons));
+                    }
                     if let Some(progress) = progress {
                         ui.label(if self.japanese_reasons {
                             format!(
@@ -2599,13 +2308,15 @@ mod tests {
         std::fs::write(root.join("small"), vec![2; 1024])?;
         let inventory = inventory::scan(&root, 2, None)?;
         let scan = Scan {
+            #[cfg(target_os = "macos")]
+            kept: Some(keep::KeepRules::default()),
             root: root.clone(),
             policy: Arc::new(super::super::artifacts::Policy {
                 roots: vec![],
                 outputs: vec![],
                 docker_context: None,
             }),
-            inventory,
+            directories: folder_index::Directories::from_inventory(&root, inventory),
             previous: None,
             recorded: false,
             files: vec![],
@@ -2642,6 +2353,7 @@ mod tests {
                 label: "Removing confirmed output",
                 removing: true,
                 progress: None,
+                review_progress: None,
             }),
             query: "keep this search".into(),
             marked: BTreeSet::from([PathBuf::from("confirmed-output")]),

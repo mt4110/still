@@ -108,10 +108,37 @@ pub(super) fn scan(
     min_mib: u64,
     sort: StaleSort,
 ) -> Result<Report> {
+    scan_scope(root, older_than_days, min_mib, sort, false)
+}
+
+#[cfg(all(feature = "desktop", any(target_os = "windows", target_os = "macos")))]
+pub(super) fn scan_personal(
+    root: Option<&Path>,
+    days: u16,
+    min_mib: u64,
+    sort: StaleSort,
+) -> Result<Report> {
+    scan_scope(root, days, min_mib, sort, true)
+}
+
+fn scan_scope(
+    root: Option<&Path>,
+    older_than_days: u16,
+    min_mib: u64,
+    sort: StaleSort,
+    personal: bool,
+) -> Result<Report> {
     let home = directories::BaseDirs::new().context("Could not locate your home directory")?;
     let home = home.home_dir().canonicalize()?;
     let cutoff = SystemTime::now() - Duration::from_secs(u64::from(older_than_days) * 86_400);
-    scan_under(&home, root.unwrap_or(&home), cutoff, min_mib, sort)
+    scan_under(
+        &home,
+        root.unwrap_or(&home),
+        cutoff,
+        min_mib,
+        sort,
+        personal,
+    )
 }
 
 fn scan_under(
@@ -120,10 +147,19 @@ fn scan_under(
     cutoff: SystemTime,
     min_mib: u64,
     sort: StaleSort,
+    personal: bool,
 ) -> Result<Report> {
     let root = inventory::home_scan_dir(home, root)?;
     if root.strip_prefix(home)?.iter().any(excluded) {
         bail!("Choose a folder under your home directory outside hidden or Library directories");
+    }
+    if personal
+        && root
+            .ancestors()
+            .take_while(|p| *p != home)
+            .any(build_output)
+    {
+        bail!("Choose a personal folder. Inspect generated output in Workspace.");
     }
     let minimum = min_mib
         .checked_mul(1024 * 1024)
@@ -136,7 +172,13 @@ fn scan_under(
         .standard_filters(false)
         .follow_links(false)
         .same_file_system(true)
-        .filter_entry(move |entry| entry.path() == scan_root || !excluded(entry.file_name()));
+        .filter_entry(move |entry| {
+            entry.path() == scan_root
+                || !(excluded(entry.file_name())
+                    || (personal
+                        && entry.file_type().is_some_and(|kind| kind.is_dir())
+                        && build_output(entry.path())))
+        });
     walker.build_parallel().run(|| {
         let matches = &matches;
         Box::new(move |item| {
@@ -287,6 +329,27 @@ pub(super) fn date(time: Option<chrono::DateTime<chrono::Utc>>) -> String {
     )
 }
 
+// Generic names such as target and dist also occur in personal folders.
+fn build_output(dir: &Path) -> bool {
+    let Some(parent) = dir.parent() else {
+        return false;
+    };
+    match dir.file_name().and_then(OsStr::to_str) {
+        Some("target") => {
+            parent.join("Cargo.toml").is_file()
+                || (dir.join("CACHEDIR.TAG").is_file() && dir.join(".rustc_info.json").is_file())
+        }
+        Some("dist" | "build") => {
+            parent.join("package.json").is_file()
+                || parent.join("CMakeLists.txt").is_file()
+                || parent.join("build.gradle").is_file()
+                || parent.join("build.gradle.kts").is_file()
+        }
+        Some("__pycache__") => true,
+        _ => false,
+    }
+}
+
 fn excluded(name: &OsStr) -> bool {
     name.to_string_lossy().starts_with('.')
         || name.eq_ignore_ascii_case("Library")
@@ -325,6 +388,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn personal_scan_skips_confirmed_project_outputs_but_keeps_other_targets() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let home = tmp.path().canonicalize()?;
+        for path in ["docs/target", "crate/target", "web/dist"] {
+            fs::create_dir_all(home.join(path))?;
+            fs::write(home.join(path).join("old.bin"), b"data")?;
+        }
+        fs::write(home.join("crate/Cargo.toml"), b"")?;
+        fs::write(home.join("web/package.json"), b"{}")?;
+        let cutoff = SystemTime::now() + Duration::from_secs(60);
+        let report = scan_under(&home, &home, cutoff, 0, StaleSort::Size, true)?;
+        let files: Vec<_> = report
+            .candidates
+            .iter()
+            .filter(|row| row.path.ends_with("old.bin"))
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert!(Path::new(&files[0].path).ends_with("docs/target/old.bin"));
+        assert!(scan_under(
+            &home,
+            &home.join("crate/target"),
+            cutoff,
+            0,
+            StaleSort::Size,
+            true
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[test]
     fn date_sort_includes_matches_outside_the_largest_hundred() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let home = tmp.path().canonicalize()?;
@@ -339,6 +433,7 @@ mod tests {
             SystemTime::now() + Duration::from_secs(60),
             0,
             StaleSort::Size,
+            false,
         )?;
         assert_eq!(report.omitted, 1);
         assert_eq!(report.candidates[0].logical_bytes, 101);
@@ -384,11 +479,19 @@ mod tests {
                 file.set_times(fs::FileTimes::new().set_accessed(new))?;
             }
         }
-        let report = scan_under(&home, &home, cutoff, 1, StaleSort::Size)?;
+        let report = scan_under(&home, &home, cutoff, 1, StaleSort::Size, false)?;
         let sizes: Vec<_> = report.candidates.iter().map(|r| r.logical_bytes).collect();
         assert_eq!(sizes, [3 * 1024 * 1024, 2 * 1024 * 1024]);
-        assert!(scan_under(&home, tmp.path(), cutoff, 1, StaleSort::Size).is_err());
-        assert!(scan_under(&home, &home.join("Library"), cutoff, 1, StaleSort::Size).is_err());
+        assert!(scan_under(&home, tmp.path(), cutoff, 1, StaleSort::Size, false).is_err());
+        assert!(scan_under(
+            &home,
+            &home.join("Library"),
+            cutoff,
+            1,
+            StaleSort::Size,
+            false
+        )
+        .is_err());
         assert_eq!(meaningful_date(Ok(UNIX_EPOCH)), None);
         assert_eq!(
             meaningful_date(Ok(UNIX_EPOCH + Duration::from_secs(1))),

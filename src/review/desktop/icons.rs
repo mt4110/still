@@ -11,6 +11,8 @@ pub(super) enum Icon {
     Docker,
     Folder,
     #[cfg(target_os = "macos")]
+    Lock,
+    #[cfg(target_os = "macos")]
     Sdk,
     #[cfg(target_os = "macos")]
     Clock,
@@ -75,6 +77,20 @@ pub(super) fn paint(ui: &egui::Ui, rect: egui::Rect, icon: Icon, color: egui::Co
                     egui::StrokeKind::Inside,
                 );
             }
+        }
+        #[cfg(target_os = "macos")]
+        Icon::Lock => {
+            painter.rect_stroke(
+                egui::Rect::from_min_max(at(0.29, 0.1), at(0.71, 0.65)),
+                4.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(at(0.12, 0.43), at(0.88, 0.94)),
+                2.0,
+                color,
+            );
         }
         Icon::Folder => {
             painter.line_segment([at(0.08, 0.24), at(0.41, 0.24)], stroke);

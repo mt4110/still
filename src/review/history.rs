@@ -1,7 +1,6 @@
 use super::{bytes, inventory, profile};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use directories::ProjectDirs;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -29,6 +28,34 @@ impl SnapshotHeader {
             bail!("History snapshot does not match this scan root or format version");
         }
         Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct SnapshotOutput<'a> {
+    header: SnapshotHeader,
+    directories: DirectoryObservations<'a>,
+}
+
+/// Serialize rows as they are visited, keeping the v1 snapshot format without
+/// allocating another vector of paths for the entire workspace.
+struct DirectoryObservations<'a> {
+    root: &'a Path,
+    rows: &'a [inventory::Row],
+}
+
+impl Serialize for DirectoryObservations<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeSeq};
+        let mut seq = serializer.serialize_seq(Some(self.rows.len()))?;
+        for row in self.rows {
+            let relative = row.path.strip_prefix(self.root).map_err(S::Error::custom)?;
+            seq.serialize_element(&(
+                NativePath::from(relative.as_os_str()),
+                Observed::from(&row.usage),
+            ))?;
+        }
+        seq.end()
     }
 }
 
@@ -127,6 +154,11 @@ impl Delta {
         }
     }
 
+    #[cfg(all(feature = "desktop", target_os = "macos"))]
+    pub fn is_partial(self) -> bool {
+        self.partial
+    }
+
     pub fn is_new(self) -> bool {
         matches!(self.direction, Direction::New)
     }
@@ -207,7 +239,7 @@ impl History {
     }
 
     fn in_directory(name: &str) -> Result<Self> {
-        let dirs = ProjectDirs::from("com", "antigravity", "still")
+        let dirs = crate::storage_paths::project_dirs()
             .context("Could not determine the still data directory")?;
         Ok(Self {
             directory: dirs.data_local_dir().join("review-history").join(name),
@@ -230,23 +262,16 @@ impl History {
     }
 
     pub fn record(&self, root: &Path, inventory: &inventory::Inventory) -> Result<()> {
-        let snapshot = ScanFile {
+        let snapshot = SnapshotOutput {
             header: SnapshotHeader {
                 version: VERSION,
                 root: NativePath::from(root.as_os_str()),
                 completed_at: Utc::now(),
             },
-            directories: inventory
-                .directories
-                .iter()
-                .map(|row| {
-                    let relative = row.path.strip_prefix(root)?;
-                    Ok((
-                        NativePath::from(relative.as_os_str()),
-                        Observed::from(&row.usage),
-                    ))
-                })
-                .collect::<Result<_>>()?,
+            directories: DirectoryObservations {
+                root,
+                rows: &inventory.directories,
+            },
         };
         fs::create_dir_all(&self.directory)?;
         let path = self.snapshot_path(root);

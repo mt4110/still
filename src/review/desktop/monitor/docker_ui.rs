@@ -81,16 +81,18 @@ fn matches(
     days: u16,
     now: DateTime<Utc>,
 ) -> bool {
-    let haystack =
-        format!("{} {} {} {}", item.name, item.id, item.status, item.detail).to_lowercase();
     let status = match filter {
         Filter::All => true,
         Filter::Reviewable => item.eligible,
         Filter::Stopped => matches!(item.status.as_str(), "exited" | "created"),
         Filter::Running => matches!(item.status.as_str(), "running" | "paused" | "restarting"),
     };
+    let query = query.to_lowercase();
     status
-        && haystack.contains(&query.to_lowercase())
+        && (query.is_empty()
+            || [&item.name, &item.id, &item.status, &item.detail]
+                .iter()
+                .any(|field| field.to_lowercase().contains(&query)))
         && (days == 0
             || activity(item).is_some_and(|time| time <= now - TimeDelta::days(i64::from(days))))
 }
@@ -136,7 +138,7 @@ fn selection_size(
     }
 }
 
-struct CacheOutputRow {
+pub(super) struct CacheOutputRow {
     id: String,
     reclaimable: String,
     size: String,
@@ -178,40 +180,51 @@ fn parse_cache_output(output: &str) -> (Vec<CacheOutputRow>, Option<String>, boo
     (rows, total, unrecognized)
 }
 
-fn cache_output_table(ui: &mut egui::Ui, output: &str, japanese: bool) {
-    let (rows, total, unrecognized) = parse_cache_output(output);
+type ParsedOutput = (Vec<CacheOutputRow>, Option<String>, bool);
+pub(super) struct CacheReceipt {
+    raw: storage::CacheCleanupResult,
+    parsed: ParsedOutput,
+}
+fn cache_output_table(ui: &mut egui::Ui, output: &str, parsed: &ParsedOutput, japanese: bool) {
+    let (rows, total, unrecognized) = parsed;
     if !rows.is_empty() {
         ui.label(if japanese {
             format!("Docker が報告した項目: {} 件", rows.len())
         } else {
             format!("{} records reported by Docker", rows.len())
         });
+        ui.small(text(
+            japanese,
+            "ID　／　回収可能　／　容量　／　最終使用",
+            "ID   /   Reclaimable   /   Size   /   Last used",
+        ));
         egui::ScrollArea::both()
             .id_salt("docker-cache-result-table")
             .max_height(220.0)
-            .show(ui, |ui| {
-                egui::Grid::new("docker-cache-result-grid")
-                    .striped(true)
-                    .spacing([20.0, 5.0])
-                    .show(ui, |ui| {
-                        ui.strong("ID");
-                        ui.strong(text(japanese, "回収可能", "Reclaimable"));
-                        ui.strong(text(japanese, "容量", "Size"));
-                        ui.strong(text(japanese, "最終使用", "Last accessed"));
-                        ui.end_row();
-                        for row in &rows {
-                            ui.monospace(&row.id);
-                            ui.label(if row.reclaimable == "true" {
-                                text(japanese, "はい", "Yes")
-                            } else {
-                                text(japanese, "いいえ", "No")
-                            });
-                            ui.label(&row.size);
-                            ui.label(&row.last_accessed);
-                            ui.end_row();
-                        }
-                    });
-            });
+            .show_rows(
+                ui,
+                ui.text_style_height(&egui::TextStyle::Body),
+                rows.len(),
+                |ui, range| {
+                    egui::Grid::new("docker-cache-result-grid")
+                        .min_col_width(68.0)
+                        .striped(true)
+                        .spacing([14.0, ui.spacing().item_spacing.y])
+                        .show(ui, |ui| {
+                            for row in &rows[range] {
+                                ui.monospace(&row.id);
+                                ui.label(if row.reclaimable == "true" {
+                                    text(japanese, "はい", "Yes")
+                                } else {
+                                    text(japanese, "いいえ", "No")
+                                });
+                                ui.label(&row.size);
+                                ui.label(&row.last_accessed);
+                                ui.end_row();
+                            }
+                        });
+                },
+            );
     }
     if let Some(total) = &total {
         ui.label(format!(
@@ -219,7 +232,7 @@ fn cache_output_table(ui: &mut egui::Ui, output: &str, japanese: bool) {
             text(japanese, "Docker の報告容量", "Docker reported")
         ));
     }
-    if unrecognized || (rows.is_empty() && total.is_none() && !output.trim().is_empty()) {
+    if *unrecognized || (rows.is_empty() && total.is_none() && !output.trim().is_empty()) {
         ui.label(text(
             japanese,
             "一部の出力を表にできませんでした。元の出力を確認してください。",
@@ -259,7 +272,15 @@ impl Panel {
         &mut self,
         receipt: storage::CacheCleanupResult,
     ) {
-        self.cache_receipt = Some(receipt);
+        let parsed = receipt
+            .result
+            .as_deref()
+            .map(parse_cache_output)
+            .unwrap_or_default();
+        self.cache_receipt = Some(CacheReceipt {
+            raw: receipt,
+            parsed,
+        });
         self.refresh_pending = true;
     }
     pub(in crate::review::desktop) fn set_review(&mut self, result: Result<storage::Review>) {
@@ -304,23 +325,54 @@ impl Panel {
         let mut context_changed = false;
         ui.horizontal(|ui| {
             ui.label(text(japanese, "ローカル接続先", "Local context"));
-            context_changed = ui
-                .add_enabled(
-                    !busy,
-                    controls::field(ui, &mut self.context)
-                        .desired_width(240.0)
-                        .hint_text(text(
-                            japanese,
-                            "現在の接続先（例 colima）",
-                            "Current context (e.g. colima)",
-                        )),
-                )
-                .changed();
+            if self.contexts.is_none() && self.context_job.is_none() {
+                self.load_contexts(ui.ctx());
+            }
+            let current = text(japanese, "現在の接続先", "Current context");
+            ui.add_enabled_ui(!busy, |ui| {
+                egui::ComboBox::from_id_salt("docker-context-selection")
+                    .selected_text(if self.context.is_empty() {
+                        current
+                    } else {
+                        &self.context
+                    })
+                    .show_ui(ui, |ui| {
+                        context_changed |= ui
+                            .selectable_value(&mut self.context, String::new(), current)
+                            .changed();
+                        if let Some(Ok(names)) = &self.contexts {
+                            for name in names {
+                                context_changed |= ui
+                                    .selectable_value(&mut self.context, name.clone(), name)
+                                    .changed();
+                            }
+                        }
+                    });
+                if ui
+                    .add_enabled(
+                        self.context_job.is_none(),
+                        egui::Button::new(text(japanese, "接続先を更新", "Refresh contexts")),
+                    )
+                    .clicked()
+                {
+                    self.load_contexts(ui.ctx());
+                }
+            });
             if self.docker_job.is_some() {
                 ui.spinner();
                 ui.label(text(japanese, "調査中…", "Inspecting…"));
             }
         });
+        if let Some(Err(error)) = &self.contexts {
+            ui.small(format!(
+                "{} · {error:#}",
+                text(
+                    japanese,
+                    "接続先を取得できません",
+                    "Could not list contexts"
+                )
+            ));
+        }
         if context_changed {
             self.docker = None;
             self.marked.clear();
@@ -330,7 +382,8 @@ impl Panel {
             self.docker_error.clear();
         }
         let mut dismiss_cache_receipt = false;
-        if let Some(receipt) = &self.cache_receipt {
+        if let Some(result) = &self.cache_receipt {
+            let receipt = &result.raw;
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.strong(text(
@@ -356,7 +409,7 @@ impl Panel {
                             "Docker の処理が完了しました。",
                             "Docker cleanup completed.",
                         ));
-                        cache_output_table(ui, output, japanese);
+                        cache_output_table(ui, output, &result.parsed, japanese);
                     }
                     Err(error) => {
                         ui.label(format!(
@@ -369,6 +422,7 @@ impl Panel {
                         ));
                     }
                 }
+                ui.small(vm_space_note(japanese));
                 if let (Some(before), Some(after)) = (receipt.before, receipt.after) {
                     ui.label(format!(
                         "{} {}{}",
@@ -449,8 +503,9 @@ impl Panel {
                     .selectable_value(
                         &mut self.kind,
                         index,
-                        format!("{} {}", super::kind_label(*kind, japanese), items.len()),
+                        format!("{} {} / {}", super::kind_label(*kind, japanese), items.len(), group_size(items, japanese)),
                     )
+                    .on_hover_text(text(japanese, "Docker の各行の報告容量の合計。共有レイヤーを含み、回収できる量とは異なります。", "Sum of reported sizes, including shared layers. Reclaimable space may differ."))
                     .changed()
                 {
                     self.marked.clear();
@@ -572,6 +627,7 @@ impl Panel {
         if previous != (self.query.clone(), self.filter, self.sort, self.age_days) {
             self.marked.clear();
         }
+        let now = Utc::now();
         let mut visible: Vec<_> = items
             .iter()
             .filter(|item| {
@@ -580,7 +636,7 @@ impl Panel {
                     &self.query,
                     if container { self.filter } else { Filter::All },
                     if container { self.age_days } else { 0 },
-                    Utc::now(),
+                    now,
                 )
             })
             .collect();
@@ -727,6 +783,8 @@ fn rows(
         },
         if kind == storage::Kind::Container {
             text(japanese, "最終停止／作成", "Stopped / created")
+        } else if kind == storage::Kind::Cache {
+            text(japanese, "最終使用", "Last used")
         } else {
             text(japanese, "参照・共有", "References / shared")
         },
@@ -825,9 +883,14 @@ fn rows(
                     ui.vertical(|ui| {
                         ui.set_width(widths[1]);
                         ui.spacing_mut().item_spacing.y = 2.0;
+                        let title = if kind == storage::Kind::Cache {
+                            cache_label(item, japanese).to_owned()
+                        } else {
+                            name(item)
+                        };
                         if controls::label(
                             ui,
-                            &name(item),
+                            &title,
                             15.0,
                             super::super::INK,
                             Align::Min,
@@ -839,7 +902,11 @@ fn rows(
                         }
                         controls::label(
                             ui,
-                            reason(kind, item, japanese),
+                            if kind == storage::Kind::Cache {
+                                &item.id
+                            } else {
+                                reason(kind, item, japanese)
+                            },
                             12.0,
                             MUTED,
                             Align::Min,
@@ -865,6 +932,12 @@ fn rows(
                         ui,
                         &if kind == storage::Kind::Container {
                             date(activity(item), japanese)
+                        } else if kind == storage::Kind::Cache {
+                            if item.last_used.is_empty() {
+                                text(japanese, "不明", "Unknown").to_owned()
+                            } else {
+                                item.last_used.clone()
+                            }
                         } else if !item.mounts.is_empty() {
                             item.mounts.clone()
                         } else {
@@ -915,7 +988,12 @@ fn inspector(
         return;
     };
     ui.add_space(8.0);
-    ui.label(RichText::new(name(item)).size(19.0).strong());
+    let title = if kind == storage::Kind::Cache {
+        cache_label(item, japanese).to_owned()
+    } else {
+        name(item)
+    };
+    ui.label(RichText::new(title).size(19.0).strong());
     ui.label(RichText::new(&item.size).size(24.0));
     ui.small(if kind == storage::Kind::Container {
         text(japanese, "コンテナの書込層", "Container writable layer")
@@ -975,6 +1053,39 @@ fn inspector(
     }
 }
 
+fn vm_space_note(japanese: bool) -> &'static str {
+    text(japanese, "Colima や Docker Desktop では、VM 内で解放した容量が Mac の空き容量に反映されるまで時間がかかる場合があります。仮想ディスクの縮小は VM の設定に依存します。", "Colima and Docker Desktop release space inside a VM. Mac free space can change later, depending on the VM’s disk reclamation settings.")
+}
+
+fn cache_label(item: &storage::Resource, japanese: bool) -> &str {
+    // Docker descriptions may contain a literal RUN command or build arguments.
+    // The projection returns only a recognized operation, never that raw text.
+    match item.operation.as_str() {
+        "pull" => return text(japanese, "取得済みイメージのレイヤー", "Pulled image layer"),
+        "run" => return text(japanese, "ビルドステップ (RUN)", "Build step (RUN)"),
+        "copy" | "add" => return text(japanese, "ビルド入力のコピー", "Copied build input"),
+        _ => {}
+    }
+    match item.name.as_str() {
+        "regular" => text(japanese, "ビルドレイヤー", "Build layer"),
+        "source.local" => text(japanese, "ローカルのビルド入力", "Local build input"),
+        "exec.cachemount" => text(japanese, "ビルド用キャッシュマウント", "Build cache mount"),
+        "source.git.checkout" => text(japanese, "Git チェックアウト", "Git checkout"),
+        "frontend" => text(japanese, "ビルドフロントエンド", "Build frontend"),
+        other => other,
+    }
+}
+
+fn group_size(items: &[storage::Resource], japanese: bool) -> String {
+    items
+        .iter()
+        .try_fold(0u64, |sum, row| {
+            sum.checked_add(storage::size_bytes(&row.size)?)
+        })
+        .map(bytes)
+        .unwrap_or_else(|| text(japanese, "容量不明", "Size unknown").to_owned())
+}
+
 fn show_receipt(
     ui: &mut egui::Ui,
     receipt: &storage::Receipt,
@@ -1022,11 +1133,7 @@ fn show_receipt(
                     .map(bytes)
                     .unwrap_or_else(|| text(japanese, "不明", "Unknown").into())
             ));
-            ui.small(text(
-                japanese,
-                "Docker VM 内の解放と Mac の SSD の空きは一致しない場合があります。",
-                "Space released inside the Docker VM may not match Mac SSD free space.",
-            ));
+            ui.small(vm_space_note(japanese));
             ui.collapsing(
                 text(japanese, "項目ごとの結果", "Individual results"),
                 |ui| {

@@ -9,6 +9,7 @@ mod policy;
 mod review;
 mod scan;
 mod scope;
+mod storage_paths;
 mod tui;
 
 use anyhow::Result;
@@ -139,7 +140,7 @@ pub fn run_cli() -> Result<()> {
             let rules_path = if let Some(path) = &args.rules {
                 Some(path.clone())
             } else {
-                directories::ProjectDirs::from("com", "antigravity", "still")
+                crate::storage_paths::project_dirs()
                     .map(|proj_dirs| proj_dirs.config_dir().join("rules.toml"))
             };
 
@@ -210,6 +211,8 @@ pub fn run_cli() -> Result<()> {
         Some(Commands::Kube(args)) => review::kube::run(args)?,
         Some(Commands::Stale(args)) => review::stale::run(args)?,
         Some(Commands::AppStorage(args)) => review::app_storage::run(args)?,
+        #[cfg(target_os = "macos")]
+        Some(Commands::StageCleanup(args)) => review::recover_stage(args)?,
         Some(Commands::CleanupHistory(args)) => review::cleanup_history::run(args)?,
         Some(Commands::Tui(args)) => {
             println!("Starting TUI with plan: {:?}", args.plan);
@@ -280,7 +283,7 @@ pub fn run_cli() -> Result<()> {
             println!("No command specified. Run with --help for usage.");
         }
         Some(Commands::Init) => {
-            if let Some(proj_dirs) = directories::ProjectDirs::from("com", "antigravity", "still") {
+            if let Some(proj_dirs) = crate::storage_paths::project_dirs() {
                 let config_dir = proj_dirs.config_dir();
                 if !config_dir.exists() {
                     std::fs::create_dir_all(config_dir)?;
