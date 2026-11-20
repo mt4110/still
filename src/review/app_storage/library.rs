@@ -15,8 +15,8 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(super) struct Bundle {
-    path: PathBuf,
-    running: bool,
+    pub(super) path: PathBuf,
+    pub(super) running: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -243,18 +243,21 @@ pub(super) fn match_bundles(rows: &mut [super::Row]) -> Result<()> {
         .collect();
     let mut bundles = BTreeMap::new();
     for group in ids.chunks(128) {
-        let json = command_output(
-            Command::new("/usr/bin/osascript")
-                .args(["-l", "JavaScript", "-e", include_str!("bundles.js"), "--"])
-                .args(group),
-            Duration::from_secs(8),
-        )?;
-        let matches: BTreeMap<String, Bundle> =
-            serde_json::from_str(&json).context("Invalid bundle inventory")?;
+        let matches = lookup_bundles(group)?;
         bundles.extend(matches);
     }
     apply_matches(rows, &bundles);
     Ok(())
+}
+
+pub(super) fn lookup_bundles(ids: &[String]) -> Result<BTreeMap<String, Bundle>> {
+    let json = command_output(
+        Command::new("/usr/bin/osascript")
+            .args(["-l", "JavaScript", "-e", include_str!("bundles.js"), "--"])
+            .args(ids),
+        Duration::from_secs(8),
+    )?;
+    serde_json::from_str(&json).context("Invalid bundle inventory")
 }
 
 fn apply_matches(rows: &mut [super::Row], bundles: &BTreeMap<String, Bundle>) {
@@ -281,6 +284,8 @@ mod tests {
         Row {
             label: directory.into(),
             path: None,
+            #[cfg(feature = "desktop")]
+            native_path: None,
             size_bytes: Some(0),
             size_basis: "allocated",
             partial: false,

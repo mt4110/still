@@ -1,3 +1,5 @@
+#[cfg(all(target_os = "macos", feature = "desktop"))]
+pub(super) mod known_cache;
 #[cfg(target_os = "macos")]
 mod library;
 #[cfg(all(target_os = "macos", any(test, feature = "desktop")))]
@@ -28,6 +30,9 @@ use serde::Serialize;
 pub(super) struct Row {
     pub label: String,
     pub path: Option<String>,
+    #[cfg(all(target_os = "macos", feature = "desktop"))]
+    #[serde(skip)]
+    pub native_path: Option<std::path::PathBuf>,
     pub size_bytes: Option<u64>,
     pub size_basis: &'static str,
     pub partial: bool,
@@ -259,6 +264,8 @@ mod mac {
                                 report.rows.push(Row {
                                     label,
                                     path: Some(inventory::display(&path)),
+                                    #[cfg(feature = "desktop")]
+                                    native_path: Some(path.clone()),
                                     size_bytes: Some(size),
                                     size_basis: "allocated",
                                     partial,
@@ -310,6 +317,8 @@ mod mac {
                     report.rows.push(Row {
                         label,
                         path: Some(inventory::display(&path)),
+                        #[cfg(feature = "desktop")]
+                        native_path: Some(path.clone()),
                         size_bytes: Some(root.usage.size()),
                         size_basis: if root.usage.allocated_bytes.is_some() {
                             "allocated"
@@ -423,6 +432,8 @@ mod mac {
             Row {
                 label: runtime.label(),
                 path: None,
+                #[cfg(feature = "desktop")]
+                native_path: None,
                 size_bytes: runtime.size_bytes,
                 size_basis: "reported by Xcode",
                 partial: false,
