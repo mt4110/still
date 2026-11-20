@@ -9,6 +9,7 @@ mod keep;
 #[cfg(target_os = "macos")]
 mod monitor;
 mod old_files;
+mod library_ui;
 #[cfg(target_os = "macos")]
 mod projects;
 mod scan;
@@ -304,6 +305,10 @@ enum Outcome {
     Stale(Result<stale::Report>),
     AppStorage(Result<app_storage::Report>),
     #[cfg(target_os = "macos")]
+    CachePrepared(Result<app_storage::known_cache::PreparedCache>),
+    #[cfg(target_os = "macos")]
+    CacheFinished(Result<library_ui::SavedReceipt>),
+    #[cfg(target_os = "macos")]
     SdkScan(Result<super::sdk_cleanup::Report>),
     #[cfg(target_os = "macos")]
     SdkRemoval(Result<super::sdk_cleanup::Receipt>),
@@ -402,6 +407,8 @@ struct App {
     browse_folders: bool,
     read_only_browse: bool,
     app_storage: Option<Result<app_storage::Report>>,
+    #[cfg(target_os = "macos")]
+    library_panel: library_ui::Panel,
     #[cfg(target_os = "macos")]
     sdk: sdk::Panel,
 }
@@ -509,7 +516,18 @@ impl App {
                     )
                 )
             }
-            Outcome::AppStorage(result) => self.app_storage = Some(result),
+            Outcome::AppStorage(result) => {
+                #[cfg(target_os = "macos")]
+                self.library_panel.scanned(&result);
+                self.app_storage = Some(result);
+            }
+            #[cfg(target_os = "macos")]
+            Outcome::CachePrepared(result) => self.library_panel.review = Some(result),
+            #[cfg(target_os = "macos")]
+            Outcome::CacheFinished(result) => {
+                self.app_storage = None;
+                self.library_panel.receipt = Some(result);
+            }
             #[cfg(target_os = "macos")]
             Outcome::SdkScan(result) => self.sdk.report = Some(result),
             #[cfg(target_os = "macos")]
@@ -1831,6 +1849,8 @@ impl App {
     fn dialogs(&mut self, ctx: &egui::Context) {
         #[cfg(target_os = "macos")]
         self.stage_dialog(ctx);
+        #[cfg(target_os = "macos")]
+        self.library_confirmation(ctx);
         if self.show_help {
             self.help_dialog(ctx);
         }
@@ -2063,163 +2083,7 @@ impl App {
         }
     }
 
-    fn app_storage_dialog(&mut self, ctx: &egui::Context, page: Option<&mut egui::Ui>) {
-        let busy = self.job.is_some();
-        let mut start = false;
-        let mut close = false;
-        let as_page = page.is_some();
-        #[cfg(target_os = "macos")]
-        let mut review_sdk = false;
-        let render = |ui: &mut egui::Ui| {
-            if !as_page {
-                ui.set_width((ctx.content_rect().width() - 80.0).clamp(590.0, 920.0));
-            }
-            ui.heading(text(
-                self.japanese_reasons,
-                "アプリと SDK の容量",
-                "App storage",
-            ));
-            ui.label(text(
-                self.japanese_reasons,
-                "SDK、ブラウザキャッシュ、アプリのデータを容量順に確認します。",
-                "Review SDKs, browser caches, and protected app data by size.",
-            ));
-            ui.label(text(
-                self.japanese_reasons,
-                "ホーム内の既知の場所から容量を調べます。この画面は確認専用です。",
-                "The scan reads metadata from known folders in your home. This view is read-only.",
-            ));
-            ui.add_enabled_ui(!busy, |ui| {
-                ui.checkbox(
-                    &mut self.xcode_runtimes,
-                    text(
-                        self.japanese_reasons,
-                        "Xcode のインストール済みランタイムも確認する",
-                        "Ask Xcode for installed simulator runtimes",
-                    ),
-                );
-                ui.checkbox(
-                    &mut self.library_inventory,
-                    text(
-                        self.japanese_reasons,
-                        "Library の主な保存先を確認する（時間がかかる場合があります）",
-                        "Inventory major Library folders (may take time)",
-                    ),
-                );
-                start = ui
-                    .button(text(self.japanese_reasons, "調べる", "Scan"))
-                    .clicked();
-                #[cfg(target_os = "macos")]
-                {
-                    review_sdk = ui
-                        .button(text(
-                            self.japanese_reasons,
-                            "Xcode と NDK を版ごとに確認…",
-                            "Review Xcode & NDK versions…",
-                        ))
-                        .clicked();
-                }
-            });
-            if busy && !as_page {
-                ui.spinner();
-            }
-            match &self.app_storage {
-                Some(Ok(report)) => {
-                    ui.label(if self.japanese_reasons {
-                        format!("{} 件", report.rows.len())
-                    } else {
-                        format!("{} items", report.rows.len())
-                    });
-                    egui::ScrollArea::vertical()
-                        .max_height(320.0)
-                        .show(ui, |ui| {
-                            for row in &report.rows {
-                                let size = row.size_bytes.map_or_else(|| "—".into(), bytes);
-                                let partial = if row.partial {
-                                    text(
-                                        self.japanese_reasons,
-                                        " · 一部を読み取れませんでした",
-                                        " · partial read",
-                                    )
-                                } else {
-                                    ""
-                                };
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{}  ·  {size} {}{partial}",
-                                        row.label,
-                                        size_basis(row.size_basis, self.japanese_reasons)
-                                    ))
-                                    .strong(),
-                                );
-                                if let Some(path) = &row.path {
-                                    ui.label(path);
-                                }
-                                ui.label(row.reason.text(self.japanese_reasons));
-                                #[cfg(target_os = "macos")]
-                                if let Some(evidence) = &row.library {
-                                    ui.small(evidence.activity_text(self.japanese_reasons));
-                                }
-                                ui.separator();
-                            }
-                            for note in &report.notes {
-                                ui.label(note);
-                            }
-                        });
-                }
-                Some(Err(error)) => {
-                    ui.label(format!(
-                        "{} · {error:#}",
-                        text(
-                            self.japanese_reasons,
-                            "容量を取得できませんでした",
-                            "Could not read storage usage"
-                        )
-                    ));
-                }
-                None => {}
-            }
-            if !as_page {
-                close = ui
-                    .button(text(self.japanese_reasons, "閉じる", "Close"))
-                    .clicked();
-            }
-        };
-        let should_close = if let Some(ui) = page {
-            egui::Frame::NONE.show(ui, render);
-            false
-        } else {
-            egui::Modal::new(egui::Id::new("app-storage"))
-                .show(ctx, render)
-                .should_close()
-        };
-        if close || should_close {
-            self.show_app_storage = false;
-        }
-        #[cfg(target_os = "macos")]
-        if review_sdk {
-            self.show_app_storage = false;
-            self.app_storage_selected = false;
-            self.navigate(shell::Screen::Apps);
-            self.sdk.open = true;
-            self.scan_sdks(ctx);
-        }
-        if start {
-            self.app_storage = None;
-            let xcode = self.xcode_runtimes;
-            let library = self.library_inventory;
-            self.spawn(
-                ctx,
-                text(
-                    self.japanese_reasons,
-                    "アプリの保存容量を調査中…",
-                    "Scanning app storage…",
-                ),
-                false,
-                move || Outcome::AppStorage(app_storage::desktop_scan(xcode, library)),
-            );
-        }
-    }
+
 }
 
 fn size_basis(basis: &str, japanese: bool) -> &str {
