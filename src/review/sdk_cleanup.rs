@@ -68,8 +68,127 @@ impl Review {
     }
 
     pub fn apply(self) -> Result<Receipt> {
-        let machine = Machine::open(&self.roots)?;
-        apply_selection(self, &machine)
+        let started = Utc::now();
+        let identifiers: Vec<_> = self
+            .items
+            .iter()
+            .map(|item| history_identifier(&item.target))
+            .collect();
+        let result = Machine::open(&self.roots).and_then(|machine| apply_selection(self, &machine));
+        let receipt = match result {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                #[cfg(not(test))]
+                {
+                    let targets = identifiers
+                        .iter()
+                        .map(|identifier| super::cleanup_history::OperationTarget {
+                            identifier: identifier.clone(),
+                            status: "held".into(),
+                            reason: Some("Preflight failed; no uninstall was started".into()),
+                            remaining_image_bytes: None,
+                        })
+                        .collect();
+                    if let Err(history_error) = super::cleanup_history::save_operation(
+                        started,
+                        None,
+                        None,
+                        super::cleanup_history::Operation {
+                            kind: "sdk_uninstall".into(),
+                            retention_days: None,
+                            targets,
+                        },
+                    ) {
+                        return Err(error.context(format!(
+                            "Could not save cleanup history: {history_error:#}"
+                        )));
+                    }
+                }
+                return Err(error);
+            }
+        };
+        #[cfg(not(test))]
+        let mut receipt = receipt;
+        #[cfg(not(test))]
+        {
+            let targets = history_targets(&identifiers, &receipt.results);
+            receipt.history_error = super::cleanup_history::save_operation(
+                started,
+                Some(receipt.before),
+                receipt.after.as_ref().ok().copied(),
+                super::cleanup_history::Operation {
+                    kind: "sdk_uninstall".into(),
+                    retention_days: None,
+                    targets,
+                },
+            )
+            .err()
+            .map(|error| format!("{error:#}"));
+        }
+        #[cfg(test)]
+        let _ = (started, identifiers);
+        Ok(receipt)
+    }
+}
+
+fn history_targets(
+    identifiers: &[String],
+    results: &[(String, Result<Removal>)],
+) -> Vec<super::cleanup_history::OperationTarget> {
+    identifiers
+        .iter()
+        .zip(results)
+        .map(|(identifier, (_, result))| {
+            use super::cleanup_history::OperationTarget;
+            let (status, reason, remaining_image_bytes) = match result {
+                Ok(Removal::Removed) => ("removed", None, None),
+                Ok(Removal::Partial { image_bytes }) => (
+                    "partial",
+                    Some("Runtime registration, path, or image remains".into()),
+                    *image_bytes,
+                ),
+                Ok(Removal::Unverified) => (
+                    "unverified",
+                    Some("Removal could not be verified".into()),
+                    None,
+                ),
+                Err(error) => {
+                    let reason = match error.to_string().as_str() {
+                        "Skipped because the previous removal was not confirmed" => {
+                            "Skipped because the previous removal was not confirmed"
+                        }
+                        "Use or installation changed after review" => {
+                            "Use or installation changed after review"
+                        }
+                        _ => "Operation failed or was held; details were not retained",
+                    };
+                    ("unverified", Some(reason.into()), None)
+                }
+            };
+            OperationTarget {
+                identifier: identifier.clone(),
+                status: status.into(),
+                reason,
+                remaining_image_bytes,
+            }
+        })
+        .collect()
+}
+
+fn history_identifier(target: &Target) -> String {
+    let safe = |value: &str| {
+        value.len() <= 80
+            && value
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'))
+    };
+    match target {
+        Target::Runtime { image, .. } => format!("Xcode runtime image {image}"),
+        Target::ResidualRuntime { build, .. } if safe(build) => {
+            format!("Xcode runtime build {build}")
+        }
+        Target::Ndk { version, .. } if safe(version) => format!("Android NDK {version}"),
+        _ => "SDK version (identifier unavailable)".into(),
     }
 }
 
@@ -77,6 +196,7 @@ pub(super) struct Receipt {
     pub before: u64,
     pub after: Result<u64>,
     pub results: Vec<(String, Result<Removal>)>,
+    pub history_error: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -126,6 +246,7 @@ fn apply_selection(review: Review, machine: &impl Backend) -> Result<Receipt> {
         before,
         after: machine.free(),
         results,
+        history_error: None,
     })
 }
 
@@ -1015,6 +1136,37 @@ fn missing(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_keeps_partial_and_unverified_results_without_error_contents() -> Result<()> {
+        let ids = vec!["one".into(), "two".into(), "three".into(), "four".into()];
+        let results = vec![
+            ("ignored".into(), Ok(Removal::Removed)),
+            (
+                "ignored".into(),
+                Ok(Removal::Partial {
+                    image_bytes: Some(123),
+                }),
+            ),
+            ("ignored".into(), Ok(Removal::Unverified)),
+            ("ignored".into(), Err(anyhow::anyhow!("secret-detail"))),
+        ];
+        let targets = history_targets(&ids, &results);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.status.as_str())
+                .collect::<Vec<_>>(),
+            ["removed", "partial", "unverified", "unverified"]
+        );
+        assert_eq!(targets[1].remaining_image_bytes, Some(123));
+        assert_eq!(
+            targets[1].reason.as_deref(),
+            Some("Runtime registration, path, or image remains")
+        );
+        assert!(!serde_json::to_string(&targets)?.contains("secret-detail"));
+        Ok(())
+    }
     use std::cell::RefCell;
     use std::collections::VecDeque;
 

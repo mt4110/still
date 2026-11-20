@@ -16,9 +16,14 @@ pub(super) struct Item {
     pub path: PathBuf,
     pub producer: String,
     pub logical_bytes: u64,
+    /// Allocated size from the earlier workspace scan, not a deletion-time measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scanned_allocated_bytes: Option<u64>,
     pub status: String,
     pub reason: Option<String>,
     pub original_path_exists: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_path_checked_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -29,7 +34,55 @@ pub(super) struct Record {
     pub completed_at: DateTime<Utc>,
     pub available_before: Option<u64>,
     pub available_after: Option<u64>,
+    /// Workspace keep rules observed at the start; absent means not observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept_paths_at_start: Option<Vec<PathBuf>>,
     pub items: Vec<Item>,
+    /// Non-filesystem operations use their own typed targets rather than fake paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct Operation {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u16>,
+    pub targets: Vec<OperationTarget>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct OperationTarget {
+    pub identifier: String,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_image_bytes: Option<u64>,
+}
+
+#[cfg(all(not(test), feature = "desktop", target_os = "macos"))]
+pub(super) fn save_operation(
+    started_at: DateTime<Utc>,
+    before: Option<u64>,
+    after: Option<u64>,
+    operation: Operation,
+) -> Result<()> {
+    let home = directories::BaseDirs::new()
+        .context("Could not locate home volume")?
+        .home_dir()
+        .to_owned();
+    save(&Record {
+        version: 1,
+        root: home,
+        started_at,
+        completed_at: Utc::now(),
+        available_before: before,
+        available_after: after,
+        kept_paths_at_start: None,
+        items: Vec::new(),
+        operation: Some(operation),
+    })
 }
 
 fn directory() -> Result<PathBuf> {
@@ -117,11 +170,13 @@ fn last_measurement_in(directory: &Path, root: &Path) -> Result<Option<(u64, u64
         root: PathBuf,
         available_before: Option<u64>,
         available_after: Option<u64>,
+        #[serde(default)]
+        operation: Option<serde_json::Value>,
     }
     for path in newest_paths(directory)? {
         let measurement: Measurement =
             serde_json::from_reader(BufReader::new(fs::File::open(path)?))?;
-        if measurement.root == root {
+        if measurement.root == root && measurement.operation.is_none() {
             anyhow::ensure!(
                 measurement.version == 1,
                 "Unsupported cleanup history version"
@@ -148,6 +203,12 @@ pub fn run(args: &CleanupHistoryArgs) -> Result<()> {
                     "  Free bytes: {:?} → {:?} (whole-volume observation)",
                     record.available_before, record.available_after
                 );
+                if let Some(paths) = &record.kept_paths_at_start {
+                    println!("  Keep rules at start: {}", paths.len());
+                    for path in paths {
+                        println!("    {}", path.display());
+                    }
+                }
                 for item in record.items {
                     println!(
                         "  {} · {} · {} logical bytes · {}",
@@ -160,6 +221,30 @@ pub fn run(args: &CleanupHistoryArgs) -> Result<()> {
                         println!("    {reason}");
                     }
                     println!("    Original path exists: {:?}", item.original_path_exists);
+                    if item.original_path_exists == Some(true) && item.status == "removed" {
+                        println!("    The path may have been recreated after removal.");
+                    }
+                    if let Some(bytes) = item.scanned_allocated_bytes {
+                        println!("    Allocated bytes from earlier scan: {bytes}");
+                    }
+                    if let Some(time) = item.original_path_checked_at {
+                        println!("    Original path checked at: {time}");
+                    }
+                }
+                if let Some(operation) = record.operation {
+                    println!("  Operation: {}", operation.kind);
+                    if let Some(days) = operation.retention_days {
+                        println!("  Retention: {days} days");
+                    }
+                    for target in operation.targets {
+                        println!("  {} · {}", target.status, target.identifier);
+                        if let Some(reason) = target.reason {
+                            println!("    {reason}");
+                        }
+                        if let Some(bytes) = target.remaining_image_bytes {
+                            println!("    Remaining image bytes: {bytes}");
+                        }
+                    }
                 }
             }
         }
@@ -180,14 +265,18 @@ mod tests {
             completed_at: Utc::now(),
             available_before: Some(10),
             available_after: Some(20),
+            kept_paths_at_start: Some(vec!["/tmp/project/keep".into()]),
             items: vec![Item {
                 path: "/tmp/project/target".into(),
                 producer: "Cargo".into(),
                 logical_bytes: 42,
+                scanned_allocated_bytes: Some(32),
                 status: "incomplete".into(),
                 reason: Some("could not verify".into()),
                 original_path_exists: None,
+                original_path_checked_at: Some(Utc::now()),
             }],
+            operation: None,
         };
         save_in(dir.path(), &record)?;
         assert_eq!(
@@ -202,7 +291,61 @@ mod tests {
             Some("could not verify")
         );
         assert_eq!(records[0].items[0].original_path_exists, None);
+        assert_eq!(records[0].items[0].scanned_allocated_bytes, Some(32));
         assert_eq!(load_from(dir.path(), 0)?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_history_written_before_optional_observation_fields() -> Result<()> {
+        let record: Record = serde_json::from_str(
+            r#"{
+            "version":1,"root":"/tmp/project",
+            "started_at":"2026-01-01T00:00:00Z",
+            "completed_at":"2026-01-01T00:01:00Z",
+            "available_before":1,"available_after":2,
+            "items":[{"path":"/tmp/project/target","producer":"Cargo",
+              "logical_bytes":42,"status":"removed","reason":null,
+              "original_path_exists":false}]
+        }"#,
+        )?;
+        assert_eq!(record.items[0].scanned_allocated_bytes, None);
+        assert_eq!(record.items[0].original_path_checked_at, None);
+        assert!(record.kept_paths_at_start.is_none());
+        assert!(record.operation.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn operation_history_round_trips_without_confusing_workspace_measurements() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let home = PathBuf::from("/tmp/fixture-home");
+        let record = Record {
+            version: 1,
+            root: home.clone(),
+            started_at: Utc::now(),
+            completed_at: Utc::now(),
+            available_before: Some(10),
+            available_after: Some(20),
+            kept_paths_at_start: None,
+            items: Vec::new(),
+            operation: Some(Operation {
+                kind: "sdk_uninstall".into(),
+                retention_days: None,
+                targets: vec![OperationTarget {
+                    identifier: "runtime".into(),
+                    status: "partial".into(),
+                    reason: Some("Runtime image remains".into()),
+                    remaining_image_bytes: Some(100),
+                }],
+            }),
+        };
+        save_in(dir.path(), &record)?;
+        let loaded = load_from(dir.path(), 1)?;
+        let target = &loaded[0].operation.as_ref().unwrap().targets[0];
+        assert_eq!(target.status, "partial");
+        assert_eq!(target.remaining_image_bytes, Some(100));
+        assert!(last_measurement_in(dir.path(), &home)?.is_none());
         Ok(())
     }
 }

@@ -275,6 +275,12 @@ impl Confirmation {
 
     pub fn remove(self, root: &Path) -> CleanupReceipt {
         let started_at = chrono::Utc::now();
+        #[cfg(target_os = "macos")]
+        let kept_paths_at_start = super::keep::KeepRules::load()
+            .ok()
+            .map(|rules| rules.relevant_to(root));
+        #[cfg(not(target_os = "macos"))]
+        let kept_paths_at_start = None;
         let before = super::super::filesystem::available(root);
         let outcomes = run_in_pairs(&self.items, |item| {
             let result = self
@@ -290,8 +296,9 @@ impl Confirmation {
         let items = self
             .items
             .iter()
+            .zip(&self.totals)
             .zip(&outcomes)
-            .map(|(item, (_, result))| {
+            .map(|((item, summary), (_, result))| {
                 let original_path_exists = match std::fs::symlink_metadata(&item.path) {
                     Ok(_) => Some(true),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(false),
@@ -301,6 +308,7 @@ impl Confirmation {
                     path: item.path.clone(),
                     producer: item.producer.reason().to_owned(),
                     logical_bytes: item.logical_bytes(),
+                    scanned_allocated_bytes: summary.scanned_allocated,
                     status: if result.is_ok() {
                         "removed"
                     } else {
@@ -309,16 +317,19 @@ impl Confirmation {
                     .into(),
                     reason: result.as_ref().err().map(ToString::to_string),
                     original_path_exists,
+                    original_path_checked_at: Some(chrono::Utc::now()),
                 }
             })
             .collect();
         let record = cleanup_history::Record {
+            operation: None,
             version: 1,
             root: root.to_owned(),
             started_at,
             completed_at: chrono::Utc::now(),
             available_before: before,
             available_after: after,
+            kept_paths_at_start,
             items,
         };
         #[cfg(not(test))]

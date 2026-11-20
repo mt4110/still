@@ -102,13 +102,19 @@ struct Matches {
     unknown_age: usize,
 }
 
+#[derive(Clone, Copy)]
+enum ScanMode {
+    Cli,
+    Personal { include_outputs: bool },
+}
+
 pub(super) fn scan(
     root: Option<&Path>,
     older_than_days: u16,
     min_mib: u64,
     sort: StaleSort,
 ) -> Result<Report> {
-    scan_scope(root, older_than_days, min_mib, sort, false)
+    scan_scope(root, older_than_days, min_mib, sort, ScanMode::Cli)
 }
 
 #[cfg(all(feature = "desktop", any(target_os = "windows", target_os = "macos")))]
@@ -117,8 +123,15 @@ pub(super) fn scan_personal(
     days: u16,
     min_mib: u64,
     sort: StaleSort,
+    include_outputs: bool,
 ) -> Result<Report> {
-    scan_scope(root, days, min_mib, sort, true)
+    scan_scope(
+        root,
+        days,
+        min_mib,
+        sort,
+        ScanMode::Personal { include_outputs },
+    )
 }
 
 fn scan_scope(
@@ -126,19 +139,12 @@ fn scan_scope(
     older_than_days: u16,
     min_mib: u64,
     sort: StaleSort,
-    personal: bool,
+    mode: ScanMode,
 ) -> Result<Report> {
     let home = directories::BaseDirs::new().context("Could not locate your home directory")?;
     let home = home.home_dir().canonicalize()?;
     let cutoff = SystemTime::now() - Duration::from_secs(u64::from(older_than_days) * 86_400);
-    scan_under(
-        &home,
-        root.unwrap_or(&home),
-        cutoff,
-        min_mib,
-        sort,
-        personal,
-    )
+    scan_under(&home, root.unwrap_or(&home), cutoff, min_mib, sort, mode)
 }
 
 fn scan_under(
@@ -147,13 +153,19 @@ fn scan_under(
     cutoff: SystemTime,
     min_mib: u64,
     sort: StaleSort,
-    personal: bool,
+    mode: ScanMode,
 ) -> Result<Report> {
+    let exclude_outputs = matches!(
+        mode,
+        ScanMode::Personal {
+            include_outputs: false
+        }
+    );
     let root = inventory::home_scan_dir(home, root)?;
     if root.strip_prefix(home)?.iter().any(excluded) {
         bail!("Choose a folder under your home directory outside hidden or Library directories");
     }
-    if personal
+    if exclude_outputs
         && root
             .ancestors()
             .take_while(|p| *p != home)
@@ -172,13 +184,7 @@ fn scan_under(
         .standard_filters(false)
         .follow_links(false)
         .same_file_system(true)
-        .filter_entry(move |entry| {
-            entry.path() == scan_root
-                || !(excluded(entry.file_name())
-                    || (personal
-                        && entry.file_type().is_some_and(|kind| kind.is_dir())
-                        && build_output(entry.path())))
-        });
+        .filter_entry(move |entry| entry.path() == scan_root || !excluded(entry.file_name()));
     walker.build_parallel().run(|| {
         let matches = &matches;
         Box::new(move |item| {
@@ -189,6 +195,16 @@ fn scan_under(
             #[cfg(windows)]
             if entry.file_type().is_some_and(|kind| kind.is_dir())
                 && fs::symlink_metadata(entry.path()).is_ok_and(|meta| inventory::is_link(&meta))
+            {
+                return WalkState::Skip;
+            }
+            // Marker checks can block on filesystem metadata. Perform them on
+            // the distributed directory workers rather than serially while a
+            // parent directory is scheduling all of its children.
+            if exclude_outputs
+                && entry.depth() != 0
+                && entry.file_type().is_some_and(|kind| kind.is_dir())
+                && build_output(entry.path())
             {
                 return WalkState::Skip;
             }
@@ -246,11 +262,17 @@ fn scan_under(
         unknown_age,
     } = matches.into_inner().unwrap();
     let ranked = ranked.map(BinaryHeap::into_sorted_vec);
-    let open_states: HashMap<_, _> = ranked[sort as usize]
-        .iter()
-        .take(20)
-        .map(|(_, _, _, path, _)| (path.clone(), open_state(path.clone())))
-        .collect();
+    // A separate lsof per candidate delays results. The GUI reports that
+    // open state was unchecked instead of waiting for those calls.
+    let open_states: HashMap<_, _> = if matches!(mode, ScanMode::Personal { .. }) {
+        HashMap::new()
+    } else {
+        ranked[sort as usize]
+            .iter()
+            .take(20)
+            .map(|(_, _, _, path, _)| (path.clone(), open_state(path.clone())))
+            .collect()
+    };
     let mut alternate_orders = ranked.map(|rows| {
         rows.into_iter()
             .map(|(_, Reverse(size), activity, path, dates)| Candidate {
@@ -391,20 +413,37 @@ mod tests {
     fn personal_scan_skips_confirmed_project_outputs_but_keeps_other_targets() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let home = tmp.path().canonicalize()?;
-        for path in ["docs/target", "crate/target", "web/dist"] {
+        for path in [
+            "docs/target",
+            "crate/target",
+            "web/dist",
+            ".hidden",
+            "node_modules",
+            "Library",
+        ] {
             fs::create_dir_all(home.join(path))?;
             fs::write(home.join(path).join("old.bin"), b"data")?;
         }
         fs::write(home.join("crate/Cargo.toml"), b"")?;
         fs::write(home.join("web/package.json"), b"{}")?;
         let cutoff = SystemTime::now() + Duration::from_secs(60);
-        let report = scan_under(&home, &home, cutoff, 0, StaleSort::Size, true)?;
+        let report = scan_under(
+            &home,
+            &home,
+            cutoff,
+            0,
+            StaleSort::Size,
+            ScanMode::Personal {
+                include_outputs: false,
+            },
+        )?;
         let files: Vec<_> = report
             .candidates
             .iter()
             .filter(|row| row.path.ends_with("old.bin"))
             .collect();
         assert_eq!(files.len(), 1);
+        assert_eq!(files[0].open_state, "not_checked");
         assert!(Path::new(&files[0].path).ends_with("docs/target/old.bin"));
         assert!(scan_under(
             &home,
@@ -412,9 +451,48 @@ mod tests {
             cutoff,
             0,
             StaleSort::Size,
-            true
+            ScanMode::Personal {
+                include_outputs: false
+            }
         )
         .is_err());
+        let included = scan_under(
+            &home,
+            &home,
+            cutoff,
+            0,
+            StaleSort::Size,
+            ScanMode::Personal {
+                include_outputs: true,
+            },
+        )?;
+        let files: Vec<_> = included
+            .candidates
+            .iter()
+            .filter(|row| row.path.ends_with("old.bin"))
+            .collect();
+        assert_eq!(files.len(), 3);
+        assert!(files.iter().all(|row| row.open_state == "not_checked"));
+        let cli = scan_under(&home, &home, cutoff, 0, StaleSort::Size, ScanMode::Cli)?;
+        let included_paths: std::collections::BTreeSet<_> = included
+            .candidates
+            .iter()
+            .map(|row| row.path.as_str())
+            .collect();
+        let cli_paths: std::collections::BTreeSet<_> =
+            cli.candidates.iter().map(|row| row.path.as_str()).collect();
+        assert_eq!(included_paths, cli_paths);
+        let selected = scan_under(
+            &home,
+            &home.join("crate/target"),
+            cutoff,
+            0,
+            StaleSort::Size,
+            ScanMode::Personal {
+                include_outputs: true,
+            },
+        )?;
+        assert_eq!(selected.candidates.len(), 1);
         Ok(())
     }
 
@@ -433,7 +511,7 @@ mod tests {
             SystemTime::now() + Duration::from_secs(60),
             0,
             StaleSort::Size,
-            false,
+            ScanMode::Cli,
         )?;
         assert_eq!(report.omitted, 1);
         assert_eq!(report.candidates[0].logical_bytes, 101);
@@ -479,17 +557,17 @@ mod tests {
                 file.set_times(fs::FileTimes::new().set_accessed(new))?;
             }
         }
-        let report = scan_under(&home, &home, cutoff, 1, StaleSort::Size, false)?;
+        let report = scan_under(&home, &home, cutoff, 1, StaleSort::Size, ScanMode::Cli)?;
         let sizes: Vec<_> = report.candidates.iter().map(|r| r.logical_bytes).collect();
         assert_eq!(sizes, [3 * 1024 * 1024, 2 * 1024 * 1024]);
-        assert!(scan_under(&home, tmp.path(), cutoff, 1, StaleSort::Size, false).is_err());
+        assert!(scan_under(&home, tmp.path(), cutoff, 1, StaleSort::Size, ScanMode::Cli).is_err());
         assert!(scan_under(
             &home,
             &home.join("Library"),
             cutoff,
             1,
             StaleSort::Size,
-            false
+            ScanMode::Cli
         )
         .is_err());
         assert_eq!(meaningful_date(Ok(UNIX_EPOCH)), None);

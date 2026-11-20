@@ -32,6 +32,8 @@ pub(super) struct Panel {
     context_job: Option<Receiver<Result<Vec<String>>>>,
     contexts: Option<Result<Vec<String>>>,
     docker_job: Option<Receiver<Result<storage::Report>>>,
+    observation_jobs: Vec<Receiver<Result<()>>>,
+    observation_result: Option<Result<()>>,
     docker: Option<Result<Arc<storage::Report>>>,
     marked: BTreeSet<String>,
     review: Option<storage::Review>,
@@ -238,7 +240,15 @@ impl Panel {
         self.reset_disk();
     }
 
-    fn poll(&mut self, ctx: &egui::Context) {
+    pub(super) fn observation_pending(&self) -> bool {
+        !self.observation_jobs.is_empty()
+    }
+
+    pub(super) fn observation_failed(&self) -> bool {
+        self.observation_result.as_ref().is_some_and(Result::is_err)
+    }
+
+    pub(super) fn poll(&mut self, ctx: &egui::Context) {
         if let Some(job) = &self.disk_job {
             match job.try_recv() {
                 Ok(result) => {
@@ -299,7 +309,26 @@ impl Panel {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if self.disk_job.is_some() || self.docker_job.is_some() {
+        let mut pending = Vec::new();
+        for job in self.observation_jobs.drain(..) {
+            let result = match job.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(anyhow::anyhow!("Docker observation interrupted")))
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    pending.push(job);
+                    None
+                }
+            };
+            if let Some(result) = result {
+                if result.is_err() || self.observation_result.is_none() {
+                    self.observation_result = Some(result);
+                }
+            }
+        }
+        self.observation_jobs = pending;
+        if self.disk_job.is_some() || self.docker_job.is_some() || self.observation_pending() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -350,10 +379,24 @@ impl Panel {
         self.selected = None;
         let context = self.context.clone();
         let (tx, rx) = mpsc::channel();
+        let (observation_tx, observation_rx) = mpsc::channel();
         self.docker_job = Some(rx);
+        self.observation_jobs.push(observation_rx);
+        self.observation_result = None;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(storage::inspect(&context));
+            let result = storage::inspect(&context);
+            let request = result
+                .as_ref()
+                .ok()
+                .and_then(|report| report.observation_request());
+            let _ = tx.send(result);
+            ctx.request_repaint();
+            if let Some(request) = request {
+                let _ = observation_tx.send(request.record());
+            } else {
+                let _ = observation_tx.send(Err(anyhow::anyhow!("Docker inventory unavailable")));
+            }
             ctx.request_repaint();
         });
     }

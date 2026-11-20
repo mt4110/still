@@ -60,6 +60,15 @@ impl KeepRules {
             .map(PathBuf::as_path)
     }
 
+    /// Snapshot only the rules that can protect this workspace or its contents.
+    pub(super) fn relevant_to(&self, root: &Path) -> Vec<PathBuf> {
+        self.paths
+            .iter()
+            .filter(|path| path.starts_with(root) || root.starts_with(path))
+            .cloned()
+            .collect()
+    }
+
     pub(super) fn reason(&self, path: &Path) -> Option<Message> {
         let kept = display(self.conflict(path)?);
         Some(Message::new(
@@ -115,6 +124,11 @@ mod tests {
         let kept = output.join("debug/incremental");
         KeepRules::update_in(&file, &kept, true)?;
         let rules = KeepRules::read(&file)?;
+        assert_eq!(
+            rules.relevant_to(Path::new("/workspace/demo")),
+            vec![kept.clone()]
+        );
+        assert!(rules.relevant_to(Path::new("/workspace/other")).is_empty());
         for path in [output, kept.as_path(), &kept.join("part")] {
             assert_eq!(rules.conflict(path), Some(kept.as_path()));
         }

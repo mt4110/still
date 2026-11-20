@@ -71,6 +71,7 @@ pub(super) struct Projects {
     focused: Option<PathBuf>,
     query: String,
     by_candidate: bool,
+    confirm_bulk: bool,
     pub(super) active: bool,
 }
 
@@ -135,7 +136,7 @@ fn candidate_header(ui: &mut egui::Ui, japanese: bool) {
     let status_width = if width >= 460. { 92. } else { 64. };
     let name_width = (width
         - super::controls::HEIGHT
-        - 82.
+        - 110.
         - status_width
         - 3. * header.spacing().item_spacing.x)
         .max(40.);
@@ -149,7 +150,7 @@ fn candidate_header(ui: &mut egui::Ui, japanese: bool) {
         );
         for (label, width, align) in [
             (text(japanese, "項目", "Item"), name_width, Align::Min),
-            (text(japanese, "サイズ", "Size"), 82., Align::Max),
+            (text(japanese, "サイズ", "Size"), 110., Align::Max),
             (text(japanese, "状態", "Status"), status_width, Align::Min),
         ] {
             super::controls::cell(ui, width, 28., align, |ui| {
@@ -162,6 +163,7 @@ fn candidate_header(ui: &mut egui::Ui, japanese: bool) {
 #[derive(Default)]
 struct InspectorActions {
     inspect: Option<PathBuf>,
+    show_parts: Option<PathBuf>,
     finder_error: Option<String>,
     keep: Option<(PathBuf, bool)>,
 }
@@ -199,6 +201,9 @@ fn candidate_inspector(
                 if let Some(count) = project.reviewable_cargo_parts.get(path) {
                     ui.label(if japanese { format!("全体の削除は保留です。下位の {count} 件は個別に確認できます。") }
                         else { format!("Whole-target removal is on hold. {count} subfolders can be reviewed individually.") });
+                    if super::controls::button(ui, text(japanese, "この下の候補を表示", "Show candidates inside"), false, true).clicked() {
+                        actions.show_parts = Some(path.clone());
+                    }
                 }
             } else {
                 ui.label(text(japanese, "確認できる掃除候補です。", "Available for cleanup review."));
@@ -240,6 +245,20 @@ fn candidate_inspector(
 }
 
 impl Projects {
+    fn bulk_breakdown(&self) -> Vec<(&Project, usize)> {
+        self.rows
+            .iter()
+            .filter_map(|project| {
+                let count = self
+                    .bulk_paths
+                    .range(project.path.clone()..)
+                    .take_while(|path| path.starts_with(&project.path))
+                    .count();
+                (count > 0).then_some((project, count))
+            })
+            .collect()
+    }
+
     pub(super) fn from_scan(scan: &Scan) -> Self {
         let mut projects: BTreeMap<_, _> = scan
             .directories
@@ -538,7 +557,7 @@ impl App {
                         let status_width = if width >= 460. { 92. } else { 64. };
                         let name_width = (width
                             - super::controls::HEIGHT
-                            - 82.
+                            - 110.
                             - status_width
                             - 3. * row.spacing().item_spacing.x)
                             .max(40.);
@@ -614,10 +633,10 @@ impl App {
                                 },
                             );
                             ui.allocate_ui_with_layout(
-                                egui::vec2(82., 42.),
+                                egui::vec2(110., 42.),
                                 egui::Layout::right_to_left(Align::Center),
                                 |ui| {
-                                    ui.set_width(82.);
+                                    ui.set_width(110.);
                                     super::controls::label(
                                         ui,
                                         &bytes(c.row.usage.size()),
@@ -765,6 +784,11 @@ impl App {
         if let Some(error) = actions.finder_error {
             self.status = error;
         }
+        if let Some(path) = actions.show_parts {
+            self.projects.query = display(&path);
+            self.projects.focused = None;
+            ui.ctx().request_repaint();
+        }
         if !missing.is_empty() {
             let scan = self.scan.as_mut().unwrap();
             scan.files.retain(|c| !missing.contains(&c.row.path));
@@ -832,7 +856,7 @@ impl App {
                         "Largest increase since last scan"
                     ),
                     name(&p.path),
-                    delta.label()
+                    delta.localized_label(self.japanese_reasons)
                 ))
                 .color(ACCENT),
             );
@@ -871,7 +895,7 @@ impl App {
                 )
                 .clicked()
                 {
-                    self.marked.clone_from(&self.projects.bulk_paths);
+                    self.projects.confirm_bulk = true;
                 }
             } else {
                 if ui
@@ -894,6 +918,52 @@ impl App {
                 .clicked();
             }
         });
+        ui.small(text(
+            japanese,
+            "選択だけでは削除されません。確認画面で内容を確認できます。",
+            "Selecting items does not delete them. Review the details on the next screen.",
+        ));
+        if self.projects.confirm_bulk {
+            let mut select = false;
+            let mut cancel = false;
+            let dialog = egui::Modal::new(egui::Id::new("confirm-project-bulk-selection"))
+                .frame(super::modal_frame(ui.ctx()))
+                .show(ui.ctx(), |ui| {
+                    ui.set_width((ui.ctx().content_rect().width() - 64.0).clamp(200.0, 720.0));
+                    ui.heading(text(japanese, "掃除候補をまとめて選択しますか？", "Select all cleanup candidates?"));
+                    ui.label(if japanese {
+                        format!("全プロジェクトの {} 件 · 見込み {}", self.projects.bulk_paths.len(), bytes(self.projects.reclaim))
+                    } else {
+                        format!("{} items across projects · estimated {}", self.projects.bulk_paths.len(), bytes(self.projects.reclaim))
+                    });
+                    ui.label(text(japanese, "この操作では削除されません。プロジェクトを開いて個別に選ぶこともできます。", "This only selects items; nothing is deleted. You can also open a project to select items individually."));
+                    let breakdown = self.projects.bulk_breakdown();
+                    ui.strong(text(japanese, "プロジェクトごとの内訳", "By project"));
+                    egui::ScrollArea::vertical().id_salt("bulk-project-breakdown").max_height(220.0)
+                        .show_rows(ui, 30.0, breakdown.len(), |ui, range| {
+                            for index in range {
+                                let (project, count) = breakdown[index];
+                                let line = if japanese {
+                                    format!("{} · {} 件 · {}", name(&project.path), count, bytes(project.reclaim))
+                                } else {
+                                    format!("{} · {} items · {}", name(&project.path), count, bytes(project.reclaim))
+                                };
+                                ui.add(egui::Label::new(line).truncate()).on_hover_text(display(&project.path));
+                            }
+                        });
+                    ui.add_space(12.);
+                    ui.horizontal(|ui| {
+                        cancel = super::controls::button(ui, text(japanese, "キャンセル", "Cancel"), false, true).clicked();
+                        select = super::controls::button(ui, text(japanese, "選択する", "Select items"), true, self.job.is_none()).clicked();
+                    });
+                });
+            if cancel || dialog.should_close() || select {
+                self.projects.confirm_bulk = false;
+            }
+            if select {
+                self.marked.clone_from(&self.projects.bulk_paths);
+            }
+        }
         if review {
             let policy = scan.policy.clone();
             let paths = self.marked.iter().cloned().collect();
@@ -961,8 +1031,8 @@ impl App {
             - 16.
             - 4. * ui.spacing().item_spacing.x)
             .max(1.);
-        let column = (available * 0.20).clamp(1., 106.);
-        let delta_width = (available * 0.22).clamp(1., 132.);
+        let column = (available * 0.22).clamp(1., 130.);
+        let delta_width = (available * 0.23).clamp(1., 150.);
         let widths = [
             available - 2. * column - delta_width,
             column,
@@ -1037,7 +1107,10 @@ impl App {
                         for (i, label) in [
                             bytes(p.size),
                             bytes(p.reclaim),
-                            p.delta.map_or_else(|| "—".into(), |d| d.label()),
+                            p.delta.map_or_else(
+                                || "—".into(),
+                                |d| d.localized_label(self.japanese_reasons),
+                            ),
                         ]
                         .into_iter()
                         .enumerate()
@@ -1138,6 +1211,14 @@ mod tests {
             1
         );
         assert_eq!(projects.reclaim, 55);
+        assert_eq!(
+            projects
+                .bulk_breakdown()
+                .iter()
+                .map(|(project, count)| (project.path.clone(), *count, project.reclaim))
+                .collect::<Vec<_>>(),
+            vec![(root.join("a"), 1, 15), (root.join("b"), 1, 40)]
+        );
         assert_eq!(
             projects.bulk_paths,
             BTreeSet::from([

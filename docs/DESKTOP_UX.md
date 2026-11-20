@@ -95,7 +95,9 @@ The visual concept informed the sidebar, list, inspector and footer. Its sample
 numbers are not application data. The application deliberately uses its actual
 producer/blocker reason and states that open files are checked again before
 removal. A scan does not prove that a candidate is unused. Disk statistics and
-Docker storage browsing remain read-only. Navigation cannot replace an active
+Docker storage browsing are read-only; separately confirmed actions can remove
+eligible containers or prune unused builder cache on the selected local daemon.
+Navigation cannot replace an active
 cleanup job. Profiles, SDK checks, partial-removal accounting and the explicit
 confirmation contracts remain authoritative.
 

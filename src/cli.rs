@@ -28,8 +28,13 @@ pub enum Commands {
     Stale(StaleArgs),
     #[command(about = "Review Mac app storage, SDK versions, caches, and protected data")]
     AppStorage(AppStorageArgs),
+    #[cfg(target_os = "macos")]
+    #[command(about = "Check one selected application's signed App Group declaration")]
+    GroupLink(GroupLinkArgs),
     #[command(about = "Read locally recorded desktop cleanup results")]
     CleanupHistory(CleanupHistoryArgs),
+    #[command(about = "Read recorded workspace scan totals over time")]
+    ReviewHistory(ReviewHistoryArgs),
     #[cfg(target_os = "macos")]
     #[command(about = "Review Finder metadata left in a cleanup stage")]
     StageCleanup(StageCleanupArgs),
@@ -52,13 +57,31 @@ pub struct StageCleanupArgs {
     #[arg(long)]
     pub cleanup_root: PathBuf,
     /// Permanently remove the reviewed metadata and empty stage directories.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "restore")]
     pub apply: bool,
+    /// Move the remaining payload back to the recorded sibling path, without overwriting it.
+    #[arg(long)]
+    pub restore: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct CleanupHistoryArgs {
     /// Maximum number of recent operations to display.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=500))]
+    pub limit: u16,
+    #[arg(long, value_enum, default_value_t = ListFormat::Text)]
+    pub format: ListFormat,
+}
+
+#[derive(Args, Debug)]
+pub struct ReviewHistoryArgs {
+    /// Workspace root from the recorded scan (absolute path).
+    #[arg(long)]
+    pub root: PathBuf,
+    /// Read a named review profile's history instead of the desktop workspace history.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Maximum number of recent observations to display.
     #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=500))]
     pub limit: u16,
     #[arg(long, value_enum, default_value_t = ListFormat::Text)]
@@ -75,6 +98,17 @@ pub struct AppStorageArgs {
     pub library: bool,
     #[arg(long, value_enum, default_value_t = ListFormat::Text)]
     pub format: ListFormat,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Args, Debug)]
+pub struct GroupLinkArgs {
+    /// Explicitly selected .app bundle to inspect; its code is not launched.
+    #[arg(long)]
+    pub app: PathBuf,
+    /// Exact App Group identifier to compare.
+    #[arg(long)]
+    pub group: String,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Default, Debug, Eq, PartialEq)]

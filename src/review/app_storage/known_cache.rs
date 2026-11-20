@@ -238,16 +238,19 @@ fn apply_in(
             Some(false) => None,
         });
     Ok(cleanup_history::Record {
+        operation: None,
         version: 1,
         root: home.join(ROOT),
         started_at,
         completed_at: Utc::now(),
         available_before: before,
         available_after: after,
+        kept_paths_at_start: None,
         items: vec![cleanup_history::Item {
             path: approved.path,
             producer: "Google Chrome HTTP cache (Default)".to_owned(),
             logical_bytes: approved.logical_bytes,
+            scanned_allocated_bytes: Some(approved.allocated_bytes),
             status: if reason.is_none() {
                 "removed"
             } else {
@@ -256,6 +259,7 @@ fn apply_in(
             .to_owned(),
             reason,
             original_path_exists: exists,
+            original_path_checked_at: Some(Utc::now()),
         }],
     })
 }

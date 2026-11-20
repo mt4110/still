@@ -380,16 +380,24 @@ fn sdk_rows(
                 row.set_clip_rect(row.clip_rect().intersect(rect));
                 let mut checked = marked.contains(&item.target);
                 if cell(&mut row, HEIGHT, HEIGHT, egui::Align::Min, |ui| {
-                    ui.add_enabled(
-                        enabled && item.selectable,
-                        egui::Checkbox::without_text(&mut checked),
-                    )
+                    if item.selectable {
+                        ui.add_enabled(enabled, egui::Checkbox::without_text(&mut checked))
+                    } else {
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                        super::icons::paint(ui, rect, super::icons::Icon::Lock, MUTED);
+                        response
+                    }
                 })
-                .on_hover_text(text(
-                    japanese,
-                    "アンインストールの確認に含める",
-                    "Include in uninstall review",
-                ))
+                .on_hover_text(if item.selectable {
+                    text(
+                        japanese,
+                        "アンインストールの確認に含める",
+                        "Include in uninstall review",
+                    )
+                } else {
+                    text(japanese, "保護された項目", "Protected item")
+                })
                 .changed()
                 {
                     if checked {
@@ -588,6 +596,16 @@ fn show_receipt(ui: &mut egui::Ui, result: &Result<Receipt>, japanese: bool) {
             ui.label(format!("{error:#}"));
         }
         Ok(receipt) => {
+            if let Some(error) = &receipt.history_error {
+                ui.label(format!(
+                    "{} · {error}",
+                    text(
+                        japanese,
+                        "整理履歴を保存できませんでした",
+                        "Could not save cleanup history"
+                    )
+                ));
+            }
             ui.label(
                 RichText::new(text(
                     japanese,

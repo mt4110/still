@@ -2,6 +2,8 @@ mod controls;
 mod folder_index;
 mod help;
 #[cfg(target_os = "macos")]
+mod history_ui;
+#[cfg(target_os = "macos")]
 mod home;
 mod icons;
 mod instance;
@@ -299,12 +301,20 @@ struct TableRow {
 enum Outcome {
     Scan(Result<Scan>),
     #[cfg(target_os = "macos")]
+    HistoryLoad(Result<(PathBuf, Vec<super::history::HistoryPoint>)>),
+    #[cfg(target_os = "macos")]
     StageReview(Result<super::filesystem::recovery::ReviewedStage>),
+    #[cfg(target_os = "macos")]
+    StageRestoreReview(Result<super::filesystem::recovery::RestoreStage>),
+    #[cfg(target_os = "macos")]
+    StageRestore(Result<()>),
     #[cfg(target_os = "macos")]
     StageRemoval(Result<()>),
     Search(Result<inventory::Inventory>),
     Stale(Result<stale::Report>),
     AppStorage(Result<app_storage::Report>),
+    #[cfg(target_os = "macos")]
+    GroupLink(Result<app_storage::group_link::Declaration>),
     #[cfg(target_os = "macos")]
     CachePrepared(Result<app_storage::known_cache::PreparedCache>),
     #[cfg(target_os = "macos")]
@@ -339,6 +349,7 @@ struct StaleFiles {
     root: Option<PathBuf>,
     days: u16,
     mib: u64,
+    include_outputs: bool,
     query: String,
     report: Option<stale::Report>,
     error: String,
@@ -351,6 +362,7 @@ impl Default for StaleFiles {
             root: None,
             days: 90,
             mib: 100,
+            include_outputs: true,
             query: String::new(),
             report: None,
             error: String::new(),
@@ -394,6 +406,8 @@ struct App {
     confirmation_page: usize,
     #[cfg(target_os = "macos")]
     stages: stage_recovery::Panel,
+    #[cfg(target_os = "macos")]
+    timeline: history_ui::Panel,
     job: Option<Job>,
     save_as: Option<String>,
     status: String,
@@ -552,6 +566,8 @@ impl App {
                 self.app_storage = Some(result);
             }
             #[cfg(target_os = "macos")]
+            Outcome::GroupLink(result) => self.library_panel.group_result = Some(result),
+            #[cfg(target_os = "macos")]
             Outcome::CachePrepared(result) => self.library_panel.review = Some(result),
             #[cfg(target_os = "macos")]
             Outcome::CacheFinished(result) => {
@@ -578,7 +594,24 @@ impl App {
                 }
             }
             #[cfg(target_os = "macos")]
+            Outcome::HistoryLoad(result) => self.timeline.review = Some(result),
+            #[cfg(target_os = "macos")]
             Outcome::StageReview(result) => self.stages.review = Some(result),
+            #[cfg(target_os = "macos")]
+            Outcome::StageRestoreReview(result) => self.stages.restore = Some(result),
+            #[cfg(target_os = "macos")]
+            Outcome::StageRestore(result) => match result {
+                Ok(()) => {
+                    self.refresh(ctx, false);
+                    self.status = text(
+                        self.japanese_reasons,
+                        "残存データを復元しました。ステージの記録は残っています。",
+                        "Restored remaining data. The stage record remains.",
+                    )
+                    .into();
+                }
+                Err(error) => self.status = format!("{error:#}"),
+            },
             #[cfg(target_os = "macos")]
             Outcome::StageRemoval(result) => match result {
                 Ok(()) => {
@@ -820,7 +853,10 @@ impl App {
                 path: Some(row.path.clone()),
                 folder: row.is_dir,
                 size: bytes(size),
-                change: delta.map_or_else(|| "—".into(), |delta| delta.label()),
+                change: delta.map_or_else(
+                    || "—".into(),
+                    |delta| delta.localized_label(self.japanese_reasons),
+                ),
                 order: if self.sort == Sort::Change {
                     delta.map(|d| d.signed_bytes())
                 } else {
@@ -1047,6 +1083,8 @@ impl App {
     }
 
     fn toolbar_actions(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        #[cfg(target_os = "macos")]
+        self.history_menu(ui);
         #[cfg(target_os = "macos")]
         self.stage_menu(ui);
         if ui
@@ -1866,6 +1904,8 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         #[cfg(target_os = "macos")]
+        self.history_dialog(ctx);
+        #[cfg(target_os = "macos")]
         self.stage_dialog(ctx);
         #[cfg(target_os = "macos")]
         self.library_confirmation(ctx);
@@ -2298,6 +2338,11 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_file_search_includes_build_outputs_by_default() {
+        assert!(StaleFiles::default().include_outputs);
+    }
 
     #[test]
     fn folder_browse_orders_files_and_directories_and_can_enter() -> anyhow::Result<()> {

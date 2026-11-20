@@ -7,7 +7,7 @@ Goal: "Hard Safety" — hardening the system against operational accidents.
 1.  **Purge Separation**: `still apply` NEVER performs permanent deletion (Purge).
 2.  **Validator Barrier**: No IO operations unless the plan passes validation.
 3.  **No Symlink Traversal**: Symlinks are never followed; they are skipped or rejected.
-4.  **No Network / No Telemetry**: Strict local-only operation.
+4.  **No Telemetry**: Scan, plan, and apply operate locally. Other workflows can explicitly request network access; for example, `--github-pr` invokes `gh` to query GitHub.
 5.  **Default Deny (Scope)**: Apply is rejected if paths are outside permitted scopes.
 
 ## Implementation Details

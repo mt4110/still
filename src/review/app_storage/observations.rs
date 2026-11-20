@@ -17,6 +17,42 @@ struct Snapshot {
     completed: DateTime<Utc>,
     // Library-relative labels contain the area as well as the directory name.
     allocated: BTreeMap<String, u64>,
+    // Added without changing v1: older snapshots simply have no saved changes.
+    #[serde(default)]
+    growth: Vec<Growth>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(in crate::review) struct Growth {
+    pub label: String,
+    pub bytes: u64,
+    pub previous: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::review) struct RecentGrowth {
+    pub completed: DateTime<Utc>,
+    pub rows: Vec<Growth>,
+}
+
+#[cfg(feature = "desktop")]
+pub(in crate::review) fn recent_growth() -> Result<Option<RecentGrowth>> {
+    let dirs = crate::storage_paths::project_dirs().context("Could not locate still data")?;
+    recent_growth_in(dirs.data_local_dir())
+}
+
+fn recent_growth_in(directory: &Path) -> Result<Option<RecentGrowth>> {
+    let file = match File::open(directory.join("library-observation.json")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let snapshot: Snapshot = serde_json::from_reader(BufReader::new(file))?;
+    ensure!(snapshot.version == 1, "Unknown Library history format");
+    Ok(Some(RecentGrowth {
+        completed: snapshot.completed,
+        rows: snapshot.growth,
+    }))
 }
 
 #[cfg(feature = "desktop")]
@@ -40,6 +76,7 @@ fn record_in(directory: &Path, report: &mut Report) -> Result<()> {
         version: 1,
         completed: Utc::now(),
         allocated: BTreeMap::new(),
+        growth: Vec::new(),
     };
     for row in &mut report.rows {
         let Some(evidence) = &mut row.library else {
@@ -57,9 +94,20 @@ fn record_in(directory: &Path, report: &mut Report) -> Result<()> {
             .and_then(|p| p.allocated.get(&row.label).map(|size| (p.completed, size)))
         {
             evidence.previous = Some((prior, i128::from(bytes) - i128::from(*size)));
+            if bytes > *size {
+                snapshot.growth.push(Growth {
+                    label: row.label.clone(),
+                    bytes: bytes - *size,
+                    previous: prior,
+                });
+            }
         }
         snapshot.allocated.insert(row.label.clone(), bytes);
     }
+    snapshot
+        .growth
+        .sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.label.cmp(&b.label)));
+    snapshot.growth.truncate(3);
     fs::create_dir_all(directory)?;
     let mut file = tempfile::NamedTempFile::new_in(directory)?;
     {
@@ -105,6 +153,7 @@ mod tests {
         let mut first = scan(64, false);
         record_in(dir.path(), &mut first)?;
         assert!(first.rows[0].library.as_ref().unwrap().previous.is_none());
+        assert!(recent_growth_in(dir.path())?.unwrap().rows.is_empty());
         let mut smaller = scan(16, false);
         record_in(dir.path(), &mut smaller)?;
         assert_eq!(
@@ -120,6 +169,7 @@ mod tests {
         let mut partial = scan(2, true);
         record_in(dir.path(), &mut partial)?;
         assert!(partial.rows[0].library.as_ref().unwrap().previous.is_none());
+        assert!(recent_growth_in(dir.path())?.unwrap().rows.is_empty());
         let mut baseline = scan(16, false);
         record_in(dir.path(), &mut baseline)?;
         assert!(baseline.rows[0]
@@ -133,6 +183,50 @@ mod tests {
         assert_eq!(
             fresh.rows[0].library.as_ref().unwrap().previous.unwrap().1,
             16
+        );
+        let latest = recent_growth_in(dir.path())?.unwrap();
+        assert_eq!(latest.rows.len(), 1);
+        assert_eq!(latest.rows[0].label, "Library/Caches/test.app");
+        assert_eq!(latest.rows[0].bytes, 16);
+        assert!(latest.rows[0].previous <= latest.completed);
+        Ok(())
+    }
+
+    #[test]
+    fn older_snapshots_are_read_without_inventing_a_difference() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(
+            dir.path().join("library-observation.json"),
+            r#"{"version":1,"completed":"2026-01-01T00:00:00Z","allocated":{"Library/Caches/test.app":16}}"#,
+        )?;
+        assert!(recent_growth_in(dir.path())?.unwrap().rows.is_empty());
+        let mut report = scan(32, false);
+        record_in(dir.path(), &mut report)?;
+        let latest = recent_growth_in(dir.path())?.unwrap();
+        assert_eq!(latest.rows.len(), 1);
+        assert_eq!(latest.rows[0].bytes, 16);
+        Ok(())
+    }
+
+    #[test]
+    fn saved_growth_is_limited_to_largest_comparable_rows() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut initial = Report::default();
+        let mut next = Report::default();
+        for (index, increase) in [10, 30, 20, 40].into_iter().enumerate() {
+            let mut old = scan(100, false).rows.pop().unwrap();
+            let mut new = scan(100 + increase, false).rows.pop().unwrap();
+            old.label = format!("Library/Caches/item{index}");
+            new.label = old.label.clone();
+            initial.rows.push(old);
+            next.rows.push(new);
+        }
+        record_in(dir.path(), &mut initial)?;
+        record_in(dir.path(), &mut next)?;
+        let latest = recent_growth_in(dir.path())?.unwrap();
+        assert_eq!(
+            latest.rows.iter().map(|row| row.bytes).collect::<Vec<_>>(),
+            [40, 30, 20]
         );
         Ok(())
     }

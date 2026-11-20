@@ -15,6 +15,15 @@ fn run_still(args: &[&str], cwd: Option<&std::path::Path>) -> std::process::Outp
 
 #[test]
 fn test_workflow_scan_plan_apply_dryrun() {
+    // Use a long-spelled temp directory on Windows; the runner's TEMP may be
+    // an 8.3 alias, which is intentionally rejected for rule-based scanning.
+    #[cfg(windows)]
+    let temp = {
+        let canonical = std::env::temp_dir().canonicalize().unwrap();
+        let long = canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+        tempfile::tempdir_in(long).unwrap()
+    };
+    #[cfg(not(windows))]
     let temp = TempDir::new().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let root = root.as_path(); // Keep it as Path
@@ -68,13 +77,34 @@ recommended_action = "Trash"
         "Plan missing target file"
     );
 
-    // Simulate User Action: Change selected_action from Keep to Trash
-    // (In reality, TUI does this. For test, we edit the JSON)
-    let plan_modified = plan_content.replace(
-        r#""selected_action": "Keep""#,
-        r#""selected_action": "Trash""#,
+    // A recommendation must not select an action without the user's review.
+    let mut plan: serde_json::Value = serde_json::from_str(&plan_content).unwrap();
+    let entries = plan["entries"].as_array_mut().unwrap();
+    assert!(entries
+        .iter()
+        .all(|entry| entry["selected_action"] == "Keep"));
+    // Windows may report the working directory without the extended-length
+    // prefix returned by canonicalize. Compare the resolved files, not their
+    // platform-dependent string spellings.
+    let target_canonical = target_file.canonicalize().unwrap();
+    let matching: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let path = std::path::Path::new(entry["path"].as_str()?);
+            (path.canonicalize().ok().as_ref() == Some(&target_canonical)).then_some(index)
+        })
+        .collect();
+    assert_eq!(
+        matching.len(),
+        1,
+        "Expected exactly one target file in the plan"
     );
-    fs::write(&plan_path, plan_modified).unwrap();
+    let target = &mut entries[matching[0]];
+    assert_eq!(target["recommended_action"], "Trash");
+    // Simulate explicitly selecting only this item in the TUI.
+    target["selected_action"] = serde_json::json!("Trash");
+    fs::write(&plan_path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
 
     // 2. Apply --dry-run
     // We need --allow-outside-scope because temp dir is not in ~/Library
@@ -101,12 +131,47 @@ recommended_action = "Trash"
         println!("Modified Plan: {}", fs::read_to_string(&plan_path).unwrap());
     }
     assert!(stdout.contains("(Dry Run)"));
-    assert!(stdout.contains("Trash: 2 items"));
+    assert!(stdout.contains("Trash: 1 items"));
 
     assert!(
         target_file.exists(),
         "Target file should still exist after dry run"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn scan_rejects_ambiguous_short_name_without_overwriting_plan() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let ambiguous = root.join("fixture~1");
+    fs::create_dir(&ambiguous).unwrap();
+    fs::write(ambiguous.join("candidate.dat"), vec![0u8; 200]).unwrap();
+    let rules = root.join("rules.toml");
+    fs::write(
+        &rules,
+        format!(
+            "[[rules]]\nname = \"fixture\"\nscopes = [{:?}]\nmin_size_bytes = 1\nrecommended_action = \"Trash\"\n",
+            root.to_str().unwrap()
+        ),
+    ).unwrap();
+    let plan = root.join("existing-plan.json");
+    fs::write(&plan, b"existing plan must remain").unwrap();
+    let output = run_still(
+        &[
+            "scan",
+            "--scope",
+            "custom",
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            plan.to_str().unwrap(),
+        ],
+        Some(&ambiguous),
+    );
+    assert!(!output.status.success(), "ambiguous scan should fail");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("8.3 short name"));
+    assert_eq!(fs::read(plan).unwrap(), b"existing plan must remain");
 }
 
 #[test]
