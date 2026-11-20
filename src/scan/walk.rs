@@ -59,17 +59,18 @@ fn reject_ambiguous_short_names(base: &Path, rules: &[Rule]) -> Result<(), AppEr
 /// verbatim drive prefix while the same path from current_dir does not. Only
 /// bridge those spellings when every component has ordinary Win32 semantics;
 /// do not resolve links or change the apply-time authorization checks.
+#[cfg(not(windows))]
 pub(crate) fn scope_contains(path: &Path, scope: &Path) -> bool {
-    if path.starts_with(scope) {
-        return true;
-    }
-    #[cfg(windows)]
-    return match (alternate_windows_path(path), alternate_windows_path(scope)) {
-        (Some(_), Some(alternate_scope)) => path.starts_with(alternate_scope),
-        _ => false,
-    };
-    #[cfg(not(windows))]
-    false
+    path.starts_with(scope)
+}
+
+#[cfg(windows)]
+pub(crate) fn scope_contains(path: &Path, scope: &Path) -> bool {
+    path.starts_with(scope)
+        || match (alternate_windows_path(path), alternate_windows_path(scope)) {
+            (Some(_), Some(alternate_scope)) => path.starts_with(alternate_scope),
+            _ => false,
+        }
 }
 
 #[cfg(windows)]
@@ -126,14 +127,14 @@ fn alternate_windows_path(path: &Path) -> Option<PathBuf> {
     Some(alternative)
 }
 
+#[cfg(not(windows))]
 pub(crate) fn glob_matches(path: &Path, matches: impl Fn(&Path) -> bool) -> bool {
-    if matches(path) {
-        return true;
-    }
-    #[cfg(windows)]
-    return alternate_windows_path(path).is_some_and(|alternative| matches(&alternative));
-    #[cfg(not(windows))]
-    false
+    matches(path)
+}
+
+#[cfg(windows)]
+pub(crate) fn glob_matches(path: &Path, matches: impl Fn(&Path) -> bool) -> bool {
+    matches(path) || alternate_windows_path(path).is_some_and(|alternative| matches(&alternative))
 }
 
 pub struct Scanner {
