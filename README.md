@@ -67,6 +67,14 @@ Macでは、Library行のフォルダ名から認識できるbundle IDについ�
 
 **Find old files…** で、ホーム配下から更新・アクセス・作成のうち、取得できた最新の日時が指定の日数より古いファイルを容量順に探せます。対象フォルダや最小サイズを指定して、結果をパスで絞れます。画面ではCLIと同じく既定で開発プロジェクトの生成物を含め、チェックを外すと確認できた生成物を除外します。画面では使用中かどうかは確認しません。ターミナルの `still stale --older-than-days 180 --min-mib 512` は上位候補の使用中チェックを試みます。`--root` でホーム配下のフォルダを指定できます。開いているプロセスが見つからなくても、不要とは限りません。隠し項目、`Library`、`node_modules` はどちらも走査対象外です。
 
+clone 後、Mac で Rust と Xcode Command Line Tools を用意し、リポジトリのルートから次のコマンドを実行すると、`.app` をビルドして起動します。
+
+```sh
+./script/build_and_run.sh
+```
+
+作成したアプリのパスは表示されます。Finder から「アプリケーション」に移して利用することもできます。再実行すると `target/still-app.*` に新しく作成し、既存のアプリは上書きしません。初回のビルドには時間がかかります。
+
 ```sh
 # ソースからウィンドウを起動（macOS / Windows）
 cargo run --locked --features desktop --bin still-desktop

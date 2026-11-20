@@ -62,7 +62,15 @@ Local Docker review also lists unreferenced volumes as protected. To inspect com
 cargo run --locked --features desktop --bin still-desktop
 ```
 
-Build a macOS bundle with [build-macos-app.sh](scripts/build-macos-app.sh), or an MSIX with [build-windows-msix.ps1](scripts/build-windows-msix.ps1). Use the Microsoft Store signed package on Windows with Smart App Control enabled.
+On macOS, install Rust and Xcode Command Line Tools, then build and launch an app from the repository root:
+
+```sh
+./script/build_and_run.sh
+```
+
+The script prints the app's path; you can move it to Applications in Finder. Each run creates a new app under `target/still-app.*` without overwriting previous builds. The first build may take some time.
+
+For manual packaging, use [build-macos-app.sh](scripts/build-macos-app.sh), or build an MSIX with [build-windows-msix.ps1](scripts/build-windows-msix.ps1). Use the Microsoft Store signed package on Windows with Smart App Control enabled.
 
 To use the app on another Apple Silicon Mac, ZIP the bundle, transfer it, and place the extracted `still.app` in Applications. The destination does not need Rust or Nix. Create a weekly profile there with **Add workspace… → Save as…** so it uses that Mac's paths.
 
