@@ -28,6 +28,8 @@ pub(crate) struct Resource {
     pub shared_size: String,
     pub unique_size: String,
     pub mounts: String,
+    pub last_used: String,
+    pub operation: String,
     #[serde(skip)]
     pub created: Option<DateTime<Utc>>,
     #[serde(skip)]
@@ -138,8 +140,39 @@ const FORMAT: &str = r#"{
 "Images":[{{range $i,$v := .Images}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json (printf "%s:%s" $v.Repository $v.Tag)}},"Size":{{json $v.Size}},"Status":{{json $v.Containers}},"SharedSize":{{json $v.SharedSize}},"UniqueSize":{{json $v.UniqueSize}}}{{end}}],
 "Containers":[{{range $i,$v := .Containers}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json $v.Names}},"Size":{{json $v.Size}},"Status":{{json $v.State}},"Detail":{{json $v.Image}},"Mounts":{{json $v.Mounts}}}{{end}}],
 "Volumes":[{{range $i,$v := .Volumes}}{{if $i}},{{end}}{"ID":{{json $v.Name}},"Name":{{json $v.Name}},"Size":{{json $v.Size}},"Status":{{json $v.Links}},"Detail":{{json $v.Driver}}}{{end}}],
-"BuildCache":[{{range $i,$v := .BuildCache}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json (printf "%s · %s" $v.CacheType $v.ID)}},"Size":{{json $v.Size}},"Status":{{json $v.InUse}},"Detail":{{json $v.Shared}}}{{end}}]
+"BuildCache":[{{range $i,$v := .BuildCache}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json $v.CacheType}},"LastUsed":{{json $v.LastUsedSince}},"Operation":{{ $op := index (split $v.Description " ") 0 }}{{if eq $op "pulled"}}"pull"{{else if eq $op "RUN"}}"run"{{else if eq $op "COPY"}}"copy"{{else if eq $op "ADD"}}"add"{{else}}""{{end}},"Size":{{json $v.Size}},"Status":{{json $v.InUse}},"Detail":{{json $v.Shared}}}{{end}}]
 }"#;
+
+// Only offer local connections. inspect and each destructive operation independently
+// resolve and verify the selected endpoint again, since context files can change.
+pub(crate) fn local_contexts() -> Result<Vec<String>> {
+    let output = command_output(
+        command().args([
+            "context",
+            "ls",
+            "--format",
+            r#"[{{json .Name}},{{json .DockerEndpoint}}]"#,
+        ]),
+        Duration::from_secs(10),
+    )?;
+    parse_contexts(&output)
+}
+
+fn parse_contexts(output: &str) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let [name, endpoint]: [String; 2] = serde_json::from_str(line)?;
+        if !name.starts_with('-')
+            && validate_context(&name).is_ok()
+            && validate_endpoint(&endpoint).is_ok()
+        {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
+}
 
 pub(crate) fn inspect(context: &str) -> Result<Report> {
     let context = if context.trim().is_empty() {
@@ -229,6 +262,8 @@ impl Default for Resource {
             shared_size: String::new(),
             unique_size: String::new(),
             mounts: String::new(),
+            last_used: String::new(),
+            operation: String::new(),
             created: None,
             started: None,
             finished: None,
@@ -258,6 +293,17 @@ pub(crate) fn size_bytes(size: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_picker_omits_remote_endpoints_and_option_like_names() -> Result<()> {
+        let output = r#"["default","unix:///var/run/docker.sock"]
+["production","ssh://docker@server"]
+["--help","unix:///tmp/docker.sock"]
+["colima","unix:///tmp/colima.sock"]"#;
+        assert_eq!(parse_contexts(output)?, ["colima", "default"]);
+        assert!(parse_contexts("broken").is_err());
+        Ok(())
+    }
 
     #[test]
     fn cache_cleanup_never_runs_if_connection_verification_fails() {

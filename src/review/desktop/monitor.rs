@@ -29,12 +29,14 @@ pub(super) struct Panel {
     disk_error: String,
     history: VecDeque<Rates>,
     next_sample: Option<Instant>,
+    context_job: Option<Receiver<Result<Vec<String>>>>,
+    contexts: Option<Result<Vec<String>>>,
     docker_job: Option<Receiver<Result<storage::Report>>>,
     docker: Option<Result<Arc<storage::Report>>>,
     marked: BTreeSet<String>,
     review: Option<storage::Review>,
     cache_review: Option<storage::CacheCleanup>,
-    cache_receipt: Option<storage::CacheCleanupResult>,
+    cache_receipt: Option<docker_ui::CacheReceipt>,
     cache_days: u16,
     receipt: Option<storage::Receipt>,
     receipt_context: String,
@@ -148,6 +150,9 @@ fn disk_sample(mut devices: Vec<String>) -> Result<DiskSample> {
         "-r",
         "-c",
         "IOBlockStorageDriver",
+        // Only the driver statistics and the immediate child BSD name are needed.
+        "-d",
+        "2",
         "-l",
         "-a",
     ]))
@@ -263,6 +268,19 @@ impl Panel {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(job) = &self.context_job {
+            match job.try_recv() {
+                Ok(result) => {
+                    self.contexts = Some(result);
+                    self.context_job = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.contexts = Some(Err(anyhow::anyhow!("Docker context list interrupted")));
+                    self.context_job = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(job) = &self.docker_job {
             match job.try_recv() {
                 Ok(report) => {
@@ -304,6 +322,19 @@ impl Panel {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(disk_sample(devices));
+            ctx.request_repaint();
+        });
+    }
+
+    fn load_contexts(&mut self, ctx: &egui::Context) {
+        if self.context_job.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.context_job = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(storage::local_contexts());
             ctx.request_repaint();
         });
     }
@@ -365,19 +396,20 @@ impl Panel {
         ui.add_space(24.0);
         if let Some(sample) = &self.disk {
             let used = 1.0 - sample.free as f32 / sample.total as f32;
-            ui.label(text(japanese, "ホームフォルダのボリューム", "Home volume"));
+            ui.label(text(
+                japanese,
+                "ホームボリュームの空き容量",
+                "Free space on home volume",
+            ));
             ui.label(
-                egui::RichText::new(format!(
-                    "{} / {}",
-                    bytes(sample.total - sample.free),
-                    bytes(sample.total)
-                ))
-                .size(24.0)
-                .strong(),
+                egui::RichText::new(format!("{} / {}", bytes(sample.free), bytes(sample.total)))
+                    .size(24.0)
+                    .strong(),
             );
             ui.add_space(6.0);
             ui.add(
                 egui::ProgressBar::new(used)
+                    .fill(ACCENT)
                     .desired_height(7.0)
                     .corner_radius(4),
             );
@@ -389,8 +421,8 @@ impl Panel {
             ui.add_space(6.0);
             ui.label(format!(
                 "{} {} · {} · {}",
-                text(japanese, "空き", "Free"),
-                bytes(sample.free),
+                text(japanese, "使用中", "Used"),
+                bytes(sample.total - sample.free),
                 sample.devices.join(" + "),
                 sample.clock.format("%H:%M:%S")
             ));
