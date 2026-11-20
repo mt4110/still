@@ -85,12 +85,36 @@ fn canonical_scope_applies_recommendation_and_excludes_to_ordinary_scan() -> any
     );
     rule.excludes = Some(vec![format!(r"{}\skip*", canonical_root.display())]);
     rule.includes = Some(vec![format!(r"{}\candidate*", canonical_root.display())]);
+    let candidate_path = ordinary_root.join("candidate.txt");
+    assert!(
+        crate::scan::walk::scope_contains(&candidate_path, &canonical_root),
+        "scope comparison failed: base={ordinary_root:?}, scope={canonical_root:?}, candidate={candidate_path:?}"
+    );
+    let include_pattern = &rule.includes.as_ref().unwrap()[0];
+    let include = globset::Glob::new(include_pattern)?.compile_matcher();
+    assert!(
+        crate::scan::walk::glob_matches(&candidate_path, |path| include.is_match(path)),
+        "include comparison failed: base={ordinary_root:?}, scope={canonical_root:?}, candidate={candidate_path:?}, pattern={include_pattern:?}"
+    );
+    let excluded_path = ordinary_root.join("skip");
+    let exclude_pattern = &rule.excludes.as_ref().unwrap()[0];
+    let exclude = globset::Glob::new(exclude_pattern)?.compile_matcher();
+    assert!(
+        crate::scan::walk::glob_matches(&excluded_path, |path| exclude.is_match(path)),
+        "exclude comparison failed: base={ordinary_root:?}, scope={canonical_root:?}, excluded={excluded_path:?}, pattern={exclude_pattern:?}"
+    );
     let entries = Scanner::new(ordinary_root, vec![rule]).scan()?;
     let candidate = entries
         .iter()
         .find(|entry| entry.path.ends_with("candidate.txt"))
         .unwrap();
-    assert_eq!(candidate.recommended_action, ActionType::Quarantine);
+    assert_eq!(
+        candidate.recommended_action,
+        ActionType::Quarantine,
+        "candidate={:?}, rule_scope={canonical_root:?}, reason={}",
+        candidate.path,
+        candidate.reason
+    );
     assert_eq!(candidate.selected_action, ActionType::Keep);
     assert!(!entries.iter().any(|entry| entry.path.ends_with("skip")));
     Ok(())
