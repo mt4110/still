@@ -1,7 +1,7 @@
 use super::{bytes, display, egui, text, App, Profile};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};
-use directories::{BaseDirs, ProjectDirs};
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,16 +12,26 @@ struct Recent {
     profile: Profile,
     name: Option<String>,
     completed: DateTime<Utc>,
+    #[serde(default)]
+    growth: Vec<Growth>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub(super) struct Growth {
+    pub(super) path: PathBuf,
+    pub(super) label: String,
 }
 
 pub(super) struct Home {
     directory: Option<PathBuf>,
     recent: Option<Recent>,
+    pub(super) requested_project: Option<PathBuf>,
     capacity: Option<(u64, u64)>,
+    pub(super) last_measurement: Option<(u64, u64)>,
 }
 
 fn recent_path() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("com", "antigravity", "still").context("still data directory")?;
+    let dirs = crate::storage_paths::project_dirs().context("still data directory")?;
     Ok(dirs.data_local_dir().join("last-workspace.json"))
 }
 
@@ -29,11 +39,18 @@ impl Default for Home {
     fn default() -> Self {
         let mut home = Self {
             directory: BaseDirs::new().map(|dirs| dirs.home_dir().to_owned()),
+            requested_project: None,
             recent: recent_path()
                 .ok()
                 .and_then(|path| serde_json::from_reader(fs::File::open(path).ok()?).ok()),
             capacity: None,
+            last_measurement: None,
         };
+        if let Some(last) = &home.recent {
+            home.last_measurement = super::super::cleanup_history::last_measurement(&last.root)
+                .ok()
+                .flatten();
+        }
         home.update_capacity();
         home
     }
@@ -54,13 +71,20 @@ impl Home {
         root: &Path,
         profile: &Profile,
         name: Option<String>,
+        growth: Vec<Growth>,
     ) -> Result<()> {
         self.update_capacity();
+        if self.recent.as_ref().is_none_or(|last| last.root != root) {
+            self.last_measurement = super::super::cleanup_history::last_measurement(root)
+                .ok()
+                .flatten();
+        }
         self.recent = Some(Recent {
             root: root.to_owned(),
             profile: profile.clone(),
             name,
             completed: Utc::now(),
+            growth,
         });
         let path = recent_path()?;
         let dir = path.parent().context("still data directory")?;
@@ -164,7 +188,7 @@ impl App {
                     "ホーム全体を調べる",
                     "Scan entire home",
                 ),
-                true,
+                self.home.recent.is_none(),
                 self.job.is_none(),
             )
             .clicked()
@@ -255,6 +279,24 @@ impl App {
                         ))
                         .color(MUTED),
                     );
+                    if let Some((before, after)) = self.home.last_measurement {
+                        let change = format!(
+                            "{}{}",
+                            if after >= before { "+" } else { "−" },
+                            bytes(after.abs_diff(before))
+                        );
+                        ui.label(
+                            RichText::new(format!(
+                                "{}　{change}",
+                                text(
+                                    self.japanese_reasons,
+                                    "前回の整理時の空き容量変化",
+                                    "Free-space change at last cleanup"
+                                )
+                            ))
+                            .strong(),
+                        );
+                    }
                 } else {
                     ui.label(
                         RichText::new(text(
@@ -273,9 +315,46 @@ impl App {
                 } else {
                     format!("Scan {name}")
                 };
-                super::controls::button(ui, &label, true, self.job.is_none()).clicked()
+                super::controls::button(ui, &label, self.home.recent.is_some(), self.job.is_none())
+                    .clicked()
             })
             .inner;
+        let mut requested = None;
+        if let Some(last) = self.home.recent.as_ref().filter(|r| !r.growth.is_empty()) {
+            ui.add_space(12.);
+            ui.strong(text(
+                self.japanese_reasons,
+                "前回のスキャンで増えた場所",
+                "Growth at last scan",
+            ));
+            for item in &last.growth {
+                let name = display(item.path.file_name().map(Path::new).unwrap_or(&item.path));
+                if ui
+                    .add_enabled(
+                        self.job.is_none(),
+                        egui::Link::new(format!("{name}　{} ›", item.label)),
+                    )
+                    .on_hover_text(display(&item.path))
+                    .clicked()
+                {
+                    requested = Some(item.path.clone());
+                }
+            }
+        }
+        if let Some(project) = requested {
+            if self.scan.as_ref().is_some_and(|s| s.root == path)
+                && self.projects.open_project(project.clone())
+            {
+                self.marked.clear();
+                self.navigate(super::shell::Screen::Workspace);
+            } else {
+                match self.resume_scan(ui.ctx(), path) {
+                    Ok(()) => self.home.requested_project = Some(project),
+                    Err(error) => self.status = super::display_error(&error, self.japanese_reasons),
+                }
+            }
+            return;
+        }
         if open {
             if let Err(error) = self.resume_scan(ui.ctx(), path.clone()) {
                 self.status = super::display_error(&error, self.japanese_reasons);
@@ -351,6 +430,7 @@ impl App {
             .context(
             text(self.japanese_reasons, "前回の場所がプロファイルから外れています。Open profile から調査先を選んでください。", "The previous workspace is no longer in the profile. Choose a workspace from Open profile."),
         )?;
+        self.browse_folders = false;
         self.profile = profile;
         self.read_only_browse = false;
         self.profile_name = last.name.clone();

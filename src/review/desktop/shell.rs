@@ -83,6 +83,24 @@ fn navigation(ui: &mut egui::Ui, screen: Screen, active: bool, japanese: bool) -
 }
 
 impl App {
+    fn close_workspace(&mut self) {
+        if self.job.is_some() {
+            return;
+        }
+        self.scan = None;
+        self.projects = Default::default();
+        self.baseline = Default::default();
+        self.matches = Vec::new();
+        self.rows = Vec::new();
+        self.marked.clear();
+        self.focused = None;
+        self.cleanup_receipt = None;
+        self.confirmation = None;
+        self.inspection = None;
+        self.status.clear();
+        self.navigate(Screen::Overview);
+    }
+
     pub(super) fn navigate(&mut self, screen: Screen) {
         if self.screen == screen {
             return;
@@ -277,6 +295,18 @@ impl App {
                                     self.navigate(Screen::Workspace);
                                     ui.close();
                                 }
+                                if self.scan.is_some()
+                                    && ui
+                                        .button(text(
+                                            self.japanese_reasons,
+                                            "調査結果を閉じてメモリを解放",
+                                            "Close scan and release memory",
+                                        ))
+                                        .clicked()
+                                {
+                                    self.close_workspace();
+                                    ui.close();
+                                }
                                 self.toolbar_actions(ui, &ctx);
                             },
                         );
@@ -369,8 +399,9 @@ impl App {
         }
     }
 
-    fn cleanup_result(&self, ui: &mut egui::Ui) {
+    fn cleanup_result(&mut self, ui: &mut egui::Ui) {
         if let Some(receipt) = &self.cleanup_receipt {
+            let mut dismiss = false;
             let actual = match (receipt.before, receipt.after) {
                 (Some(before), Some(after)) => format!(
                     "{}{}",
@@ -385,7 +416,14 @@ impl App {
                 .inner_margin(16)
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    ui.strong(text(self.japanese_reasons, "掃除の結果", "Cleanup result"));
+                    ui.horizontal(|ui| {
+                        ui.strong(text(self.japanese_reasons, "掃除の結果", "Cleanup result"));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            dismiss = ui
+                                .button(text(self.japanese_reasons, "閉じる", "Dismiss"))
+                                .clicked();
+                        });
+                    });
                     if let Some(error) = &receipt.history_error {
                         ui.label(format!(
                             "{} · {error}",
@@ -438,6 +476,9 @@ impl App {
                         },
                     );
                 });
+            if dismiss {
+                self.cleanup_receipt = None;
+            }
             ui.add_space(12.0);
         }
     }

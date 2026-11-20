@@ -63,7 +63,10 @@ fn virtual_row(
 
 #[derive(Default)]
 pub(super) struct Projects {
+    root: PathBuf,
     rows: Vec<Project>,
+    bulk_paths: BTreeSet<PathBuf>,
+    reclaim: u64,
     selected: Option<PathBuf>,
     focused: Option<PathBuf>,
     query: String,
@@ -156,14 +159,21 @@ fn candidate_header(ui: &mut egui::Ui, japanese: bool) {
     });
 }
 
+#[derive(Default)]
+struct InspectorActions {
+    inspect: Option<PathBuf>,
+    finder_error: Option<String>,
+    keep: Option<(PathBuf, bool)>,
+}
+
 fn candidate_inspector(
     ui: &mut egui::Ui,
     candidate: &super::super::artifacts::FileCandidate,
     project: &Project,
     japanese: bool,
     height: f32,
-    inspect: &mut Option<PathBuf>,
-    finder_error: &mut Option<String>,
+    kept: Option<&super::keep::KeepRules>,
+    actions: &mut InspectorActions,
 ) {
     let path = &candidate.row.path;
     ui.set_max_width(ui.available_width());
@@ -206,11 +216,25 @@ fn candidate_inspector(
                 "Contents and open files are checked again before removal. Free-space change is measured afterward.",
             )).size(12.).color(MUTED));
             ui.add_space(18.);
+            if let Some(rules) = kept {
+                let existing = rules.conflict(path);
+                if let Some(held) = existing {
+                    ui.small(format!("{} · {}", text(japanese, "残す設定", "Kept folder"), display(held)));
+                }
+                let label = if existing.is_some() {
+                    text(japanese, "この保持設定を解除", "Remove this keep rule")
+                } else {
+                    text(japanese, "次回以降も残す", "Keep in future scans")
+                };
+                if super::controls::button(ui, label, false, true).clicked() {
+                    actions.keep = Some((existing.unwrap_or(path).to_owned(), existing.is_none()));
+                }
+            }
             if super::controls::button(ui, text(japanese, "Finder で開く ↗", "Open in Finder ↗"), false, true).clicked() {
-                *finder_error = open_in_finder(path).err().map(|error| super::display_error(&error, japanese));
+                actions.finder_error = open_in_finder(path).err().map(|error| super::display_error(&error, japanese));
             }
             if super::controls::button(ui, text(japanese, "この項目を再確認", "Inspect this item"), false, true).clicked() {
-                *inspect = Some(path.clone());
+                actions.inspect = Some(path.clone());
             }
         });
 }
@@ -251,6 +275,7 @@ impl Projects {
             })
             .map(|c| c.row.path.as_path())
             .collect();
+        let mut bulk_paths = BTreeSet::new();
         for (index, candidate) in scan.files.iter().enumerate() {
             let path = &candidate.row.path;
             let Some(component) = path
@@ -282,11 +307,17 @@ impl Projects {
                 if candidate.blocked_reason.is_none()
                     && !path.ancestors().skip(1).any(|p| eligible.contains(p))
                 {
+                    bulk_paths.insert(path.clone());
                     project.reclaim = project.reclaim.saturating_add(candidate.row.usage.size());
                 }
             }
         }
         let mut result = Self {
+            root: scan.root.clone(),
+            reclaim: projects
+                .values()
+                .fold(0u64, |sum, p| sum.saturating_add(p.reclaim)),
+            bulk_paths,
             rows: projects.into_values().collect(),
             active: true,
             ..Default::default()
@@ -294,6 +325,63 @@ impl Projects {
         result.sort();
         result
     }
+    pub(super) fn growth(&self) -> Vec<super::home::Growth> {
+        let mut changes: Vec<_> = self
+            .rows
+            .iter()
+            .filter_map(|project| {
+                project
+                    .delta
+                    .filter(|d| d.signed_bytes() > 0)
+                    .map(|delta| (delta, &project.path))
+            })
+            .collect();
+        changes.sort_unstable_by(|(a, pa), (b, pb)| {
+            b.signed_bytes()
+                .cmp(&a.signed_bytes())
+                .then_with(|| pa.cmp(pb))
+        });
+        changes
+            .into_iter()
+            .take(3)
+            .map(|(delta, path)| super::home::Growth {
+                path: path.clone(),
+                label: delta.label(),
+            })
+            .collect()
+    }
+
+    pub(super) fn open_project(&mut self, path: PathBuf) -> bool {
+        if self.rows.iter().any(|project| project.path == path) {
+            self.active = true;
+            self.selected = Some(path);
+            self.focused = None;
+            self.query.clear();
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn refresh(&mut self, scan: &Scan) {
+        let mut next = Self::from_scan(scan);
+        if self.root == next.root {
+            next.by_candidate = self.by_candidate;
+            next.sort();
+            next.selected = self
+                .selected
+                .take()
+                .filter(|path| next.rows.iter().any(|p| p.path == *path));
+            if next.selected.is_some() {
+                next.query = std::mem::take(&mut self.query);
+                next.focused = self
+                    .focused
+                    .take()
+                    .filter(|path| scan.files.iter().any(|c| c.row.path == *path));
+            }
+        }
+        *self = next;
+    }
+
     fn sort(&mut self) {
         let value = |p: &Project| if self.by_candidate { p.reclaim } else { p.size };
         self.rows
@@ -330,7 +418,6 @@ impl App {
             self.projects.selected = None;
             self.projects.focused = None;
             self.projects.query.clear();
-            self.marked.clear();
             return;
         }
         ui.add_space(8.);
@@ -354,14 +441,11 @@ impl App {
             );
         });
         ui.add_space(14.);
-        let search = ui.add(
+        ui.add(
             super::controls::field(ui, &mut self.projects.query)
                 .hint_text(text(japanese, "候補を検索", "Search candidates"))
                 .desired_width(320.),
         );
-        if search.changed() {
-            self.marked.clear();
-        }
         ui.add_space(10.);
         let query = self.projects.query.to_lowercase();
         let visible: Vec<_> = project
@@ -408,8 +492,7 @@ impl App {
             false
         };
         let mut missing = BTreeSet::new();
-        let mut inspect = None;
-        let mut finder_error = None;
+        let mut actions = InspectorActions::default();
         let body_height = (ui.available_height() - 72.).max(160.);
         let wide = ui.available_width() >= 680.;
         let inspector_width = if wide { 280. } else { ui.available_width() };
@@ -452,9 +535,7 @@ impl App {
                         }
                         let active = focused.as_ref() == Some(path) || self.marked.contains(path);
                         let (mut row, response) = virtual_row(ui, path, 52., active);
-                        if response.clicked() {
-                            *focused = Some(path.clone());
-                        }
+                        let mut clicked = response.clicked();
                         let width = row.available_width();
                         let status_width = if width >= 460. { 92. } else { 64. };
                         let name_width = (width
@@ -469,28 +550,30 @@ impl App {
                                 egui::Layout::left_to_right(Align::Center),
                                 |ui| {
                                     ui.set_width(super::controls::HEIGHT);
-                                    let mut checked = self.marked.contains(path);
-                                    if ui
-                                        .add_enabled(
-                                            self.job.is_none() && c.blocked_reason.is_none(),
-                                            egui::Checkbox::without_text(&mut checked),
-                                        )
-                                        .on_hover_text(text(
-                                            japanese,
-                                            "この候補を選択",
-                                            "Select this candidate",
-                                        ))
-                                        .changed()
-                                    {
-                                        *focused = Some(path.clone());
-                                        if checked {
-                                            self.marked.retain(|other| {
-                                                !other.starts_with(path) && !path.starts_with(other)
-                                            });
-                                            self.marked.insert(path.clone());
-                                        } else {
-                                            self.marked.remove(path);
-                                        }
+                                    if c.blocked_reason.is_some() {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(17., 17.),
+                                            egui::Sense::hover(),
+                                        );
+                                        super::icons::paint(
+                                            ui,
+                                            rect,
+                                            super::icons::Icon::Lock,
+                                            MUTED,
+                                        );
+                                    } else {
+                                        let mut checked = self.marked.contains(path);
+                                        clicked |= ui
+                                            .add_enabled(
+                                                self.job.is_none(),
+                                                egui::Checkbox::without_text(&mut checked),
+                                            )
+                                            .on_hover_text(text(
+                                                japanese,
+                                                "この候補を選択",
+                                                "Select this candidate",
+                                            ))
+                                            .changed();
                                     }
                                 },
                             );
@@ -507,7 +590,7 @@ impl App {
                                         .ok()
                                         .filter(|p| !p.as_os_str().is_empty())
                                         .unwrap_or(path);
-                                    if ui
+                                    clicked |= ui
                                         .add(
                                             egui::Label::new(
                                                 RichText::new(display(relative)).size(15.0),
@@ -517,10 +600,7 @@ impl App {
                                             .truncate(),
                                         )
                                         .on_hover_text(display(path))
-                                        .clicked()
-                                    {
-                                        *focused = Some(path.clone());
-                                    }
+                                        .clicked();
                                     let reason = c.blocked_reason.as_ref().map_or_else(
                                         || effect(c.producer, japanese),
                                         |reason| reason.text(japanese),
@@ -571,6 +651,18 @@ impl App {
                                 },
                             );
                         });
+                        if clicked {
+                            *focused = Some(path.clone());
+                            if self.job.is_none()
+                                && c.blocked_reason.is_none()
+                                && !self.marked.remove(path)
+                            {
+                                self.marked.retain(|other| {
+                                    !other.starts_with(path) && !path.starts_with(other)
+                                });
+                                self.marked.insert(path.clone());
+                            }
+                        }
                     }
                 });
         };
@@ -606,8 +698,8 @@ impl App {
                                 project,
                                 japanese,
                                 body_height,
-                                &mut inspect,
-                                &mut finder_error,
+                                scan.kept.as_ref(),
+                                &mut actions,
                             );
                         }
                     },
@@ -633,8 +725,8 @@ impl App {
                     project,
                     japanese,
                     (body_height - table_height).max(100.),
-                    &mut inspect,
-                    &mut finder_error,
+                    scan.kept.as_ref(),
+                    &mut actions,
                 );
             }
         }
@@ -642,31 +734,22 @@ impl App {
         ui.add_space(8.);
         divider(ui);
         ui.add_space(8.);
-        let estimate = project
+        let estimate = scan
             .files
             .iter()
-            .map(|&i| &scan.files[i])
-            .filter(|c| {
-                self.marked.contains(&c.row.path)
-                    && !c
-                        .row
-                        .path
-                        .ancestors()
-                        .skip(1)
-                        .any(|p| self.marked.contains(p))
-            })
+            .filter(|c| self.marked.contains(&c.row.path))
             .fold(0u64, |sum, c| sum.saturating_add(c.row.usage.size()));
         let mut review = false;
         ui.horizontal(|ui| {
             ui.label(if japanese {
                 format!(
-                    "{} 件を選択 · 見込み {}",
+                    "全プロジェクトで {} 件を選択 · 見込み {}",
                     self.marked.len(),
                     bytes(estimate)
                 )
             } else {
                 format!(
-                    "{} selected · estimated {}",
+                    "{} selected across projects · estimated {}",
                     self.marked.len(),
                     bytes(estimate)
                 )
@@ -681,27 +764,26 @@ impl App {
                 .clicked();
             });
         });
-        if let Some(error) = finder_error {
+        if let Some(error) = actions.finder_error {
             self.status = error;
         }
         if !missing.is_empty() {
-            let selected = project.path.clone();
-            let focused = self.projects.focused.clone();
-            let query = self.projects.query.clone();
             let scan = self.scan.as_mut().unwrap();
             scan.files.retain(|c| !missing.contains(&c.row.path));
             self.marked.retain(|p| !missing.contains(p));
-            self.projects = Projects::from_scan(scan);
-            self.projects.selected = Some(selected);
-            self.projects.focused = focused.filter(|p| !missing.contains(p));
-            self.projects.query = query;
+            self.projects.refresh(scan);
             ui.ctx().request_repaint();
             return;
         }
         if self.job.is_some() {
             return;
         }
-        if let Some(path) = inspect {
+        if let Some((path, keep)) = actions.keep {
+            match super::keep::KeepRules::update(&path, keep) {
+                Ok(()) => self.refresh(ui.ctx(), false),
+                Err(error) => self.status = super::display_error(&error, japanese),
+            }
+        } else if let Some(path) = actions.inspect {
             let policy = scan.policy.clone();
             self.spawn(
                 ui.ctx(),
@@ -775,6 +857,69 @@ impl App {
                 .color(MUTED),
             );
         }
+        let japanese = self.japanese_reasons;
+        let mut review = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(if japanese {
+                format!(
+                    "掃除候補の合計 {}（{} 件）",
+                    bytes(self.projects.reclaim),
+                    self.projects.bulk_paths.len()
+                )
+            } else {
+                format!(
+                    "Cleanup candidates: {} ({} items)",
+                    bytes(self.projects.reclaim),
+                    self.projects.bulk_paths.len()
+                )
+            });
+            if self.marked.is_empty() {
+                if super::controls::button(
+                    ui,
+                    text(japanese, "まとめて選択", "Select all"),
+                    false,
+                    self.job.is_none() && !self.projects.bulk_paths.is_empty(),
+                )
+                .clicked()
+                {
+                    self.marked.clone_from(&self.projects.bulk_paths);
+                }
+            } else {
+                if ui
+                    .button(text(japanese, "選択を解除", "Clear selection"))
+                    .clicked()
+                {
+                    self.marked.clear();
+                }
+                let label = if japanese {
+                    format!("選択した {} 件を確認", self.marked.len())
+                } else {
+                    format!("Review {} selected", self.marked.len())
+                };
+                review = super::controls::button(
+                    ui,
+                    &label,
+                    true,
+                    self.job.is_none() && !self.marked.is_empty(),
+                )
+                .clicked();
+            }
+        });
+        if review {
+            let policy = scan.policy.clone();
+            let paths = self.marked.iter().cloned().collect();
+            self.spawn(
+                ui.ctx(),
+                text(
+                    japanese,
+                    "選択した候補を照合中…",
+                    "Checking selected candidates…",
+                ),
+                false,
+                move || Outcome::Review(Confirmation::prepare(policy, paths)),
+            );
+            return;
+        }
         ui.add_space(18.);
         ui.horizontal(|ui| {
             ui.label(
@@ -817,11 +962,27 @@ impl App {
             .size(14.)
             .color(MUTED),
         );
+        if self
+            .projects
+            .rows
+            .iter()
+            .any(|p| p.delta.is_some_and(Delta::is_partial))
+        {
+            ui.small(text(
+                japanese,
+                "* は読み取れなかった項目を含む概算です。",
+                "* includes a scan with unreadable entries.",
+            ));
+        }
         ui.add_space(4.);
         divider(ui);
-        let available = (ui.available_width() - 12. - 3. * ui.spacing().item_spacing.x).max(1.);
+        let available = (ui.available_width()
+            - ui.spacing().scroll.allocated_width()
+            - 16.
+            - 4. * ui.spacing().item_spacing.x)
+            .max(1.);
         let column = (available * 0.20).clamp(1., 106.);
-        let delta_width = (available * 0.18).clamp(1., 96.);
+        let delta_width = (available * 0.22).clamp(1., 132.);
         let widths = [
             available - 2. * column - delta_width,
             column,
@@ -857,18 +1018,15 @@ impl App {
                 "No project folders directly inside this workspace.",
             ));
         }
-        egui::ScrollArea::vertical().id_salt("projects").show_rows(
-            ui,
-            52.,
-            self.projects.rows.len(),
-            |ui, range| {
+        egui::ScrollArea::vertical()
+            .id_salt(("projects", &self.projects.root))
+            .show_rows(ui, 52., self.projects.rows.len(), |ui, range| {
                 for p in &self.projects.rows[range] {
                     let (mut row, response) = virtual_row(ui, &p.path, 52., false);
                     if response.clicked() {
                         self.projects.selected = Some(p.path.clone());
                         self.projects.focused = None;
                         self.projects.query.clear();
-                        self.marked.clear();
                     }
                     row.horizontal(|ui| {
                         ui.allocate_ui_with_layout(
@@ -893,7 +1051,6 @@ impl App {
                                     self.projects.selected = Some(p.path.clone());
                                     self.projects.focused = None;
                                     self.projects.query.clear();
-                                    self.marked.clear();
                                 }
                             },
                         );
@@ -918,14 +1075,14 @@ impl App {
                                 egui::Layout::right_to_left(Align::Center),
                                 |ui| {
                                     ui.set_width(widths[i + 1]);
-                                    ui.add(egui::Label::new(value).truncate());
+                                    ui.add(egui::Label::new(value.clone()).truncate())
+                                        .on_hover_text(value);
                                 },
                             );
                         }
                     });
                 }
-            },
-        );
+            });
     }
 }
 
@@ -938,9 +1095,7 @@ mod tests {
     };
     use std::sync::Arc;
 
-    #[test]
-    fn rankings_keep_nested_and_blocked_outputs_out_of_the_estimated_total() {
-        let root = PathBuf::from("/workspace");
+    fn sample_scan(root: &Path) -> Scan {
         let row = |path: &str, size| Row {
             path: root.join(path),
             is_dir: true,
@@ -954,8 +1109,9 @@ mod tests {
             producer: Producer::DeclaredOutput,
             blocked_reason: blocked.then(|| Message::new("kept", "保留")),
         };
-        let scan = Scan {
-            root: root.clone(),
+        Scan {
+            kept: Some(super::super::keep::KeepRules::default()),
+            root: root.to_owned(),
             inventory: Inventory {
                 directories: vec![row("a", 130), row("b", 120), row("b/other", 40)],
                 matches: vec![],
@@ -983,7 +1139,13 @@ mod tests {
             ],
             external: vec![],
             notes: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn rankings_keep_nested_and_blocked_outputs_out_of_the_estimated_total() {
+        let root = PathBuf::from("/workspace");
+        let scan = sample_scan(&root);
         let mut projects = Projects::from_scan(&scan);
         assert_eq!(projects.rows.len(), 2);
         assert_eq!(projects.rows[0].path, root.join("a"));
@@ -992,10 +1154,81 @@ mod tests {
             projects.rows[0].reviewable_cargo_parts[&root.join("a/target")],
             1
         );
+        assert_eq!(projects.reclaim, 55);
+        assert_eq!(
+            projects.bulk_paths,
+            BTreeSet::from([
+                root.join("b/other"),
+                root.join("a/target/debug/incremental")
+            ])
+        );
+        projects.selected = Some(root.join("a"));
+        projects.query = "incremental".into();
+        projects.refresh(&scan);
+        assert_eq!(projects.selected, Some(root.join("a")));
+        assert_eq!(projects.query, "incremental");
         projects.by_candidate = true;
         projects.sort();
         assert_eq!(projects.rows[0].path, root.join("b"));
         assert_eq!(projects.rows[0].reclaim, 40);
         assert_eq!(projects.rows[0].files.len(), 2);
+    }
+    #[test]
+    fn clicking_a_name_or_size_toggles_the_candidate_but_a_held_row_only_focuses() {
+        let root = Path::new("/workspace");
+        let scan = sample_scan(root);
+        let mut projects = Projects::from_scan(&scan);
+        projects.open_project(root.join("a"));
+        let mut app = App {
+            projects,
+            scan: Some(scan),
+            next_presence_check: Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            ),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let render = |app: &mut App, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200., 800.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.project_screen(ui),
+            )
+        };
+        let click = |app: &mut App, label: &str| {
+            let frame = render(app, Vec::new());
+            let pos = frame
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) if t.galley.text() == label => {
+                        Some(t.pos + t.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing row label: {label}"));
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            render(app, vec![egui::Event::PointerMoved(pos), button(true)]);
+            render(app, vec![button(false)]);
+        };
+        let nested = root.join("a/target/debug/incremental");
+        click(&mut app, "target/debug/incremental");
+        assert_eq!(app.marked, BTreeSet::from([nested.clone()]));
+        click(&mut app, "100 B");
+        assert_eq!(app.projects.focused, Some(root.join("a/target")));
+        assert_eq!(app.marked, BTreeSet::from([nested]));
+        click(&mut app, "15 B");
+        assert!(app.marked.is_empty());
     }
 }

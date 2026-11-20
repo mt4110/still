@@ -1,7 +1,6 @@
 use crate::cli::{CleanupHistoryArgs, ListFormat};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::BufReader;
@@ -34,7 +33,7 @@ pub(super) struct Record {
 }
 
 fn directory() -> Result<PathBuf> {
-    let dirs = ProjectDirs::from("com", "antigravity", "still")
+    let dirs = crate::storage_paths::project_dirs()
         .context("Could not determine the still data directory")?;
     Ok(dirs.data_local_dir().join("cleanup-history"))
 }
@@ -68,7 +67,7 @@ fn save_in(directory: &Path, record: &Record) -> Result<()> {
     Ok(())
 }
 
-fn load_from(directory: &Path, limit: usize) -> Result<Vec<Record>> {
+fn newest_paths(directory: &Path) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -83,7 +82,11 @@ fn load_from(directory: &Path, limit: usize) -> Result<Vec<Record>> {
         }
     }
     paths.sort_unstable_by(|a, b| b.cmp(a));
-    paths
+    Ok(paths)
+}
+
+fn load_from(directory: &Path, limit: usize) -> Result<Vec<Record>> {
+    newest_paths(directory)?
         .into_iter()
         .take(limit)
         .map(|path| {
@@ -97,6 +100,38 @@ fn load_from(directory: &Path, limit: usize) -> Result<Vec<Record>> {
             Ok(record)
         })
         .collect()
+}
+
+/// Read just the volume measurements. Older history files can contain thousands
+/// of individual outcomes, which the overview does not need to allocate.
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+pub(super) fn last_measurement(root: &Path) -> Result<Option<(u64, u64)>> {
+    last_measurement_in(&directory()?, root)
+}
+
+#[cfg(any(test, all(feature = "desktop", target_os = "macos")))]
+fn last_measurement_in(directory: &Path, root: &Path) -> Result<Option<(u64, u64)>> {
+    #[derive(Deserialize)]
+    struct Measurement {
+        version: u8,
+        root: PathBuf,
+        available_before: Option<u64>,
+        available_after: Option<u64>,
+    }
+    for path in newest_paths(directory)? {
+        let measurement: Measurement =
+            serde_json::from_reader(BufReader::new(fs::File::open(path)?))?;
+        if measurement.root == root {
+            anyhow::ensure!(
+                measurement.version == 1,
+                "Unsupported cleanup history version"
+            );
+            return Ok(measurement
+                .available_before
+                .zip(measurement.available_after));
+        }
+    }
+    Ok(None)
 }
 
 pub fn run(args: &CleanupHistoryArgs) -> Result<()> {
@@ -155,6 +190,11 @@ mod tests {
             }],
         };
         save_in(dir.path(), &record)?;
+        assert_eq!(
+            last_measurement_in(dir.path(), &record.root)?,
+            Some((10, 20))
+        );
+        assert!(last_measurement_in(dir.path(), Path::new("/other"))?.is_none());
         let records = load_from(dir.path(), 1)?;
         assert_eq!(records.len(), 1);
         assert_eq!(

@@ -9,6 +9,8 @@ pub(super) const THREADS: u16 = 4;
 pub(super) type Baseline = Option<Arc<history::Snapshot>>;
 
 pub(super) struct Scan {
+    #[cfg(target_os = "macos")]
+    pub kept: Option<super::keep::KeepRules>,
     pub root: PathBuf,
     pub policy: Arc<artifacts::Policy>,
     pub inventory: inventory::Inventory,
@@ -94,7 +96,39 @@ impl Scan {
             None
         };
         let files = artifacts::file_candidates(&inventory, &policy);
+        #[cfg(target_os = "macos")]
+        let (files, kept) = {
+            let mut files = files;
+            let kept = if read_only {
+                None
+            } else {
+                match super::keep::KeepRules::load() {
+                    Ok(rules) => {
+                        for c in &mut files {
+                            if c.blocked_reason.is_none() {
+                                c.blocked_reason = rules.reason(&c.row.path);
+                            }
+                        }
+                        Some(rules)
+                    }
+                    Err(error) => {
+                        let reason = super::Message::new(
+                            format!("Could not read keep settings: {error}"),
+                            format!("「残す」設定を読み取れません · {error}"),
+                        );
+                        notes.push(reason.to_string());
+                        for c in &mut files {
+                            c.blocked_reason.get_or_insert_with(|| reason.clone());
+                        }
+                        None
+                    }
+                }
+            };
+            (files, kept)
+        };
         Ok(Self {
+            #[cfg(target_os = "macos")]
+            kept,
             root,
             policy: Arc::new(policy),
             inventory,
@@ -122,12 +156,26 @@ pub(super) struct CleanupReceipt {
 pub(super) struct Confirmation {
     policy: Arc<artifacts::Policy>,
     items: Vec<artifacts::Prepared>,
+    totals: Vec<ReviewSize>,
+}
+
+pub(super) struct ReviewSize {
+    pub files: usize,
+    pub logical_bytes: u64,
+    pub scanned_allocated: Option<u64>,
 }
 
 impl Confirmation {
     pub fn prepare(policy: Arc<artifacts::Policy>, paths: Vec<PathBuf>) -> Result<Self> {
         if paths.is_empty() {
             bail!("Choose a generated folder to review.");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let rules = super::keep::KeepRules::load()?;
+            for path in &paths {
+                rules.check(path)?;
+            }
         }
         let items = run_in_pairs(&paths, |path| {
             policy.prepare(path).with_context(|| display(path))
@@ -142,21 +190,57 @@ impl Confirmation {
                 display(pair[1])
             );
         }
-        Ok(Self { policy, items })
+        // Walk reviewed file metadata on the worker. The confirmation modal
+        // can redraw many times without recounting a large Cargo target.
+        let totals = items
+            .iter()
+            .map(|item| ReviewSize {
+                files: item.files(),
+                logical_bytes: item.logical_bytes(),
+                scanned_allocated: None,
+            })
+            .collect();
+        Ok(Self {
+            policy,
+            items,
+            totals,
+        })
     }
 
     pub fn items(&self) -> &[artifacts::Prepared] {
         &self.items
     }
 
+    pub fn match_scan_sizes(&mut self, scan: &Scan) {
+        let sizes: std::collections::HashMap<_, _> = scan
+            .files
+            .iter()
+            .filter_map(|c| {
+                c.row
+                    .usage
+                    .allocated_bytes
+                    .map(|size| (c.row.path.as_path(), size))
+            })
+            .collect();
+        for (item, summary) in self.items.iter().zip(&mut self.totals) {
+            summary.scanned_allocated = sizes.get(item.path.as_path()).copied();
+        }
+    }
+
+    pub fn summaries(&self) -> impl Iterator<Item = (&artifacts::Prepared, &ReviewSize)> {
+        self.items.iter().zip(&self.totals)
+    }
+
     pub fn remove(self, root: &Path) -> CleanupReceipt {
         let started_at = chrono::Utc::now();
         let before = super::super::filesystem::available(root);
         let outcomes = run_in_pairs(&self.items, |item| {
-            let result = self
-                .policy
-                .remove(item)
-                .map_err(|err| super::Message::from_error(&err));
+            let result = (|| {
+                #[cfg(target_os = "macos")]
+                super::keep::KeepRules::load()?.check(&item.path)?;
+                self.policy.remove(item)
+            })()
+            .map_err(|err| super::Message::from_error(&err));
             (display(&item.path), result)
         });
         let after = super::super::filesystem::available(root);
