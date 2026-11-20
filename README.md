@@ -73,7 +73,7 @@ cargo run --locked --features desktop --bin still-desktop
 
 # macOS のローカル配布用 .app
 cargo build --locked --release --features desktop --bins
-scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.2.0 target/still.app
+scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.3.0 target/still.app
 ```
 
 別の Apple Silicon Mac に渡すときは、`still.app` を ZIP にまとめて転送し、展開したアプリを「アプリケーション」に入れます。転送先で Rust や Nix をインストールする必要はありません。週次プロファイルは端末ごとのパスを使うため、転送先で **Add workspace… → Save as…** から作成します。
@@ -88,7 +88,7 @@ PR の **Rust CI → build (macos-15)** が成功すると、実行結果の **A
 
 ```sh
 STILL_SIGNING_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
-  scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.2.0 target/still-signed.app
+  scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.3.0 target/still-signed.app
 scripts/notarize-macos-app.sh target/still-signed.app still-notary target/still-notarized.zip
 ```
 

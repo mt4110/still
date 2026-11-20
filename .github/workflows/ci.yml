@@ -44,7 +44,7 @@ jobs:
     - name: Package Apple Silicon app
       if: runner.os == 'macOS'
       run: |
-        scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.2.0 target/still.app
+        scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.3.0 target/still.app
         ditto -c -k --sequesterRsrc --keepParent target/still.app target/still-macos-arm64.zip
     - name: Upload Apple Silicon app
       if: runner.os == 'macOS'
