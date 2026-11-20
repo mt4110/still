@@ -323,6 +323,7 @@ impl App {
                 self.baseline.clear();
                 self.browse_folders = true;
                 self.read_only_browse = true;
+                self.view = super::View::Folders;
                 self.cleanup_receipt = None;
                 self.navigate(super::shell::Screen::Workspace);
                 self.refresh(ctx, false);
@@ -369,6 +370,42 @@ impl App {
             .unwrap_or_default();
         self.baseline.clear();
         self.refresh(ctx, true);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_scan_switches_from_candidates_to_folders() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        std::fs::create_dir(root.join("large-folder"))?;
+        let mut app = App {
+            view: super::super::View::Candidates,
+            ..App::default()
+        };
+        app.start_browse_scan(&egui::Context::default(), root.clone());
+        assert!(matches!(app.view, super::super::View::Folders));
+        assert!(app.read_only_browse);
+        let result = app
+            .job
+            .take()
+            .context("scan did not start")?
+            .result
+            .recv_timeout(std::time::Duration::from_secs(10))?;
+        let super::super::Outcome::Scan(scan) = result else {
+            anyhow::bail!("unexpected operation")
+        };
+        let scan = scan?;
+        assert!(scan
+            .inventory
+            .directories
+            .iter()
+            .any(|row| row.path == root.join("large-folder")));
+        assert!(scan.files.is_empty());
         Ok(())
     }
 }
