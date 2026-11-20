@@ -45,6 +45,50 @@ fn date(value: Option<DateTime<Utc>>, japanese: bool) -> String {
         .unwrap_or_else(|| text(japanese, "不明", "Unknown").into())
 }
 
+fn docker_size(value: &str) -> String {
+    storage::size_bytes(value)
+        .map(bytes)
+        .unwrap_or_else(|| value.to_owned())
+}
+
+fn relative_time(value: &str, japanese: bool) -> String {
+    if !japanese {
+        return value.to_owned();
+    }
+    if value == "Just now" || value == "just now" {
+        return "たった今".into();
+    }
+    if let Some(translated) = match value.to_ascii_lowercase().as_str() {
+        "less than a second ago" => Some("1秒未満前"),
+        "about a minute ago" => Some("約1分前"),
+        "about an hour ago" => Some("約1時間前"),
+        "about a day ago" => Some("約1日前"),
+        "about a week ago" => Some("約1週間前"),
+        "about a month ago" => Some("約1か月前"),
+        "about a year ago" => Some("約1年前"),
+        _ => None,
+    } {
+        return translated.into();
+    }
+    let parts: Vec<_> = value.split_whitespace().collect();
+    if let [number, unit, "ago"] = parts.as_slice() {
+        if number.parse::<u64>().is_ok() {
+            let unit = match *unit {
+                "second" | "seconds" => "秒",
+                "minute" | "minutes" => "分",
+                "hour" | "hours" => "時間",
+                "day" | "days" => "日",
+                "week" | "weeks" => "週間",
+                "month" | "months" => "か月",
+                "year" | "years" => "年",
+                _ => return value.to_owned(),
+            };
+            return format!("{number}{unit}前");
+        }
+    }
+    value.to_owned()
+}
+
 fn name(item: &storage::Resource) -> String {
     if item.name.trim().is_empty() {
         item.id.chars().take(12).collect()
@@ -218,8 +262,8 @@ fn cache_output_table(ui: &mut egui::Ui, output: &str, parsed: &ParsedOutput, ja
                                 } else {
                                     text(japanese, "いいえ", "No")
                                 });
-                                ui.label(&row.size);
-                                ui.label(&row.last_accessed);
+                                ui.label(docker_size(&row.size));
+                                ui.label(relative_time(&row.last_accessed, japanese));
                                 ui.end_row();
                             }
                         });
@@ -228,8 +272,9 @@ fn cache_output_table(ui: &mut egui::Ui, output: &str, parsed: &ParsedOutput, ja
     }
     if let Some(total) = &total {
         ui.label(format!(
-            "{}: {total}",
-            text(japanese, "Docker の報告容量", "Docker reported")
+            "{}: {}",
+            text(japanese, "Docker の報告容量", "Docker reported"),
+            docker_size(total)
         ));
     }
     if *unrecognized || (rows.is_empty() && total.is_none() && !output.trim().is_empty()) {
@@ -385,6 +430,16 @@ impl Panel {
         if let Some(result) = &self.cache_receipt {
             let receipt = &result.raw;
             ui.group(|ui| {
+                if let Some(error) = &receipt.history_error {
+                    ui.label(format!(
+                        "{} · {error}",
+                        text(
+                            japanese,
+                            "整理履歴を保存できませんでした",
+                            "Could not save cleanup history"
+                        )
+                    ));
+                }
                 ui.horizontal(|ui| {
                     ui.strong(text(
                         japanese,
@@ -459,6 +514,18 @@ impl Panel {
         }
         if !self.docker_error.is_empty() {
             ui.label(RichText::new(&self.docker_error).color(Color32::from_rgb(170, 50, 42)));
+        }
+        if self.observation_pending() && self.docker_job.is_none() {
+            ui.small(text(
+                japanese,
+                "容量の前回比較を記録中…",
+                "Recording storage comparison…",
+            ));
+        }
+        if let Some(Err(error)) = &self.observation_result {
+            ui.label(format!("{} · {error:#}", text(japanese,
+                "前回比較を記録できませんでした。概要には以前の記録が残る場合があります",
+                "Could not record the comparison. The overview may still show an older observation")));
         }
         let Some(result) = &self.docker else {
             if !busy {
@@ -543,7 +610,7 @@ impl Panel {
                     action = Action::ReviewCache;
                 }
             });
-            ui.small(text(japanese, "Docker の接続先にある該当キャッシュをまとめて整理します。正確な対象と回収量は事前に確定できません。", "Docker selects matching cache on this connection. Exact items and reclaimed space cannot be determined in advance."));
+            ui.small(text(japanese, "Docker の既定ビルダーが対象を判定します。使用中などの理由で行が残ることがあり、表示容量と回収量も一致するとは限りません。", "Docker's default builder selects the records. Some may remain, for example if in use, and reported size may differ from reclaimed space."));
         }
         let previous = (self.query.clone(), self.filter, self.sort, self.age_days);
         ui.add_enabled_ui(!busy, |ui| {
@@ -920,7 +987,7 @@ fn rows(
                         &item
                             .estimated_bytes
                             .map(bytes)
-                            .unwrap_or_else(|| item.size.clone()),
+                            .unwrap_or_else(|| docker_size(&item.size)),
                         15.0,
                         super::super::INK,
                         Align::Max,
@@ -936,12 +1003,12 @@ fn rows(
                             if item.last_used.is_empty() {
                                 text(japanese, "不明", "Unknown").to_owned()
                             } else {
-                                item.last_used.clone()
+                                relative_time(&item.last_used, japanese)
                             }
                         } else if !item.mounts.is_empty() {
                             item.mounts.clone()
                         } else {
-                            item.shared_size.clone()
+                            docker_size(&item.shared_size)
                         },
                         13.0,
                         MUTED,
@@ -994,7 +1061,7 @@ fn inspector(
         name(item)
     };
     ui.label(RichText::new(title).size(19.0).strong());
-    ui.label(RichText::new(&item.size).size(24.0));
+    ui.label(RichText::new(docker_size(&item.size)).size(24.0));
     ui.small(if kind == storage::Kind::Container {
         text(japanese, "コンテナの書込層", "Container writable layer")
     } else {
@@ -1040,9 +1107,9 @@ fn inspector(
         ui.label(format!(
             "{} {} · {} {}",
             text(japanese, "共有", "Shared"),
-            item.shared_size,
+            docker_size(&item.shared_size),
             text(japanese, "固有", "Unique"),
-            item.unique_size
+            docker_size(&item.unique_size)
         ));
     }
     ui.add_space(12.0);
@@ -1093,6 +1160,16 @@ fn show_receipt(
     names: &std::collections::BTreeMap<String, String>,
     japanese: bool,
 ) {
+    if let Some(error) = &receipt.history_error {
+        ui.label(format!(
+            "{} · {error}",
+            text(
+                japanese,
+                "整理履歴を保存できませんでした",
+                "Could not save cleanup history"
+            )
+        ));
+    }
     egui::Frame::NONE
         .stroke(Stroke::new(1.0_f32, LINE))
         .corner_radius(9)
@@ -1228,7 +1305,7 @@ impl App {
                 ui.set_width(520.0);
                 ui.heading(text(japanese, "ビルドキャッシュを整理しますか？", "Clean up build cache?"));
                 ui.strong(format!("{}: {}", text(japanese, "接続先", "Context"), review.context));
-                ui.label(if japanese { format!("この Docker の既定ビルダーで、{} 日以上未使用のキャッシュを Docker の基準でまとめて削除します。", review.days) } else { format!("Docker will prune unused cache older than {} days from this daemon's default builder.", review.days) });
+                ui.label(if japanese { format!("この Docker の既定ビルダーで、{} 日以上未使用のキャッシュを Docker の基準で削除します。通常は残る内部・フロントエンドのキャッシュも対象です。", review.days) } else { format!("Docker will prune unused cache older than {} days from this daemon's default builder, including internal and frontend cache.", review.days) });
                 ui.label(text(japanese, "対象の全件や回収量は事前に確定できません。次のビルドは遅くなり、キャッシュマウント内のデータが失われる場合があります。ゴミ箱には入りません。", "Exact records and reclaimed space are unknown in advance. Later builds may be slower and cache-mount data may be lost. This bypasses Trash."));
                 ui.horizontal(|ui| {
                     cancel = controls::button(ui, text(japanese, "キャンセル", "Cancel"), false, self.job.is_none()).clicked();
@@ -1270,7 +1347,7 @@ impl App {
             ui.label(text(japanese,"コンテナ内の書込データと Docker 管理ログが失われます。マウント先・ボリューム・イメージは残します。","Container writable data and Docker-managed logs will be lost. Mounts, volumes and images remain."));
             ui.add_space(12.0);
             egui::ScrollArea::vertical().max_height(280.0).show(ui,|ui| {
-                for item in &review.items { ui.strong(name(item)); ui.small(&item.id); ui.label(format!("{} · {} {}",item.size,text(japanese,"最終停止／作成","Stopped / created"),date(activity(item),japanese))); ui.label(item.reason.text(japanese)); ui.add_space(6.0); ui.separator(); }
+                for item in &review.items { ui.strong(name(item)); ui.small(&item.id); ui.label(format!("{} · {} {}",docker_size(&item.size),text(japanese,"最終停止／作成","Stopped / created"),date(activity(item),japanese))); ui.label(item.reason.text(japanese)); ui.add_space(6.0); ui.separator(); }
             });
             ui.add_space(12.0);
             ui.horizontal(|ui| {
@@ -1306,6 +1383,17 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docker_display_converts_known_values_and_preserves_unknown_values() {
+        assert_eq!(docker_size("2GB"), bytes(2_000_000_000));
+        assert_eq!(docker_size("unknown"), "unknown");
+        assert_eq!(relative_time("2 months ago", true), "2か月前");
+        assert_eq!(relative_time("1 hour ago", true), "1時間前");
+        assert_eq!(relative_time("About an hour ago", true), "約1時間前");
+        assert_eq!(relative_time("2 months ago", false), "2 months ago");
+        assert_eq!(relative_time("unknown format", true), "unknown format");
+    }
 
     #[test]
     fn cache_cleanup_output_preserves_rows_and_unknown_details() {

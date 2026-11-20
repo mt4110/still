@@ -105,6 +105,7 @@ impl App {
         if self.screen == screen {
             return;
         }
+        self.status.clear();
         self.monitor.close();
         self.sdk.open = screen == Screen::Apps;
         match screen {
@@ -115,7 +116,11 @@ impl App {
                     self.monitor.context = self.profile.docker_context.clone().unwrap_or_default();
                 }
             }
-            Screen::Overview => self.home.update_capacity(),
+            Screen::Overview => {
+                self.home.update_capacity();
+                self.home.reload_library_growth();
+                self.home.reload_docker_growth();
+            }
             Screen::Apps => self.sdk.open = true,
             _ => {}
         }
@@ -397,7 +402,24 @@ impl App {
             ui.add_space(12.0);
         }
         if !self.status.is_empty() {
-            ui.label(RichText::new(&self.status).color(egui::Color32::from_rgb(160, 50, 40)));
+            let success = self.status
+                == text(
+                    self.japanese_reasons,
+                    "ステージを片付けました。",
+                    "Removed the reviewed stage.",
+                )
+                || self.status
+                    == text(
+                        self.japanese_reasons,
+                        "残存データを復元しました。ステージの記録は残っています。",
+                        "Restored remaining data. The stage record remains.",
+                    );
+            let color = if success {
+                ACCENT
+            } else {
+                egui::Color32::from_rgb(160, 50, 40)
+            };
+            ui.label(RichText::new(&self.status).color(color));
             ui.add_space(10.0);
         }
     }
@@ -405,6 +427,7 @@ impl App {
     fn cleanup_result(&mut self, ui: &mut egui::Ui) {
         if let Some(receipt) = &self.cleanup_receipt {
             let mut dismiss = false;
+            let mut review_stages = false;
             let actual = match (receipt.before, receipt.after) {
                 (Some(before), Some(after)) => format!(
                     "{}{}",
@@ -456,6 +479,24 @@ impl App {
                             receipt.held
                         )
                     });
+                    if receipt.held > 0 {
+                        ui.small(text(
+                            self.japanese_reasons,
+                            "元の場所に残っていない場合も、ステージにデータが残っている可能性があります。",
+                            "Data may remain in a stage even if it is no longer at the original location.",
+                        ));
+                        review_stages = ui
+                            .add_enabled(
+                                self.job.is_none()
+                                    && self.scan.as_ref().is_some_and(|scan| !scan.policy.roots.is_empty()),
+                                egui::Button::new(text(
+                                    self.japanese_reasons,
+                                    "残ったステージを確認…",
+                                    "Review leftover stages…",
+                                )),
+                            )
+                            .clicked();
+                    }
                     ui.collapsing(
                         text(
                             self.japanese_reasons,
@@ -481,6 +522,9 @@ impl App {
                 });
             if dismiss {
                 self.cleanup_receipt = None;
+            }
+            if review_stages {
+                self.open_stage_list();
             }
             ui.add_space(12.0);
         }

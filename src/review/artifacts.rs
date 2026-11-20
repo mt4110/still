@@ -117,7 +117,8 @@ impl Policy {
         if matches!(
             path.file_name().and_then(|s| s.to_str()),
             Some("incremental" | "deps")
-        ) && cargo_cache::cache_root(path).is_some_and(|target| self.permits(target))
+        ) && cargo_cache::cache_root(path)
+            .is_some_and(|target| self.permits(target) && self.has_enclosing_cargo_project(target))
         {
             return Some(if path.ends_with("incremental") {
                 Producer::CargoIncremental
@@ -125,7 +126,9 @@ impl Policy {
                 Producer::CargoDependencies
             });
         }
-        if cargo_cache::incremental_unit(path).is_some_and(|target| self.permits(target)) {
+        if cargo_cache::incremental_unit(path)
+            .is_some_and(|target| self.permits(target) && self.has_enclosing_cargo_project(target))
+        {
             return Some(Producer::CargoIncremental);
         }
         let parent = path.parent()?;
@@ -184,7 +187,17 @@ impl Policy {
             let unit = path
                 .parent()
                 .is_some_and(|parent| parent.ends_with("incremental"));
-            for parent in path.ancestors().skip(1).take(if unit { 3 } else { 2 }) {
+            let cache = if unit {
+                path.parent().expect("incremental parent")
+            } else {
+                &path
+            };
+            let target = cargo_cache::cache_root(cache).context("Cargo cache root changed")?;
+            for parent in path
+                .ancestors()
+                .skip(1)
+                .take_while(|parent| parent.starts_with(target))
+            {
                 for marker in [".still-active", ".keep", ".gitkeep", ".git"] {
                     match fs::symlink_metadata(parent.join(marker)) {
                         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -341,9 +354,6 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
                 .skip(1)
                 .any(|dir| cargo_roots.contains(dir))
     });
-    if found.is_empty() {
-        return Vec::new();
-    }
     let mounts = policy
         .docker_context
         .as_deref()
@@ -381,7 +391,7 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
     let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
     let mut files: Vec<_> = std::thread::scope(|scope| {
         found
-            .chunks(found.len().div_ceil(workers))
+            .chunks(found.len().div_ceil(workers).max(1))
             .map(|chunk| {
                 let inspect = &inspect;
                 scope.spawn(move || {
@@ -399,22 +409,25 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
     // Only expand a held target; keep the ordinary Cargo row for a clean build tree.
     let held_targets: HashSet<_> = files
         .iter()
-        .filter(|c| c.blocked_reason.is_some() && c.producer == Producer::Cargo)
+        .filter(|c| {
+            c.blocked_reason.is_some()
+                && matches!(c.producer, Producer::Cargo | Producer::CargoRelocated)
+        })
         .map(|c| c.row.path.clone())
         .collect();
-    if !held_targets.is_empty() {
-        for row in &scan.directories {
-            if !matches!(
-                row.path.file_name().and_then(|s| s.to_str()),
-                Some("incremental" | "deps")
-            ) || !row
-                .path
-                .ancestors()
-                .nth(2)
-                .is_some_and(|p| held_targets.contains(p))
-            {
-                continue;
-            }
+    let identified_targets: HashSet<_> = files
+        .iter()
+        .filter(|c| matches!(c.producer, Producer::Cargo | Producer::CargoRelocated))
+        .map(|c| c.row.path.clone())
+        .collect();
+    for row in &scan.directories {
+        let Some(target) = cargo_cache::cache_root(&row.path) else {
+            continue;
+        };
+        // A held target or one whose markers were lost can still contain
+        // separately reviewable compiler caches. Do not add overlapping rows
+        // when the whole target is already selectable.
+        if held_targets.contains(target) || !identified_targets.contains(target) {
             if let Some(producer) = policy.producer(&row.path).filter(|p| p.is_partial_cargo()) {
                 files.push(inspect(row, producer, None));
             }
@@ -706,6 +719,13 @@ pub fn verify_staged(tree: &Tree, payload: &Path) -> Result<()> {
                 // Moving the root into staging can change its ctime.
                 actual.changed = expected.changed;
             }
+            #[cfg(unix)]
+            if !actual.is_dir && !expected.is_dir {
+                // Finder and hard-link metadata can change ctime after staging
+                // without changing file contents. stamp has already checked
+                // the file identity and watched for changes while hashing it.
+                actual.changed = expected.changed;
+            }
             #[cfg(target_os = "macos")]
             if actual != *expected
                 && actual.is_dir
@@ -973,6 +993,30 @@ fn has_dependency(project: &Path, package: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn change_test_file_metadata(path: &Path) -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let before = fs::metadata(path)?;
+        let original_changed = (before.ctime(), before.ctime_nsec());
+        let mode = before.permissions().mode() ^ 0o100;
+        // Some filesystems expose coarse timestamps; wait briefly for ctime
+        // to advance so the test actually covers a changed ctime.
+        for _ in 0..210 {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+            let after = fs::metadata(path)?;
+            assert_ne!(
+                after.permissions().mode() & 0o100,
+                before.permissions().mode() & 0o100
+            );
+            if (after.ctime(), after.ctime_nsec()) != original_changed {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        bail!("File ctime did not advance after metadata change")
+    }
+
     fn fixture() -> (tempfile::TempDir, PathBuf, Policy) {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().canonicalize().unwrap();
@@ -999,6 +1043,56 @@ mod tests {
         verify_staged(&prepared.tree, &staged)?;
         fs::write(staged.join("debug/keep.txt"), b"user file")?;
         assert!(verify_staged(&prepared.tree, &staged).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_removal_accepts_metadata_changes_but_rejects_modified_contents() -> Result<()> {
+        let (_temp, output, policy) = fixture();
+        let prepared = policy.prepare(&output)?;
+        let staged = output.with_file_name("payload");
+        fs::rename(&output, &staged)?;
+        verify_staged(&prepared.tree, &staged)?;
+        change_test_file_metadata(&staged.join("build.bin"))?;
+        filesystem::test_remove_staged(staged.parent().unwrap(), &prepared.tree)?;
+        assert!(!staged.exists());
+
+        let (_temp, output, policy) = fixture();
+        let prepared = policy.prepare(&output)?;
+        let staged = output.with_file_name("payload");
+        fs::rename(&output, &staged)?;
+        verify_staged(&prepared.tree, &staged)?;
+        let modified = fs::metadata(staged.join("build.bin"))?.modified()?;
+        fs::write(staged.join("build.bin"), b"different")?;
+        fs::File::options()
+            .write(true)
+            .open(staged.join("build.bin"))?
+            .set_times(fs::FileTimes::new().set_modified(modified))?;
+        assert!(filesystem::test_remove_staged(staged.parent().unwrap(), &prepared.tree).is_err());
+        assert_eq!(fs::read(staged.join("build.bin"))?, b"different");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_verification_accepts_metadata_changes_but_rejects_modified_contents() -> Result<()> {
+        let (_temp, output, policy) = fixture();
+        let prepared = policy.prepare(&output)?;
+        let staged = output.with_file_name("payload");
+        fs::rename(&output, &staged)?;
+        let file = staged.join("build.bin");
+        let modified = fs::metadata(&file)?.modified()?;
+        change_test_file_metadata(&file)?;
+        verify_staged(&prepared.tree, &staged)?;
+
+        fs::write(&file, b"different")?;
+        fs::File::options()
+            .write(true)
+            .open(&file)?
+            .set_times(fs::FileTimes::new().set_modified(modified))?;
+        assert!(verify_staged(&prepared.tree, &staged).is_err());
+        assert_eq!(fs::read(file)?, b"different");
         Ok(())
     }
 
@@ -1096,6 +1190,88 @@ mod tests {
         fs::remove_file(&log)?;
         assert!(policy.prepare(&target).is_err());
         assert!(result.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn markerless_restored_target_only_exposes_strictly_verified_cache_parts() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().canonicalize()?;
+        let target = root.join("target-aarch64");
+        let profile = target.join("aarch64-apple-darwin/debug");
+        let deps = profile.join("deps");
+        let incremental = profile.join("incremental");
+        fs::create_dir_all(&deps)?;
+        fs::create_dir(&incremental)?;
+        fs::create_dir(profile.join(".fingerprint"))?;
+        fs::write(profile.join(".cargo-lock"), b"")?;
+        fs::write(root.join("Cargo.toml"), b"[workspace]")?;
+        fs::write(root.join(".gitignore"), b"/target-aarch64/")?;
+        git::check(git::run(&root, ["init", "-q"])?, "init")?;
+        fs::write(deps.join("demo-0123456789abcdef.d"), b"build metadata")?;
+        let unit = incremental.join("demo-0123456789abc");
+        let session = "s-ho9wx39w3k-0u5spzg";
+        let generation = format!("{session}-0xny0l54dee30tk2bxf7bttju");
+        fs::create_dir_all(unit.join(&generation))?;
+        fs::write(unit.join(&generation).join("dep-graph.bin"), b"generated")?;
+        fs::write(unit.join(format!("{session}.lock")), b"")?;
+        let policy = Policy {
+            roots: vec![root.clone()],
+            outputs: vec![],
+            docker_context: None,
+        };
+        let scan = inventory::scan(&root, 2, None)?;
+        let rows = file_candidates(&scan, &policy);
+        assert!(!rows.iter().any(|row| row.row.path == target));
+        assert!(
+            rows.iter()
+                .any(|row| row.row.path == deps && row.blocked_reason.is_none()),
+            "deps: {:?}",
+            rows.iter()
+                .find(|row| row.row.path == deps)
+                .and_then(|row| row.blocked_reason.as_ref())
+                .map(ToString::to_string)
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.row.path == incremental && row.blocked_reason.is_none()));
+        let approved = policy.prepare(&deps)?;
+        let approved_unit = policy.prepare(&unit)?;
+        fs::write(deps.join("personal-notes.txt"), b"preserve")?;
+        assert!(policy.remove(&approved).is_err());
+        let scan = inventory::scan(&root, 2, None)?;
+        assert!(file_candidates(&scan, &policy)
+            .iter()
+            .any(|row| row.row.path == deps && row.blocked_reason.is_some()));
+        assert!(deps.join("personal-notes.txt").is_file());
+        // A target-level keep marker applies even through the triple/profile hierarchy.
+        fs::write(target.join(".keep"), b"preserve")?;
+        assert!(policy.remove(&approved_unit).is_err());
+        assert!(unit.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn markerless_caches_require_a_real_cargo_project_and_profile_structure() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().canonicalize()?;
+        let target = root.join("target-other");
+        let profile = target.join("debug");
+        let deps = profile.join("deps");
+        fs::create_dir_all(&deps)?;
+        fs::create_dir(profile.join(".fingerprint"))?;
+        fs::write(profile.join(".cargo-lock"), b"")?;
+        let policy = Policy {
+            roots: vec![root.clone()],
+            outputs: vec![],
+            docker_context: None,
+        };
+        assert!(policy.producer(&deps).is_none());
+        fs::write(root.join("Cargo.toml"), b"[workspace]")?;
+        assert_eq!(policy.producer(&deps), Some(Producer::CargoDependencies));
+        // A present but unrecognized marker must not be treated as missing.
+        fs::write(target.join("CACHEDIR.TAG"), b"not a Cargo marker")?;
+        assert!(policy.producer(&deps).is_none());
         Ok(())
     }
 

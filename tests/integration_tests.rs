@@ -68,13 +68,20 @@ recommended_action = "Trash"
         "Plan missing target file"
     );
 
-    // Simulate User Action: Change selected_action from Keep to Trash
-    // (In reality, TUI does this. For test, we edit the JSON)
-    let plan_modified = plan_content.replace(
-        r#""selected_action": "Keep""#,
-        r#""selected_action": "Trash""#,
-    );
-    fs::write(&plan_path, plan_modified).unwrap();
+    // A recommendation must not select an action without the user's review.
+    let mut plan: serde_json::Value = serde_json::from_str(&plan_content).unwrap();
+    let entries = plan["entries"].as_array_mut().unwrap();
+    assert!(entries
+        .iter()
+        .all(|entry| entry["selected_action"] == "Keep"));
+    let target = entries
+        .iter_mut()
+        .find(|entry| entry["path"].as_str() == target_file.to_str())
+        .unwrap();
+    assert_eq!(target["recommended_action"], "Trash");
+    // Simulate explicitly selecting only this item in the TUI.
+    target["selected_action"] = serde_json::json!("Trash");
+    fs::write(&plan_path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
 
     // 2. Apply --dry-run
     // We need --allow-outside-scope because temp dir is not in ~/Library
@@ -101,7 +108,7 @@ recommended_action = "Trash"
         println!("Modified Plan: {}", fs::read_to_string(&plan_path).unwrap());
     }
     assert!(stdout.contains("(Dry Run)"));
-    assert!(stdout.contains("Trash: 2 items"));
+    assert!(stdout.contains("Trash: 1 items"));
 
     assert!(
         target_file.exists(),

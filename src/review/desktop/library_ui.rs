@@ -10,6 +10,8 @@ impl App {
         let mut review_sdk = false;
         #[cfg(target_os = "macos")]
         let mut cache_action = None;
+        #[cfg(target_os = "macos")]
+        let mut group_check = None;
         let render = |ui: &mut egui::Ui| {
             if !as_page {
                 ui.set_width((ctx.content_rect().width() - 80.0).clamp(590.0, 920.0));
@@ -29,6 +31,12 @@ impl App {
                 "所有元と再生成方法を確認できたキャッシュは、内容を確認してから整理できます。",
                 "Review an eligible cache separately before removing it.",
             ));
+            #[cfg(target_os = "macos")]
+            {
+                group_check = self.library_panel.group_ui(ui, busy, self.japanese_reasons);
+                self.library_panel
+                    .assertion_overview(ui, busy, self.japanese_reasons);
+            }
             ui.add_enabled_ui(!busy, |ui| {
                 ui.checkbox(
                     &mut self.xcode_runtimes,
@@ -93,35 +101,56 @@ impl App {
                                     size_basis(row.size_basis, self.japanese_reasons)
                                 );
                                 #[cfg(target_os = "macos")]
-                                let title = format!(
-                                    "{title}{}",
-                                    self.library_panel.marker(row, index, self.japanese_reasons)
-                                );
+                                let access = self.library_panel.access(row, index);
+                                #[cfg(target_os = "macos")]
+                                let title =
+                                    format!("{title}{}", access.label(self.japanese_reasons));
                                 let header = egui::CollapsingHeader::new(title).id_salt((
                                     row.path.as_deref(),
                                     &row.label,
                                     index,
                                 ));
-                                header.show(ui, |ui| {
-                                    if let Some(path) = &row.path {
-                                        ui.label(path);
-                                    }
-                                    ui.label(row.reason.text(self.japanese_reasons));
+                                ui.horizontal(|ui| {
                                     #[cfg(target_os = "macos")]
-                                    {
-                                        if let Some(evidence) = &row.library {
-                                            ui.small(evidence.activity_text(self.japanese_reasons));
-                                        }
-                                        if let Some(action) = self.library_panel.row(
-                                            ui,
-                                            row,
-                                            index,
-                                            busy,
-                                            self.japanese_reasons,
-                                        ) {
-                                            cache_action = Some(action);
-                                        }
+                                    if access.is_locked() {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(14.0, 14.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        icons::paint(ui, rect, icons::Icon::Lock, MUTED);
                                     }
+                                    header.show(ui, |ui| {
+                                        if let Some(path) = &row.path {
+                                            ui.label(path);
+                                        }
+                                        ui.label(row.reason.text(self.japanese_reasons));
+                                        #[cfg(target_os = "macos")]
+                                        {
+                                            if let Some(evidence) = &row.library {
+                                                ui.small(
+                                                    evidence.activity_text(self.japanese_reasons),
+                                                );
+                                                ui.small(
+                                                    evidence.name_hints_text(self.japanese_reasons),
+                                                );
+                                                self.library_panel.uninstall_row(
+                                                    ui,
+                                                    evidence,
+                                                    busy,
+                                                    self.japanese_reasons,
+                                                );
+                                            }
+                                            if let Some(action) = self.library_panel.row(
+                                                ui,
+                                                row,
+                                                index,
+                                                busy,
+                                                self.japanese_reasons,
+                                            ) {
+                                                cache_action = Some(action);
+                                            }
+                                        }
+                                    });
                                 });
                                 ui.separator();
                             }
@@ -171,6 +200,23 @@ impl App {
         if let Some(action) = cache_action {
             self.cache_action(ctx, action);
         }
+        #[cfg(target_os = "macos")]
+        self.library_panel
+            .uninstall_modal(ctx, self.japanese_reasons);
+        #[cfg(target_os = "macos")]
+        if let Some((app, group)) = group_check {
+            self.library_panel.group_result = None;
+            self.spawn(
+                ctx,
+                text(
+                    self.japanese_reasons,
+                    "アプリの署名と宣言を確認中…",
+                    "Checking the app signature and declaration…",
+                ),
+                false,
+                move || Outcome::GroupLink(app_storage::group_link::inspect(&app, &group)),
+            );
+        }
         if start {
             self.app_storage = None;
             #[cfg(target_os = "macos")]
@@ -199,7 +245,13 @@ pub(super) use mac::{Panel, SavedReceipt};
 #[cfg(target_os = "macos")]
 mod mac {
     use super::*;
-    use crate::review::{app_storage::known_cache, cleanup_history};
+    use crate::review::{
+        app_storage::{
+            known_cache,
+            uninstall_assertions::{Records, Scope},
+        },
+        cleanup_history,
+    };
     use keep::KeepRules;
 
     #[derive(Default)]
@@ -209,6 +261,33 @@ mod mac {
         settings_error: Option<String>,
         pub(in crate::review::desktop) review: Option<Result<known_cache::PreparedCache>>,
         pub(in crate::review::desktop) receipt: Option<Result<SavedReceipt>>,
+        group_app: Option<PathBuf>,
+        group_id: String,
+        pub(in crate::review::desktop) group_result:
+            Option<Result<app_storage::group_link::Declaration>>,
+        assertions: Option<Result<Records>>,
+        observed_registered_ids: std::collections::BTreeSet<String>,
+        assertion_draft: Option<AssertionDraft>,
+        assertion_error: Option<String>,
+    }
+
+    struct AssertionDraft {
+        id: String,
+        registered: bool,
+        scope: Option<Scope>,
+        acknowledged: bool,
+    }
+
+    fn scope_text(scope: Scope, ja: bool) -> &'static str {
+        match scope {
+            Scope::SystemApplications => text(ja, "/Applications のみ", "/Applications only"),
+            Scope::UserApplications => text(ja, "~/Applications のみ", "~/Applications only"),
+            Scope::BothApplications => text(
+                ja,
+                "/Applications と ~/Applications",
+                "/Applications and ~/Applications",
+            ),
+        }
     }
 
     pub(in crate::review::desktop) struct SavedReceipt {
@@ -221,15 +300,295 @@ mod mac {
         Review(PathBuf),
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Access {
+        Reviewable,
+        Kept,
+        Unavailable,
+        ReadOnly,
+    }
+
+    impl Access {
+        pub(super) fn is_locked(self) -> bool {
+            self != Self::Reviewable
+        }
+        pub(super) fn label(self, ja: bool) -> &'static str {
+            match self {
+                Self::Reviewable => text(ja, " · HTTP キャッシュを確認", " · Review HTTP cache"),
+                Self::Kept => text(ja, " · 残す設定", " · Kept"),
+                Self::Unavailable => text(ja, " · 確認保留", " · Review unavailable"),
+                Self::ReadOnly => {
+                    text(ja, " · この画面では閲覧のみ", " · View only on this screen")
+                }
+            }
+        }
+    }
+
     impl Panel {
+        fn overview_draft(&self, id: String) -> AssertionDraft {
+            AssertionDraft {
+                registered: self.observed_registered_ids.contains(&id),
+                id,
+                scope: None,
+                acknowledged: false,
+            }
+        }
+
+        pub(super) fn assertion_overview(&mut self, ui: &mut egui::Ui, busy: bool, ja: bool) {
+            if self.assertions.is_none() {
+                self.assertions = Some(Records::load());
+            }
+            let mut revoke: Option<String> = None;
+            let mut update: Option<String> = None;
+            let mut reload = false;
+            ui.collapsing(text(ja, "自分のアンインストール確認記録", "Your uninstall confirmation records"), |ui| {
+                ui.small(text(ja, "本人の申告です。OSの検出とは別で、削除可否には使いません。", "Your statements are separate from OS detection and never control deletion."));
+                match &self.assertions {
+                    Some(Ok(records)) => {
+                        if records.entries().next().is_none() { ui.small(text(ja, "記録はありません。", "No records.")); }
+                        for (id, record) in records.entries() {
+                            let date = record.updated_at.with_timezone(&chrono::Local).format("%Y/%m/%d %H:%M");
+                            ui.label(format!("{id} · {} · {} · {date}", scope_text(record.scope, ja), if record.confirmed() { text(ja, "本人確認済み", "Confirmed by you") } else { text(ja, "撤回済み", "Revoked") }));
+                            ui.horizontal(|ui| {
+                                if ui.add_enabled(!busy, egui::Button::new(text(ja, "再確認…", "Confirm again…"))).clicked() { update = Some(id.to_owned()); }
+                                if record.confirmed() && ui.add_enabled(!busy, egui::Button::new(text(ja, "撤回", "Revoke"))).clicked() { revoke = Some(id.to_owned()); }
+                            });
+                        }
+                    }
+                    Some(Err(error)) => { ui.label(format!("{} · {error:#}", text(ja, "確認記録を読み込めません", "Could not read confirmations"))); }
+                    None => {}
+                }
+                reload = ui.add_enabled(!busy, egui::Button::new(text(ja, "記録を再読み込み", "Reload records"))).clicked();
+                if let Some(error) = &self.assertion_error { ui.label(format!("{} · {error}", text(ja, "記録を更新できません", "Could not update confirmation"))); }
+            });
+            if reload {
+                self.assertions = Some(Records::load());
+            }
+            if let Some(id) = revoke {
+                match Records::revoke(&id) {
+                    Ok(records) => {
+                        self.assertions = Some(Ok(records));
+                        self.assertion_error = None;
+                    }
+                    Err(error) => self.assertion_error = Some(format!("{error:#}")),
+                }
+            }
+            if let Some(id) = update {
+                self.assertion_draft = Some(self.overview_draft(id));
+                self.assertion_error = None;
+            }
+        }
+
+        pub(super) fn group_ui(
+            &mut self,
+            ui: &mut egui::Ui,
+            busy: bool,
+            ja: bool,
+        ) -> Option<(PathBuf, String)> {
+            let mut check = false;
+            ui.collapsing(text(ja, "選んだアプリの App Group 宣言を照合…", "Check an app's App Group declaration…"), |ui| {
+                ui.label(text(ja, "アプリ1つの署名付き宣言と指定したIDを完全一致で照合します。", "Compare one selected app's signed declaration with an exact group ID."));
+                ui.small(text(ja, "署名の整合性は発行元の真正性を証明しません。他の利用元や使用中かどうかも分かりません。同時変更をすべて検出できる保証はありません。", "Signature integrity does not prove publisher identity, other group members, or whether the group is in use. Concurrent changes may not always be detected."));
+                ui.add_enabled_ui(!busy, |ui| {
+                    if ui.button(text(ja, "アプリを選ぶ…", "Choose app…")).clicked() {
+                        if let Some(path) = rfd::FileDialog::new().add_filter("Application", &["app"]).pick_file() {
+                            self.group_app = Some(path);
+                            self.group_result = None;
+                        }
+                    }
+                    if let Some(path) = &self.group_app { ui.small(display(path)); }
+                    ui.horizontal(|ui| {
+                        ui.label(text(ja, "App Group ID", "App Group ID"));
+                        if ui.text_edit_singleline(&mut self.group_id).changed() { self.group_result = None; }
+                    });
+                    check = ui.add_enabled(self.group_app.is_some() && !self.group_id.is_empty(), egui::Button::new(text(ja, "宣言を照合", "Check declaration"))).clicked();
+                });
+                if let Some(result) = &self.group_result {
+                    use app_storage::group_link::Declaration;
+                    match result {
+                        Ok(Declaration::Match) => { ui.label(text(ja, "このアプリの署名付き宣言に、指定IDの完全一致があります。", "The app's signed declaration contains the exact ID.")); }
+                        Ok(Declaration::NoMatch) => { ui.label(text(ja, "このアプリの署名付き宣言に、指定IDはありません。", "The app's signed declaration does not contain the ID.")); }
+                        Ok(Declaration::NoGroups) => { ui.label(text(ja, "このアプリの署名に App Groups の宣言はありません。", "The app signature has no App Groups declaration.")); }
+                        Err(error) => { ui.label(text(ja, "宣言を確認できませんでした。", "The declaration could not be verified.")); ui.small(format!("{error:#}")); }
+                    }
+                }
+            });
+            check.then(|| (self.group_app.clone().unwrap(), self.group_id.clone()))
+        }
+
         pub(in crate::review::desktop) fn scanned(&mut self, result: &Result<app_storage::Report>) {
             self.load_kept();
+            self.assertions = Some(Records::load());
+            self.observed_registered_ids = result
+                .as_ref()
+                .ok()
+                .into_iter()
+                .flat_map(|report| report.rows.iter())
+                .filter_map(|row| {
+                    let evidence = row.library.as_ref()?;
+                    evidence
+                        .registered_bundle_observed()
+                        .then(|| evidence.bundle_id().map(str::to_owned))
+                        .flatten()
+                })
+                .collect();
             self.cache_row =
                 result.as_ref().ok().and_then(|report| {
                     report.rows.iter().enumerate().find_map(|(index, row)| {
                         known_cache::candidate(row).map(|path| (index, path))
                     })
                 });
+        }
+
+        pub(super) fn uninstall_row(
+            &mut self,
+            ui: &mut egui::Ui,
+            evidence: &app_storage::library::Evidence,
+            busy: bool,
+            ja: bool,
+        ) {
+            let Some(id) = evidence.bundle_id() else {
+                return;
+            };
+            ui.add_space(6.);
+            ui.label(text(
+                ja,
+                "アンインストールについての自分の確認",
+                "Your uninstall confirmation",
+            ));
+            let mut revoke = false;
+            match &self.assertions {
+                Some(Ok(records)) => match records.get(id) {
+                    Some(record) => {
+                        let timestamp = record
+                            .updated_at
+                            .with_timezone(&chrono::Local)
+                            .format("%Y/%m/%d %H:%M");
+                        let scope = scope_text(record.scope, ja);
+                        ui.small(if ja {
+                            format!(
+                                "{} · {scope} · {timestamp}",
+                                if record.confirmed() {
+                                    "本人が確認済みとして記録"
+                                } else {
+                                    "本人が確認記録を撤回"
+                                }
+                            )
+                        } else {
+                            format!(
+                                "{} · {scope} · {timestamp}",
+                                if record.confirmed() {
+                                    "Confirmed by you"
+                                } else {
+                                    "Confirmation revoked by you"
+                                }
+                            )
+                        });
+                        if record.confirmed() {
+                            revoke = ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new(text(
+                                        ja,
+                                        "この確認を撤回",
+                                        "Revoke confirmation",
+                                    )),
+                                )
+                                .clicked();
+                        }
+                    }
+                    None => {
+                        ui.small(text(
+                            ja,
+                            "本人の確認記録はありません。",
+                            "No confirmation from you is recorded.",
+                        ));
+                    }
+                },
+                Some(Err(error)) => {
+                    ui.small(format!(
+                        "{} · {error:#}",
+                        text(
+                            ja,
+                            "確認記録を読み込めません",
+                            "Could not read confirmations"
+                        )
+                    ));
+                    return;
+                }
+                None => return,
+            }
+            if revoke {
+                match Records::revoke(id) {
+                    Ok(records) => {
+                        self.assertions = Some(Ok(records));
+                        self.assertion_error = None;
+                    }
+                    Err(error) => self.assertion_error = Some(format!("{error:#}")),
+                }
+            }
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(text(
+                        ja,
+                        "自分の確認を記録・更新…",
+                        "Record or update your confirmation…",
+                    )),
+                )
+                .clicked()
+            {
+                self.assertion_draft = Some(AssertionDraft {
+                    id: id.into(),
+                    registered: evidence.registered_bundle_observed(),
+                    scope: None,
+                    acknowledged: false,
+                });
+                self.assertion_error = None;
+            }
+            if let Some(error) = &self.assertion_error {
+                ui.small(format!(
+                    "{} · {error}",
+                    text(ja, "記録を更新できません", "Could not update confirmation")
+                ));
+            }
+        }
+
+        pub(super) fn uninstall_modal(&mut self, ctx: &egui::Context, ja: bool) {
+            let Some(draft) = &mut self.assertion_draft else {
+                return;
+            };
+            let mut save = false;
+            let mut close = false;
+            let modal = egui::Modal::new("uninstall-user-confirmation".into()).show(ctx, |ui| {
+                ui.heading(text(ja, "自分の確認を記録", "Record your confirmation"));
+                ui.label(format!("Bundle ID: {}", draft.id));
+                ui.label(text(ja, "フォルダ名から推定したIDです。対象のアプリとIDを自分で確かめてください。", "This ID comes from the folder name. Verify the app and ID yourself."));
+                ui.small(text(ja, "この確認記録からOS登録の有無は分かりません。", "This confirmation does not establish OS registration status."));
+                if draft.registered { ui.label(text(ja, "注意: 今回の調査では、このIDの登録済みアプリも観測しています。", "Note: this scan also observed a registered app with this ID.")); }
+                ui.label(text(ja, "確認した場所を選んでください。ほかの場所は確認範囲に含みません。", "Choose the locations you checked; other locations are outside this record."));
+                for scope in [Scope::SystemApplications, Scope::UserApplications, Scope::BothApplications] {
+                    ui.radio_value(&mut draft.scope, Some(scope), scope_text(scope, ja));
+                }
+                ui.checkbox(&mut draft.acknowledged, text(ja, "このIDのアプリを自分でアンインストールし、選んだ場所を確認しました。", "I uninstalled the app with this ID and checked the selected locations."));
+                ui.small(text(ja, "本人の申告として日時と範囲を保存します。OSやstillによる証明ではなく、削除可否や自動選択には使いません。", "This records your statement with its time and scope. It is not proof by the OS or still and never controls deletion or automatic selection."));
+                ui.horizontal(|ui| {
+                    close = ui.button(text(ja, "キャンセル", "Cancel")).clicked();
+                    save = ui.add_enabled(draft.scope.is_some() && draft.acknowledged, egui::Button::new(text(ja, "確認を記録", "Record confirmation"))).clicked();
+                });
+            });
+            if save {
+                let draft = self.assertion_draft.take().expect("open confirmation");
+                match Records::confirm(&draft.id, draft.scope.expect("scope selected")) {
+                    Ok(records) => {
+                        self.assertions = Some(Ok(records));
+                        self.assertion_error = None;
+                    }
+                    Err(error) => self.assertion_error = Some(format!("{error:#}")),
+                }
+            } else if close || modal.should_close() {
+                self.assertion_draft = None;
+            }
         }
 
         fn target(&self, index: usize) -> Option<&Path> {
@@ -239,16 +598,8 @@ mod mac {
                 .map(|(_, path)| path.as_path())
         }
 
-        pub(super) fn marker(
-            &self,
-            row: &app_storage::Row,
-            index: usize,
-            ja: bool,
-        ) -> &'static str {
+        pub(super) fn access(&self, row: &app_storage::Row, index: usize) -> Access {
             let candidate = self.target(index);
-            if candidate.is_none() && row.library.is_none() {
-                return "";
-            }
             let path = candidate.or(row.native_path.as_deref());
             if path.is_some_and(|path| {
                 self.kept
@@ -256,11 +607,15 @@ mod mac {
                     .and_then(|r| r.as_ref().ok())
                     .is_some_and(|rules| rules.conflict(path).is_some())
             }) {
-                text(ja, " · 残す設定", " · Kept")
+                Access::Kept
             } else if candidate.is_some() {
-                text(ja, " · HTTP キャッシュを確認", " · Review HTTP cache")
+                if matches!(self.kept, Some(Ok(_))) {
+                    Access::Reviewable
+                } else {
+                    Access::Unavailable
+                }
             } else {
-                ""
+                Access::ReadOnly
             }
         }
 
@@ -501,6 +856,43 @@ mod mac {
                     },
                 );
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod confirmation_tests {
+        use super::{Access, Panel};
+        use crate::review::{app_storage::Row, desktop::keep::KeepRules, message::Message};
+
+        #[test]
+        fn access_marks_only_available_cache_as_reviewable() {
+            let row = Row {
+                label: "Chrome".into(),
+                path: None,
+                native_path: None,
+                size_bytes: Some(10),
+                size_basis: "allocated",
+                partial: false,
+                reason: Message::new("example", "例"),
+                library: None,
+            };
+            let mut panel = Panel::default();
+            assert_eq!(panel.access(&row, 0), Access::ReadOnly);
+            panel.cache_row = Some((0, "/tmp/example".into()));
+            assert_eq!(panel.access(&row, 0), Access::Unavailable);
+            panel.kept = Some(Ok(KeepRules::default()));
+            assert_eq!(panel.access(&row, 0), Access::Reviewable);
+            assert!(!panel.access(&row, 0).is_locked());
+            assert!(panel.access(&row, 1).is_locked());
+        }
+        #[test]
+        fn overview_reconfirmation_warns_for_observed_registered_id() {
+            let mut panel = Panel::default();
+            panel
+                .observed_registered_ids
+                .insert("com.example.app".into());
+            assert!(panel.overview_draft("com.example.app".into()).registered);
+            assert!(!panel.overview_draft("com.example.other".into()).registered);
         }
     }
 }

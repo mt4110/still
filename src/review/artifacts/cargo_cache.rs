@@ -4,18 +4,27 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path};
 
-/// Only recognize direct Cargo profile caches belonging to a local manifest.
+/// Recognize Cargo profile caches, including profiles nested under a target triple.
+/// The policy independently verifies an enclosing Cargo project.
 pub(super) fn cache_root(path: &Path) -> Option<&Path> {
     if !matches!(path.file_name()?.to_str()?, "deps" | "incremental") || !directory(path) {
         return None;
     }
     let profile = path.parent()?;
-    let target = profile.parent()?;
+    let parent = profile.parent()?;
+    let target = if parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains('-') && !name.starts_with("target-"))
+        && parent.parent().is_some_and(target_name)
+    {
+        parent.parent()?
+    } else {
+        parent
+    };
     if !matches!(profile.file_name()?.to_str()?, "debug" | "release")
-        || target.file_name()? != "target"
         || !directory(profile)
         || !directory(target)
-        || !regular_file(&target.parent()?.join("Cargo.toml"))
         || !directory(&profile.join(".fingerprint"))
         || !regular_file(&profile.join(".cargo-lock"))
     {
@@ -24,7 +33,14 @@ pub(super) fn cache_root(path: &Path) -> Option<&Path> {
     if !regular_file(&target.join(".rustc_info.json")) {
         let tag = target.join("CACHEDIR.TAG");
         if !regular_file(&tag) {
-            return None;
+            // A failed staged removal can already have removed both markers.
+            // Only strictly verified subtrees are eligible in this case; the
+            // enclosing target itself never gains deletion authority here.
+            let missing = |path: &Path| matches!(fs::symlink_metadata(path), Err(err) if err.kind() == std::io::ErrorKind::NotFound);
+            return (target_name(target)
+                && missing(&target.join(".rustc_info.json"))
+                && missing(&tag))
+            .then_some(target);
         }
         let mut header = String::new();
         fs::File::open(tag)
@@ -39,6 +55,12 @@ pub(super) fn cache_root(path: &Path) -> Option<&Path> {
         }
     }
     Some(target)
+}
+
+fn target_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "target" || name.starts_with("target-"))
 }
 
 fn crate_name(value: &str) -> bool {
@@ -267,7 +289,8 @@ mod tests {
         fs::create_dir(profile.join(".fingerprint"))?;
         fs::write(profile.join(".cargo-lock"), "")?;
         fs::write(temp.path().join("Cargo.toml"), "[workspace]")?;
-        assert!(cache_root(&deps).is_none());
+        // The policy additionally checks that the root belongs to a Cargo project.
+        assert_eq!(cache_root(&deps), Some(target.as_path()));
         fs::write(target.join(".rustc_info.json"), "{}")?;
         assert_eq!(cache_root(&deps), Some(target.as_path()));
         assert!(cache_root(&profile).is_none());

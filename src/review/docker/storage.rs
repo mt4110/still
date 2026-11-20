@@ -4,6 +4,7 @@ use crate::review::message::Message;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 mod actions;
+pub(crate) mod observations;
 pub(crate) use actions::{Receipt, Review};
 use serde::Deserialize;
 use std::time::Duration;
@@ -76,6 +77,7 @@ pub(crate) struct CacheCleanupResult {
     pub result: Result<String>,
     pub before: Option<u64>,
     pub after: Option<u64>,
+    pub history_error: Option<String>,
 }
 
 impl CacheCleanup {
@@ -95,6 +97,7 @@ impl CacheCleanup {
     }
 
     pub fn apply(self) -> CacheCleanupResult {
+        let started = Utc::now();
         let free = || {
             directories::BaseDirs::new()
                 .and_then(|d| crate::review::filesystem::available(d.home_dir()))
@@ -111,19 +114,52 @@ impl CacheCleanup {
                 Ok(())
             },
             || {
-                let filter = format!("until={}h", u64::from(self.days) * 24);
-                command_output(command_on(&self.endpoint).args(["builder", "prune", "--force", "--filter", &filter]), Duration::from_secs(300))
+                command_output(&mut cache_prune_command(&self.endpoint, self.days), Duration::from_secs(300))
                     .context("Docker cache cleanup did not complete; some records may already have been removed")
             },
         );
-        CacheCleanupResult {
+        let receipt = CacheCleanupResult {
             context: self.context,
             days: self.days,
             result,
             before,
             after: free(),
+            history_error: None,
+        };
+        #[cfg(not(test))]
+        let mut receipt = receipt;
+        #[cfg(not(test))]
+        {
+            let target = super::super::cleanup_history::OperationTarget {
+                identifier: "default builder cache".into(),
+                status: if receipt.result.is_ok() { "completed" } else { "unverified" }.into(),
+                reason: receipt.result.as_ref().err().map(|_| "Cleanup did not complete or could not be verified; details were not retained".into()),
+                remaining_image_bytes: None,
+            };
+            receipt.history_error = super::super::cleanup_history::save_operation(
+                started,
+                receipt.before,
+                receipt.after,
+                super::super::cleanup_history::Operation {
+                    kind: "docker_builder_cache_cleanup".into(),
+                    retention_days: Some(receipt.days),
+                    targets: vec![target],
+                },
+            )
+            .err()
+            .map(|error| format!("{error:#}"));
         }
+        #[cfg(test)]
+        let _ = started;
+        receipt
     }
+}
+
+fn cache_prune_command(endpoint: &str, days: u16) -> std::process::Command {
+    let filter = format!("until={}h", u64::from(days) * 24);
+    let mut command = command_on(endpoint);
+    command.args(["builder", "prune", "--all", "--force", "--filter", &filter]);
+    command
 }
 
 fn checked_cache_cleanup(
@@ -201,9 +237,29 @@ pub(crate) fn inspect(context: &str) -> Result<Report> {
         Duration::from_secs(30),
     )
     .context("Docker の容量を取得できませんでした。Docker Desktop または Colima と接続先を確認してください")?;
-    let mut report = parse(context, &response)?;
+    let mut report = parse(context.clone(), &response)?;
     actions::enrich(&mut report, pin)?;
     Ok(report)
+}
+
+pub(crate) struct ObservationRequest {
+    context: String,
+    pin: actions::Pin,
+}
+
+impl Report {
+    pub(crate) fn observation_request(&self) -> Option<ObservationRequest> {
+        self.daemon.as_ref().map(|pin| ObservationRequest {
+            context: self.context.clone(),
+            pin: pin.clone(),
+        })
+    }
+}
+
+impl ObservationRequest {
+    pub(crate) fn record(self) -> Result<()> {
+        observations::measure_and_record(&self.pin.endpoint, &self.context, &self.pin)
+    }
 }
 
 fn parse(context: String, json: &str) -> Result<Report> {
@@ -303,6 +359,24 @@ mod tests {
         assert_eq!(parse_contexts(output)?, ["colima", "default"]);
         assert!(parse_contexts("broken").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn cache_cleanup_includes_all_unused_cache_with_the_selected_age() {
+        let command = cache_prune_command("unix:///tmp/docker.sock", 7);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(6).any(|args| args
+            == [
+                "builder",
+                "prune",
+                "--all",
+                "--force",
+                "--filter",
+                "until=168h"
+            ]));
     }
 
     #[test]

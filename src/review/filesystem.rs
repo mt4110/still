@@ -298,7 +298,6 @@ pub fn remove_output(path: &Path, tree: &artifacts::Tree) -> Result<()> {
             Path::new(""),
             tree,
             flags,
-            &mut std::collections::HashSet::new(),
         )?;
         Ok::<(), anyhow::Error>(())
     })();
@@ -337,7 +336,6 @@ fn remove_tree(
     relative: &Path,
     tree: &artifacts::Tree,
     flags: rustix::fs::OFlags,
-    unlinked: &mut std::collections::HashSet<Identity>,
 ) -> Result<()> {
     use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
     use std::os::unix::ffi::OsStrExt;
@@ -379,14 +377,7 @@ fn remove_tree(
                 finder::remove_metadata(&directory, &child)?;
                 continue;
             }
-            remove_tree(
-                &directory,
-                &child,
-                &relative.join(&child),
-                tree,
-                flags,
-                unlinked,
-            )?;
+            remove_tree(&directory, &child, &relative.join(&child), tree, flags)?;
         }
         #[cfg(target_os = "macos")]
         finder::finish(parent, name, &directory)?;
@@ -397,12 +388,10 @@ fn remove_tree(
             stat.st_mtime as u64,
             stat.st_mtime_nsec as u32,
         ));
-        // Unlinking one name changes ctime for the other names of the same inode.
-        let changed = (stat.st_ctime as i64, stat.st_ctime_nsec as i64);
-        if stat.st_size as u64 != expected.len
-            || modified != Some(expected.modified)
-            || (changed != expected.changed && !unlinked.contains(&expected.identity))
-        {
+        // Metadata changes after staging (including unlinking another hard link)
+        // can change ctime without changing the reviewed file contents. Compare
+        // the bytes below and still detect changes while that comparison runs.
+        if stat.st_size as u64 != expected.len || modified != Some(expected.modified) {
             bail!("Staged file was modified: {relative:?}");
         }
         let file = fs::openat(
@@ -434,13 +423,18 @@ fn remove_tree(
             bail!("Staged file changed during inspection: {relative:?}");
         }
         fs::unlinkat(parent, name, AtFlags::empty())?;
-        if stat.st_nlink > 1 {
-            unlinked.insert(expected.identity);
-        }
     } else {
         bail!("Unsupported staged entry: {relative:?}");
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn test_remove_staged(parent: &Path, tree: &artifacts::Tree) -> Result<()> {
+    use rustix::fs::{self, Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let parent = fs::open(parent, flags, Mode::empty())?;
+    remove_tree(&parent, "payload".as_ref(), Path::new(""), tree, flags)
 }
 
 #[cfg(windows)]

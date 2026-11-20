@@ -122,6 +122,7 @@ fn render_details(f: &mut Frame, state: &AppState, area: Rect) {
                 Span::raw("Reason: "),
                 Span::styled(&entry.reason, Style::default().fg(Color::Magenta)),
             ]),
+            Line::from(format!("Recommended: {:?}", entry.recommended_action)),
             Line::from(""),
             Line::from(vec![
                 Span::raw("Action: "),

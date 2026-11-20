@@ -212,8 +212,11 @@ pub fn run_cli() -> Result<()> {
         Some(Commands::Stale(args)) => review::stale::run(args)?,
         Some(Commands::AppStorage(args)) => review::app_storage::run(args)?,
         #[cfg(target_os = "macos")]
+        Some(Commands::GroupLink(args)) => review::app_storage::group_link::run(args)?,
+        #[cfg(target_os = "macos")]
         Some(Commands::StageCleanup(args)) => review::recover_stage(args)?,
         Some(Commands::CleanupHistory(args)) => review::cleanup_history::run(args)?,
+        Some(Commands::ReviewHistory(args)) => review::review_history(args)?,
         Some(Commands::Tui(args)) => {
             println!("Starting TUI with plan: {:?}", args.plan);
             let mut app = tui::app::App::new(args.plan.clone())?;

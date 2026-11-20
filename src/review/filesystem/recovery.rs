@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Entry {
@@ -124,6 +125,90 @@ impl Stage {
     }
 }
 
+/// The stage record is user-controlled evidence, not proof of provenance or completeness.
+pub(crate) struct RestoreStage {
+    root: PathBuf,
+    pub(crate) path: PathBuf,
+    pub(crate) original: PathBuf,
+    stage_id: Identity,
+    payload_id: Identity,
+    note: Entry,
+}
+
+impl RestoreStage {
+    pub(crate) fn inspect(root: &Path, path: &Path) -> Result<Self> {
+        let path = inventory::safe_dir(path)?;
+        let stage = Stage::open(root, &path)?;
+        let mut note =
+            finder::open_regular(&stage.dir, OsStr::new("original-path.txt"), 16 * 1024)?;
+        let mut value = String::new();
+        (&mut note).take(16 * 1024 + 1).read_to_string(&mut value)?;
+        let original = PathBuf::from(
+            value
+                .strip_suffix('\n')
+                .context("Unrecognized stage note")?,
+        );
+        ensure!(
+            original.parent() == path.parent()
+                && original.file_name().is_some()
+                && !artifacts::protected(&original)
+                && inventory::display(&original) == original.to_string_lossy(),
+            "Original path in stage note does not name an unprotected sibling"
+        );
+        let payload = fs::openat(&stage.dir, "payload", finder::DIRECTORY, Mode::empty())?;
+        let payload_stat = fs::fstat(&payload)?;
+        ensure!(
+            payload_stat.st_dev == fs::fstat(&stage.dir)?.st_dev,
+            "Payload crosses a filesystem boundary"
+        );
+        Ok(Self {
+            root: inventory::safe_dir(root)?,
+            path,
+            original,
+            stage_id: stat_identity(&fs::fstat(&stage.dir)?),
+            payload_id: stat_identity(&payload_stat),
+            note: Entry::file(&fs::fstat(note)?),
+        })
+    }
+
+    pub(crate) fn restore(self) -> Result<()> {
+        super::ensure_not_open(&self.path)?;
+        let current = Self::inspect(&self.root, &self.path)?;
+        ensure!(
+            current.stage_id == self.stage_id
+                && current.payload_id == self.payload_id
+                && current.note == self.note
+                && current.original == self.original,
+            "Stage or recorded destination changed during review"
+        );
+        let stage = Stage::open(&self.root, &self.path)?;
+        ensure!(
+            stat_identity(&fs::fstat(&stage.dir)?) == self.stage_id,
+            "Stage changed during review"
+        );
+        let payload = fs::openat(&stage.dir, "payload", finder::DIRECTORY, Mode::empty())?;
+        ensure!(
+            stat_identity(&fs::fstat(&payload)?) == self.payload_id,
+            "Payload changed during review"
+        );
+        let payload_path_stat = fs::statat(&stage.dir, "payload", AtFlags::SYMLINK_NOFOLLOW)?;
+        ensure!(
+            FileType::from_raw_mode(payload_path_stat.st_mode) == FileType::Directory
+                && stat_identity(&payload_path_stat) == self.payload_id,
+            "Payload path changed during review"
+        );
+        fs::renameat_with(
+            &stage.dir,
+            "payload",
+            &stage.parent,
+            self.original.file_name().context("Missing destination")?,
+            fs::RenameFlags::NOREPLACE,
+        )
+        .context("Could not restore payload without overwriting the destination")?;
+        Ok(())
+    }
+}
+
 fn inspect_directory(
     parent: &OwnedFd,
     name: &OsStr,
@@ -226,13 +311,32 @@ pub(crate) fn run(args: &crate::cli::StageCleanupArgs) -> Result<()> {
 }
 
 fn run_review(args: &crate::cli::StageCleanupArgs) -> Result<()> {
-    let review = ReviewedStage::inspect(&args.cleanup_root, &args.stage)?;
+    if args.restore {
+        let review = RestoreStage::inspect(&args.cleanup_root, &args.stage)?;
+        println!("Stage record is not proof of origin or completeness. Moving remaining payload from {} to {}.", inventory::display(&review.path), inventory::display(&review.original));
+        review.restore()?;
+        println!("Restored remaining payload; the stage and its note remain for review.");
+        return Ok(());
+    }
+    let review = match ReviewedStage::inspect(&args.cleanup_root, &args.stage) {
+        Ok(review) => review,
+        Err(metadata_error) if !args.apply => {
+            let restore = RestoreStage::inspect(&args.cleanup_root, &args.stage)
+                .context(format!("Metadata cleanup unavailable: {metadata_error:#}"))?;
+            println!("Remaining payload: {}\nRecorded destination: {}\nThe stage record does not prove origin or completeness. Verify both paths and contents before running with --restore; an existing destination will not be overwritten.", inventory::display(&restore.path.join("payload")), inventory::display(&restore.original));
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let label = inventory::display(&review.path);
     if args.apply {
         review.remove()?;
         println!("Removed metadata-only stage: {label}");
     } else {
         println!("Metadata-only stage: {label}\nRun this command with --apply to remove it.");
+        if let Ok(restore) = RestoreStage::inspect(&args.cleanup_root, &args.stage) {
+            println!("Alternatively, inspect {} and recorded destination {} before using --restore. The record does not prove origin or completeness; an existing destination will not be overwritten.", inventory::display(&restore.path.join("payload")), inventory::display(&restore.original));
+        }
     }
     Ok(())
 }
@@ -270,6 +374,7 @@ mod tests {
                 stage,
                 cleanup_root: root,
                 apply: false,
+                restore: false,
             },
         ))
     }
@@ -321,7 +426,8 @@ mod tests {
                 "symlink" => symlink(&outside, &candidate)?,
                 _ => fs::hard_link(&outside, &candidate)?,
             }
-            assert!(run_review(&args).is_err());
+            assert!(ReviewedStage::inspect(&args.cleanup_root, &args.stage).is_err());
+            run_review(&args)?; // Previewing restore must not remove anything.
             assert!(outside.is_file());
         }
         Ok(())
@@ -336,6 +442,58 @@ mod tests {
         args.cleanup_root = args.stage.parent().unwrap().to_owned();
         fs::set_permissions(&args.stage, fs::Permissions::from_mode(0o755))?;
         assert!(run_review(&args).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn restores_remaining_payload_without_deleting_stage_note() -> Result<()> {
+        let (_fixture, payload, args) = fixture()?;
+        fs::write(payload.join("remaining.txt"), b"remaining")?;
+        let review = RestoreStage::inspect(&args.cleanup_root, &args.stage)?;
+        let destination = review.original.clone();
+        review.restore()?;
+        assert_eq!(fs::read(destination.join("remaining.txt"))?, b"remaining");
+        assert!(args.stage.join("original-path.txt").is_file());
+        assert!(!payload.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_refuses_existing_destination_and_changed_note() -> Result<()> {
+        let (_fixture, payload, args) = fixture()?;
+        fs::write(payload.join("remaining.txt"), b"remaining")?;
+        let review = RestoreStage::inspect(&args.cleanup_root, &args.stage)?;
+        fs::create_dir(&review.original)?;
+        fs::write(review.original.join("existing.txt"), b"existing")?;
+        assert!(review.restore().is_err());
+        assert_eq!(
+            fs::read(args.cleanup_root.join("target/existing.txt"))?,
+            b"existing"
+        );
+        assert_eq!(fs::read(payload.join("remaining.txt"))?, b"remaining");
+        let review = RestoreStage::inspect(&args.cleanup_root, &args.stage)?;
+        fs::write(
+            args.stage.join("original-path.txt"),
+            format!("{}\n", args.cleanup_root.join("different").display()),
+        )?;
+        assert!(review.restore().is_err());
+        assert!(payload.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn restore_rejects_replaced_payload_and_non_sibling_destination() -> Result<()> {
+        let (_fixture, payload, args) = fixture()?;
+        let review = RestoreStage::inspect(&args.cleanup_root, &args.stage)?;
+        fs::rename(&payload, args.stage.join("preserved-payload"))?;
+        fs::create_dir(&payload)?;
+        assert!(review.restore().is_err());
+        assert!(args
+            .stage
+            .join("preserved-payload/debug/deps/.DS_Store")
+            .exists());
+        fs::write(args.stage.join("original-path.txt"), "/tmp/other\n")?;
+        assert!(RestoreStage::inspect(&args.cleanup_root, &args.stage).is_err());
         Ok(())
     }
 }

@@ -20,8 +20,8 @@ impl App {
             ));
             ui.label(text(
                 self.japanese_reasons,
-                "ホーム内の古い大容量ファイルを探します。開発プロジェクトの生成物はワークスペースで確認できます。",
-                "Find old personal files in your home folder. Review project build output in Workspace.",
+                "ホーム内の古い大容量ファイルを探します。使用中かどうかは確認しません。",
+                "Find old large files in your home folder. Open processes are not checked.",
             ));
             #[cfg(target_os = "macos")]
             if as_page
@@ -80,6 +80,24 @@ impl App {
                         state.error.clear();
                     }
                 });
+                if ui
+                    .checkbox(
+                        &mut state.include_outputs,
+                        text(
+                            self.japanese_reasons,
+                            "開発プロジェクトの生成物を含める",
+                            "Include project build output",
+                        ),
+                    )
+                    .changed()
+                {
+                    state.report = None;
+                }
+                ui.small(text(
+                    self.japanese_reasons,
+                    "隠し項目、Library、node_modules は常に対象外です。",
+                    "Hidden items, Library, and node_modules are always excluded.",
+                ));
                 ui.horizontal(|ui| {
                     ui.label(text(
                         self.japanese_reasons,
@@ -268,7 +286,13 @@ impl App {
             self.show_stale_files = false;
         }
         if start {
-            let (root, days, mib, sort) = (state.root.clone(), state.days, state.mib, state.sort);
+            let (root, days, mib, sort, include_outputs) = (
+                state.root.clone(),
+                state.days,
+                state.mib,
+                state.sort,
+                state.include_outputs,
+            );
             state.report = None;
             state.error.clear();
             state.query.clear();
@@ -280,7 +304,15 @@ impl App {
                     "Looking for old files…",
                 ),
                 false,
-                move || Outcome::Stale(stale::scan_personal(root.as_deref(), days, mib, sort)),
+                move || {
+                    Outcome::Stale(stale::scan_personal(
+                        root.as_deref(),
+                        days,
+                        mib,
+                        sort,
+                        include_outputs,
+                    ))
+                },
             );
         }
         #[cfg(target_os = "macos")]

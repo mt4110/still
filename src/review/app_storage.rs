@@ -1,9 +1,13 @@
+#[cfg(target_os = "macos")]
+pub(crate) mod group_link;
 #[cfg(all(target_os = "macos", feature = "desktop"))]
 pub(super) mod known_cache;
 #[cfg(target_os = "macos")]
-mod library;
+pub(super) mod library;
 #[cfg(all(target_os = "macos", any(test, feature = "desktop")))]
-mod observations;
+pub(super) mod observations;
+#[cfg(all(target_os = "macos", any(test, feature = "desktop")))]
+pub(super) mod uninstall_assertions;
 
 #[cfg(all(target_os = "macos", feature = "desktop"))]
 pub(super) fn desktop_scan(xcode: bool, include_library: bool) -> anyhow::Result<Report> {
@@ -65,6 +69,7 @@ pub fn run(args: &AppStorageArgs) -> Result<()> {
                 #[cfg(target_os = "macos")]
                 if let Some(evidence) = row.library {
                     println!("  {}", evidence.activity_text(false));
+                    println!("  {}", evidence.name_hints_text(false));
                 }
             }
             for note in result.notes {
@@ -81,9 +86,11 @@ pub(super) fn scan(_: bool, _: bool) -> Result<Report> {
 }
 
 #[cfg(target_os = "macos")]
+pub(super) use mac::command_output;
+#[cfg(target_os = "macos")]
 pub(super) use mac::scan;
 #[cfg(all(target_os = "macos", feature = "desktop"))]
-pub(super) use mac::{command_output, runtimes, simctl_json, Runtime};
+pub(super) use mac::{runtimes, simctl_json, Runtime};
 
 #[cfg(target_os = "macos")]
 mod mac {

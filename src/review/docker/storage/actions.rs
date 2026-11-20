@@ -7,7 +7,7 @@ const PROJECTION: &str = r#"{"id":{{json .Id}},"name":{{json .Name}},"image":{{j
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Pin {
-    endpoint: String,
+    pub(super) endpoint: String,
     id: String,
 }
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -370,6 +370,7 @@ pub(crate) struct Receipt {
     pub before: Option<u64>,
     pub after: Option<u64>,
     pub estimated_bytes: Option<u64>,
+    pub history_error: Option<String>,
 }
 impl Review {
     pub fn prepare(report: &Report, selection: &BTreeSet<String>) -> Result<Self> {
@@ -423,7 +424,33 @@ impl Review {
         })
     }
     pub fn apply(self) -> Receipt {
-        self.apply_with(&Docker)
+        let started = Utc::now();
+        let receipt = self.apply_with(&Docker);
+        #[cfg(not(test))]
+        let mut receipt = receipt;
+        #[cfg(not(test))]
+        {
+            let targets = receipt.outcomes.iter().map(|(id, result)| super::super::super::cleanup_history::OperationTarget {
+                identifier: id.clone(), status: if result.is_ok() { "removed" } else { "unverified" }.into(),
+                reason: result.as_ref().err().map(|_| "Operation failed or removal could not be verified; details were not retained".into()),
+                remaining_image_bytes: None,
+            }).collect();
+            receipt.history_error = super::super::super::cleanup_history::save_operation(
+                started,
+                receipt.before,
+                receipt.after,
+                super::super::super::cleanup_history::Operation {
+                    kind: "docker_container_removal".into(),
+                    retention_days: None,
+                    targets,
+                },
+            )
+            .err()
+            .map(|error| format!("{error:#}"));
+        }
+        #[cfg(test)]
+        let _ = started;
+        receipt
     }
     fn apply_with(self, backend: &impl Backend) -> Receipt {
         let before = backend.free();
@@ -463,6 +490,7 @@ impl Review {
             before,
             after: backend.free(),
             estimated_bytes,
+            history_error: None,
         }
     }
 }

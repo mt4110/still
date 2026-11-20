@@ -164,8 +164,13 @@ impl Delta {
     }
 
     pub fn label(self) -> String {
+        self.localized_label(false)
+    }
+
+    pub fn localized_label(self, japanese: bool) -> String {
         let size = bytes(self.bytes);
         let label = match self.direction {
+            Direction::New if japanese => format!("新規 {size}"),
             Direction::New => format!("new {size}"),
             Direction::Up => format!("+{size}"),
             Direction::Down => format!("-{size}"),
@@ -233,7 +238,6 @@ impl History {
         Self::in_directory(&format!("profile-{name}"))
     }
 
-    #[cfg(all(feature = "desktop", target_os = "macos"))]
     pub fn workspace() -> Result<Self> {
         Self::in_directory("workspace")
     }
@@ -299,12 +303,103 @@ impl History {
         if let Some(current) = read::<HeaderOnly>(&path)? {
             current.header.verify(root)?;
             if current.header.completed_at > snapshot.header.completed_at {
-                return Ok(());
+                return self.save_inventory_summary(root, inventory, snapshot.header.completed_at)
+                    .context("A newer latest scan was retained, but this scan's long-term summary could not be saved");
             }
         }
         temp.persist(&path)
             .with_context(|| format!("Could not save scan history at {path:?}"))?;
+        // Keep one compact root total per explicit observation, rather than
+        // archiving every directory in each full snapshot. The existing latest
+        // snapshot remains usable even if this separate history write fails.
+        self.save_inventory_summary(root, inventory, snapshot.header.completed_at)
+            .context("Latest scan saved, but its long-term summary could not be saved")?;
         Ok(())
+    }
+
+    fn save_inventory_summary(
+        &self,
+        root: &Path,
+        inventory: &inventory::Inventory,
+        completed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let root_row = inventory
+            .directories
+            .iter()
+            .find(|row| row.path == root)
+            .context("Scan did not contain a root total")?;
+        let summary = ScanSummary {
+            header: SnapshotHeader {
+                version: VERSION,
+                root: NativePath::from(root.as_os_str()),
+                completed_at,
+            },
+            total: Observed::from(&root_row.usage),
+        };
+        self.save_summary(root, &summary)
+    }
+
+    fn series_dir(&self, root: &Path) -> PathBuf {
+        let snapshot = self.snapshot_path(root);
+        self.directory
+            .join("series")
+            .join(snapshot.file_stem().expect("snapshot name"))
+    }
+
+    fn save_summary(&self, root: &Path, summary: &ScanSummary) -> Result<()> {
+        let dir = self.series_dir(root);
+        fs::create_dir_all(&dir)?;
+        let mut temp = NamedTempFile::new_in(&dir)?;
+        serde_json::to_writer(&mut temp, summary)?;
+        temp.write_all(b"\n")?;
+        temp.as_file().sync_all()?;
+        let filename = format!(
+            "{}-{}.json",
+            summary.header.completed_at.format("%Y%m%dT%H%M%S%9fZ"),
+            uuid::Uuid::new_v4()
+        );
+        temp.persist_noclobber(dir.join(filename))?;
+        Ok(())
+    }
+
+    fn summaries(&self, root: &Path, limit: usize) -> Result<Vec<ScanSummary>> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let dir = self.series_dir(root);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        // Keep only the newest requested paths even after years of scans.
+        let mut paths = BinaryHeap::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry.path().extension().is_some_and(|ext| ext == "json")
+            {
+                let path = entry.path();
+                if paths.len() < limit {
+                    paths.push(Reverse(path));
+                } else if paths.peek().is_some_and(|oldest| path > oldest.0) {
+                    paths.pop();
+                    paths.push(Reverse(path));
+                }
+            }
+        }
+        paths
+            .into_sorted_vec()
+            .into_iter()
+            .map(|path| path.0)
+            .map(|path| {
+                let summary: ScanSummary = read(&path)?.context("Scan summary disappeared")?;
+                summary.header.verify(root)?;
+                Ok(summary)
+            })
+            .collect()
     }
 
     fn snapshot_path(&self, root: &Path) -> PathBuf {
@@ -318,6 +413,90 @@ impl History {
             });
         self.directory.join(format!("{hash:016x}.json"))
     }
+}
+
+#[derive(Deserialize, Serialize)]
+struct ScanSummary {
+    header: SnapshotHeader,
+    total: Observed,
+}
+
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+pub(super) struct HistoryPoint {
+    pub completed_at: DateTime<Utc>,
+    pub logical_bytes: u64,
+    pub allocated_bytes: Option<u64>,
+    pub partial: bool,
+}
+
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+pub(super) fn load_timeline(
+    root: &Path,
+    profile: Option<&str>,
+    limit: usize,
+) -> Result<Vec<HistoryPoint>> {
+    let store = match profile {
+        Some(name) => History::open(name)?,
+        None => History::workspace()?,
+    };
+    store.timeline(root, limit)
+}
+
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+impl History {
+    fn timeline(&self, root: &Path, limit: usize) -> Result<Vec<HistoryPoint>> {
+        Ok(self
+            .summaries(root, limit)?
+            .into_iter()
+            .map(|entry| HistoryPoint {
+                completed_at: entry.header.completed_at,
+                logical_bytes: entry.total.logical_bytes,
+                allocated_bytes: entry.total.allocated_bytes,
+                partial: entry.total.partial,
+            })
+            .collect())
+    }
+}
+
+pub(crate) fn run(args: &crate::cli::ReviewHistoryArgs) -> Result<()> {
+    use crate::cli::ListFormat;
+    anyhow::ensure!(args.root.is_absolute(), "Root must be an absolute path");
+    // A removed workspace can still be inspected by its original absolute path.
+    let root = match args.root.canonicalize() {
+        Ok(root) => root,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => args.root.clone(),
+        Err(err) => return Err(err.into()),
+    };
+    let history = match &args.profile {
+        Some(name) => History::open(name)?,
+        None => History::workspace()?,
+    };
+    let records = history.summaries(&root, usize::from(args.limit))?;
+    match args.format {
+        ListFormat::Json => println!("{}", serde_json::to_string_pretty(&records)?),
+        ListFormat::Text => {
+            if records.is_empty() {
+                println!("No recorded scan totals for this root. Earlier snapshots are not reconstructed.");
+            }
+            for record in records {
+                println!(
+                    "{} · logical {} bytes · allocated {} · {}",
+                    record.header.completed_at,
+                    record.total.logical_bytes,
+                    record
+                        .total
+                        .allocated_bytes
+                        .map_or_else(|| "unavailable".to_owned(), |n| format!("{n} bytes")),
+                    if record.total.partial {
+                        "partial scan"
+                    } else {
+                        "complete scan"
+                    }
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
@@ -338,6 +517,19 @@ mod tests {
     use super::*;
     use crate::review::inventory::{Inventory, Row, Usage};
 
+    #[test]
+    fn new_growth_label_respects_language_and_partial_status() {
+        let delta = Delta {
+            direction: Direction::New,
+            bytes: 1024,
+            partial: true,
+            basis: Basis::Logical,
+        };
+        assert!(delta.localized_label(true).starts_with("新規 "));
+        assert!(delta.localized_label(true).ends_with('*'));
+        assert!(delta.label().starts_with("new "));
+    }
+
     fn row(path: PathBuf, logical: u64, allocated: Option<u64>, skipped: u64) -> Row {
         Row {
             path,
@@ -349,6 +541,171 @@ mod tests {
                 ..Usage::default()
             },
         }
+    }
+
+    #[test]
+    fn compact_series_keeps_independent_roots_partial_status_and_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = History {
+            directory: temp.path().join("snapshots"),
+        };
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        assert!(history.summaries(&first, 20)?.is_empty());
+        let inventory = |root: &Path, size, allocated, skipped| Inventory {
+            directories: vec![row(root.to_owned(), size, allocated, skipped)],
+            matches: Vec::new(),
+            omitted_matches: 0,
+            cargo_marker_dirs: Default::default(),
+        };
+        history.record(&first, &inventory(&first, 50, Some(100), 0))?;
+        history.record(&second, &inventory(&second, 1000, Some(2048), 0))?;
+        history.record(&first, &inventory(&first, 70, None, 2))?;
+        let first_records = history.summaries(&first, 20)?;
+        assert_eq!(first_records.len(), 2);
+        assert_eq!(first_records[0].total.logical_bytes, 70);
+        assert!(first_records[0].total.allocated_bytes.is_none());
+        assert!(first_records[0].total.partial);
+        assert_eq!(first_records[1].total.allocated_bytes, Some(100));
+        assert!(!first_records[1].total.partial);
+        assert_eq!(history.summaries(&first, 1)?.len(), 1);
+        assert_eq!(history.summaries(&second, 20)?[0].total.logical_bytes, 1000);
+        #[cfg(all(feature = "desktop", target_os = "macos"))]
+        {
+            let points = history.timeline(&first, 100)?;
+            assert_eq!(points.len(), 2);
+            assert_eq!(points[0].logical_bytes, 70);
+            assert_eq!(points[0].allocated_bytes, None);
+            assert!(points[0].partial);
+            assert_eq!(points[1].allocated_bytes, Some(100));
+            assert!(!points[1].partial);
+            assert!(history
+                .timeline(&temp.path().join("missing"), 100)?
+                .is_empty());
+        }
+        assert_eq!(
+            history
+                .previous(&first)?
+                .unwrap()
+                .delta(&row(first.clone(), 75, None, 0))
+                .unwrap()
+                .signed_bytes(),
+            5
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn series_uses_fixed_precision_chronological_order_and_rejects_wrong_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = History {
+            directory: temp.path().join("snapshots"),
+        };
+        let root = temp.path().join("root");
+        let summary = |when: &str, name: &Path, bytes| ScanSummary {
+            header: SnapshotHeader {
+                version: VERSION,
+                root: NativePath::from(name.as_os_str()),
+                completed_at: when.parse().unwrap(),
+            },
+            total: Observed {
+                logical_bytes: bytes,
+                allocated_bytes: None,
+                partial: false,
+            },
+        };
+        history.save_summary(&root, &summary("2026-01-01T00:00:00.123Z", &root, 1))?;
+        history.save_summary(&root, &summary("2026-01-01T00:00:00.123001Z", &root, 2))?;
+        assert_eq!(history.summaries(&root, 2)?[0].total.logical_bytes, 2);
+        history.save_summary(&root, &summary("2026-01-01T00:00:00.123Z", &root, 1))?;
+        assert_eq!(history.summaries(&root, 10)?.len(), 3);
+        history.save_summary(
+            &root,
+            &summary("2027-01-01T00:00:00Z", &temp.path().join("other"), 3),
+        )?;
+        assert!(history.summaries(&root, 1).is_err());
+        #[cfg(all(feature = "desktop", target_os = "macos"))]
+        assert!(history.timeline(&root, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn older_observation_keeps_latest_snapshot_and_records_its_total() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = History {
+            directory: temp.path().join("snapshots"),
+        };
+        let root = temp.path().join("root");
+        let inventory = |size| Inventory {
+            directories: vec![row(root.clone(), size, Some(size), 0)],
+            matches: Vec::new(),
+            omitted_matches: 0,
+            cargo_marker_dirs: Default::default(),
+        };
+        history.record(&root, &inventory(50))?;
+        let path = history.snapshot_path(&root);
+        let mut latest: serde_json::Value = serde_json::from_reader(File::open(&path)?)?;
+        latest["header"]["completed_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+        fs::write(path, serde_json::to_vec(&latest)?)?;
+        history.record(&root, &inventory(80))?;
+        assert_eq!(history.summaries(&root, 10)?.len(), 2);
+        assert_eq!(
+            history
+                .previous(&root)?
+                .unwrap()
+                .delta(&row(root.clone(), 55, Some(55), 0))
+                .unwrap()
+                .signed_bytes(),
+            5
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn summary_failure_reports_error_but_keeps_latest_snapshot() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = History {
+            directory: temp.path().join("snapshots"),
+        };
+        let root = temp.path().join("root");
+        fs::create_dir_all(&history.directory)?;
+        fs::write(history.directory.join("series"), b"not a directory")?;
+        let inventory = Inventory {
+            directories: vec![row(root.clone(), 50, Some(100), 0)],
+            matches: Vec::new(),
+            omitted_matches: 0,
+            cargo_marker_dirs: Default::default(),
+        };
+        let err = history.record(&root, &inventory).unwrap_err();
+        assert!(format!("{err:#}").contains("long-term summary"));
+        assert!(history.previous(&root)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn old_snapshot_remains_readable_without_inventing_series() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let history = History {
+            directory: temp.path().join("snapshots"),
+        };
+        let root = temp.path().join("root");
+        let rows = vec![row(root.clone(), 50, Some(100), 0)];
+        let snapshot = SnapshotOutput {
+            header: SnapshotHeader {
+                version: VERSION,
+                root: NativePath::from(root.as_os_str()),
+                completed_at: Utc::now(),
+            },
+            directories: DirectoryObservations {
+                root: &root,
+                rows: &rows,
+            },
+        };
+        fs::create_dir_all(&history.directory)?;
+        serde_json::to_writer(File::create(history.snapshot_path(&root))?, &snapshot)?;
+        assert!(history.previous(&root)?.is_some());
+        assert!(history.summaries(&root, 20)?.is_empty());
+        Ok(())
     }
 
     #[test]
@@ -419,7 +776,10 @@ mod tests {
         history.record(
             temp.path(),
             &Inventory {
-                directories: vec![row(odd_path.clone(), 3, None, 0)],
+                directories: vec![
+                    row(temp.path().to_owned(), 3, None, 0),
+                    row(odd_path.clone(), 3, None, 0),
+                ],
                 matches: Vec::new(),
                 omitted_matches: 0,
                 cargo_marker_dirs: Default::default(),

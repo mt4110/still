@@ -10,6 +10,7 @@ mod filesystem;
 pub(crate) use filesystem::recovery::run as recover_stage;
 mod git;
 mod history;
+pub(crate) use history::run as review_history;
 mod inventory;
 pub mod kube;
 mod message;

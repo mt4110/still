@@ -174,7 +174,8 @@ impl Scanner {
                 origin: PlanOrigin::Scan,
                 recommended_action,
                 reason,
-                selected_action: recommended_action,
+                // Recommendations are informational until the user explicitly selects an action.
+                selected_action: ActionType::Keep,
             });
         }
 
