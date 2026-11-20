@@ -315,6 +315,47 @@ mod tests {
         }
     }
 
+    /// Read-only acceptance check for a locally generated Chromium cache,
+    /// including a cached HTTP Range response. Launch an isolated Chrome with
+    /// its --disk-cache-dir set to <fixture>/Library/Caches/Google/Chrome,
+    /// close it, and set STILL_CHROME_TEST_HOME to this temporary fixture.
+    #[test]
+    #[ignore = "requires an isolated Chrome cache generated from local HTTP responses"]
+    fn validate_locally_generated_cache() -> Result<()> {
+        let temp_root = std::env::temp_dir().canonicalize()?;
+        let home = PathBuf::from(
+            std::env::var_os("STILL_CHROME_TEST_HOME").context("Missing fixture home")?,
+        )
+        .canonicalize()?;
+        ensure!(
+            home.parent() == Some(temp_root.as_path())
+                && home
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| name.starts_with("still-chrome-cache-test-")),
+            "Choose an isolated Chrome test directory"
+        );
+        let path = home.join(ROOT).join(HTTP);
+        let review = inspect(&home, &path, None, &|| {
+            Ok(PathBuf::from("/Applications/Google Chrome.app"))
+        })?;
+        for suffix in ["_0", "_s"] {
+            ensure!(
+                review
+                    .tree
+                    .entries
+                    .keys()
+                    .any(|path| path.to_str().is_some_and(|s| s.ends_with(suffix))),
+                "Expected regular and sparse cached responses"
+            );
+        }
+        println!(
+            "Verified {} ordinary and index files, {} logical bytes",
+            review.files, review.logical_bytes
+        );
+        Ok(())
+    }
+
     #[test]
     fn removes_only_confirmed_http_cache_and_records_observation() -> Result<()> {
         let cache = Cache::new()?;
