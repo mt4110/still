@@ -231,16 +231,19 @@ impl Confirmation {
         self.items.iter().zip(&self.totals)
     }
 
+    fn remove_reviewed(&self, item: &artifacts::Prepared) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        super::keep::KeepRules::load()?.check(&item.path)?;
+        self.policy.remove(item)
+    }
+
     pub fn remove(self, root: &Path) -> CleanupReceipt {
         let started_at = chrono::Utc::now();
         let before = super::super::filesystem::available(root);
         let outcomes = run_in_pairs(&self.items, |item| {
-            let result = (|| {
-                #[cfg(target_os = "macos")]
-                super::keep::KeepRules::load()?.check(&item.path)?;
-                self.policy.remove(item)
-            })()
-            .map_err(|err| super::Message::from_error(&err));
+            let result = self
+                .remove_reviewed(item)
+                .map_err(|err| super::Message::from_error(&err));
             (display(&item.path), result)
         });
         let after = super::super::filesystem::available(root);
