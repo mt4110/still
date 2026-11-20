@@ -136,6 +136,111 @@ fn selection_size(
     }
 }
 
+struct CacheOutputRow {
+    id: String,
+    reclaimable: String,
+    size: String,
+    last_accessed: String,
+}
+
+fn parse_cache_output(output: &str) -> (Vec<CacheOutputRow>, Option<String>, bool) {
+    let mut rows = Vec::new();
+    let mut total = None;
+    let mut header = false;
+    let mut unrecognized = false;
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if line.split_whitespace().collect::<Vec<_>>()
+            == ["ID", "RECLAIMABLE", "SIZE", "LAST", "ACCESSED"]
+        {
+            header = true;
+        } else if let Some(value) = line.strip_prefix("Total:") {
+            total = Some(value.trim().to_owned());
+        } else if header {
+            let parts: Vec<_> = line.split_whitespace().collect();
+            if parts.len() >= 4 && matches!(parts[1], "true" | "false") {
+                rows.push(CacheOutputRow {
+                    id: parts[0].to_owned(),
+                    reclaimable: parts[1].to_owned(),
+                    size: parts[2].to_owned(),
+                    last_accessed: parts[3..].join(" "),
+                });
+            } else {
+                unrecognized = true;
+            }
+        } else {
+            unrecognized = true;
+        }
+    }
+    (rows, total, unrecognized)
+}
+
+fn cache_output_table(ui: &mut egui::Ui, output: &str, japanese: bool) {
+    let (rows, total, unrecognized) = parse_cache_output(output);
+    if !rows.is_empty() {
+        ui.label(if japanese {
+            format!("Docker が報告した項目: {} 件", rows.len())
+        } else {
+            format!("{} records reported by Docker", rows.len())
+        });
+        egui::ScrollArea::both()
+            .id_salt("docker-cache-result-table")
+            .max_height(220.0)
+            .show(ui, |ui| {
+                egui::Grid::new("docker-cache-result-grid")
+                    .striped(true)
+                    .spacing([20.0, 5.0])
+                    .show(ui, |ui| {
+                        ui.strong("ID");
+                        ui.strong(text(japanese, "回収可能", "Reclaimable"));
+                        ui.strong(text(japanese, "容量", "Size"));
+                        ui.strong(text(japanese, "最終使用", "Last accessed"));
+                        ui.end_row();
+                        for row in &rows {
+                            ui.monospace(&row.id);
+                            ui.label(if row.reclaimable == "true" {
+                                text(japanese, "はい", "Yes")
+                            } else {
+                                text(japanese, "いいえ", "No")
+                            });
+                            ui.label(&row.size);
+                            ui.label(&row.last_accessed);
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+    if let Some(total) = &total {
+        ui.label(format!(
+            "{}: {total}",
+            text(japanese, "Docker の報告容量", "Docker reported")
+        ));
+    }
+    if unrecognized || (rows.is_empty() && total.is_none() && !output.trim().is_empty()) {
+        ui.label(text(
+            japanese,
+            "一部の出力を表にできませんでした。元の出力を確認してください。",
+            "Some output could not be shown as a table; inspect the original output.",
+        ));
+    }
+    if !output.trim().is_empty() {
+        ui.collapsing(
+            text(japanese, "Docker の元の出力", "Original Docker output"),
+            |ui| {
+                egui::ScrollArea::both()
+                    .id_salt("docker-cache-raw-output")
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        ui.monospace(output);
+                    });
+            },
+        );
+    }
+}
+
 impl Panel {
     pub(in crate::review::desktop) fn set_cache_review(
         &mut self,
@@ -224,13 +329,20 @@ impl Panel {
             self.cache_receipt = None;
             self.docker_error.clear();
         }
+        let mut dismiss_cache_receipt = false;
         if let Some(receipt) = &self.cache_receipt {
             ui.group(|ui| {
-                ui.strong(text(
-                    japanese,
-                    "ビルドキャッシュ整理の結果",
-                    "Build cache cleanup result",
-                ));
+                ui.horizontal(|ui| {
+                    ui.strong(text(
+                        japanese,
+                        "ビルドキャッシュ整理の結果",
+                        "Build cache cleanup result",
+                    ));
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        dismiss_cache_receipt =
+                            ui.button(text(japanese, "閉じる", "Close")).clicked();
+                    });
+                });
                 ui.label(format!(
                     "{} · {} {}",
                     receipt.context,
@@ -244,7 +356,7 @@ impl Panel {
                             "Docker の処理が完了しました。",
                             "Docker cleanup completed.",
                         ));
-                        ui.label(output);
+                        cache_output_table(ui, output, japanese);
                     }
                     Err(error) => {
                         ui.label(format!(
@@ -266,6 +378,9 @@ impl Panel {
                     ));
                 }
             });
+        }
+        if dismiss_cache_receipt {
+            self.cache_receipt = None;
         }
         if let Some(receipt) = &self.receipt {
             show_receipt(
@@ -1084,6 +1199,23 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_cleanup_output_preserves_rows_and_unknown_details() {
+        let text = "ID RECLAIMABLE SIZE LAST ACCESSED\nabc123* true 4.227MB 2 months ago\ndef456 false 0B 9 days ago\nTotal: 4.227MB\n";
+        let (rows, total, unknown) = parse_cache_output(text);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "abc123*");
+        assert_eq!(rows[0].last_accessed, "2 months ago");
+        assert_eq!(rows[1].reclaimable, "false");
+        assert_eq!(total.as_deref(), Some("4.227MB"));
+        assert!(!unknown);
+        let (_, _, unknown) = parse_cache_output("unexpected Docker format\n");
+        assert!(unknown);
+        let (rows, total, _) = parse_cache_output("Total: 0B\n");
+        assert!(rows.is_empty());
+        assert_eq!(total.as_deref(), Some("0B"));
+    }
 
     fn resource(id: &str, status: &str, days: i64, eligible: bool) -> storage::Resource {
         let time = Utc::now() - TimeDelta::days(days);
