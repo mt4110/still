@@ -391,6 +391,7 @@ struct App {
     inspection: Option<Vec<String>>,
     next_presence_check: Option<std::time::Instant>,
     confirmation: Option<Confirmation>,
+    confirmation_page: usize,
     #[cfg(target_os = "macos")]
     stages: stage_recovery::Panel,
     job: Option<Job>,
@@ -572,6 +573,7 @@ impl App {
             Outcome::Review(Ok(mut confirmation)) => {
                 if let Some(scan) = self.scan.as_ref() {
                     confirmation.match_scan_sizes(scan);
+                    self.confirmation_page = 0;
                     self.confirmation = Some(confirmation);
                 }
             }
@@ -1998,10 +2000,27 @@ impl App {
                         "一覧はディスク使用量（取得できない場合は論理容量）、以下はファイルの論理容量です。実際の空き容量の変化は削除後に測定します。",
                         "The list uses allocated space when available. Sizes below are logical file sizes. The change in free space is measured after deletion."));
                     ui.add_space(14.0);
+                    // Long paths wrap to different heights. Page the list so a large
+                    // selection renders bounded work while every path stays readable.
+                    const PAGE_SIZE: usize = 20;
+                    let count = confirmation.items().len();
+                    if count > PAGE_SIZE {
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(self.confirmation_page > 0, egui::Button::new(text(self.japanese_reasons, "前へ", "Previous"))).clicked() {
+                                self.confirmation_page -= 1;
+                            }
+                            let start = self.confirmation_page * PAGE_SIZE;
+                            ui.label(format!("{}–{} / {count}", start + 1, (start + PAGE_SIZE).min(count)));
+                            if ui.add_enabled(start + PAGE_SIZE < count, egui::Button::new(text(self.japanese_reasons, "次へ", "Next"))).clicked() {
+                                self.confirmation_page += 1;
+                            }
+                        });
+                    }
                     egui::ScrollArea::vertical()
+                        .id_salt(("review-paths", self.confirmation_page))
                         .max_height(260.0)
                         .show(ui, |ui| {
-                            for (item, size) in confirmation.summaries() {
+                            for (item, size) in confirmation.summaries().skip(self.confirmation_page * PAGE_SIZE).take(PAGE_SIZE) {
                                 ui.label(
                                     RichText::new(
                                         item.path.file_name().unwrap_or_default().to_string_lossy(),
