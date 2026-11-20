@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-beta.1] - 2026-11-20
+
 ### Added
 
 - Compare one explicitly selected app's verified signed App Group declaration against an exact ID without enumerating applications or treating the result as ownership or current-use proof.
@@ -20,7 +22,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keep compact per-scan workspace totals and provide a timeline in the Mac app and `still review-history`.
 - Show comparable Library and Docker changes in the Mac overview and link incomplete cleanup results to stage review.
 - Show filename-based Library clues and allow a user to record, update, or revoke their own scoped uninstall confirmation; neither authorizes deletion.
-- Compare an explicitly selected signed app's App Group declaration against one specified group ID without enumerating apps or exposing its other entitlements.
 
 ### Changed
 

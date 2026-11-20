@@ -76,7 +76,7 @@ For organization-managed Macs, explicitly select a **Developer ID Application** 
 
 ```sh
 STILL_SIGNING_IDENTITY='Developer ID Application: Your Name (TEAMID)' \
-  scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.2.0 target/still-signed.app
+  scripts/build-macos-app.sh target/release/still target/release/still-desktop 0.3.0 target/still-signed.app
 scripts/notarize-macos-app.sh target/still-signed.app still-notary target/still-notarized.zip
 ```
 
