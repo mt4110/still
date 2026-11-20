@@ -25,7 +25,7 @@ pub struct VaultMeta {
 
 impl Vault {
     pub fn new() -> Result<Self> {
-        let dirs = directories::ProjectDirs::from("com", "antigravity", "still")
+        let dirs = crate::storage_paths::project_dirs()
             .or_else(|| directories::ProjectDirs::from("com", "user", "still"))
             .ok_or(anyhow::anyhow!("Could not determine data directory"))?;
 

@@ -25,6 +25,11 @@ impl Message {
         Self { english, japanese }
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn japanese(&self) -> &str {
+        &self.japanese
+    }
+
     pub fn with_prefix(&self, prefix: &str) -> Self {
         Self::new(
             format!("{prefix} · {}", self.english),

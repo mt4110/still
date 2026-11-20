@@ -174,8 +174,8 @@ fn scan_under(
         .same_file_system(true)
         .filter_entry(move |entry| {
             entry.path() == scan_root
-                || (!excluded(entry.file_name())
-                    && !(personal
+                || !(excluded(entry.file_name())
+                    || (personal
                         && entry.file_type().is_some_and(|kind| kind.is_dir())
                         && build_output(entry.path())))
         });

@@ -163,3 +163,9 @@ still vault purge --expired
 Source Available License.
 Commercial redistribution and public distribution of forks are prohibited. Modifications are permitted only as PRs to this repository.
 See [LICENSE](./LICENSE) for details.
+
+### Reviewing leftover stages and Library storage on macOS
+
+After a partial workspace cleanup, refresh the scan and open **Review leftover stages…** from the workspace menu. Inspect the stage, then confirm removal if it contains only empty directories, recognizable Finder metadata and the staging note. The CLI equivalent is `still stage-cleanup --cleanup-root <workspace> <stage>` to preview, with `--apply` to confirm.
+
+The optional Library inventory under **Apps & SDKs → App storage** shows exact registered bundle ID matches, recorded file dates, and changes since the previous desktop Library scan. Logs, databases and shared containers stay available for read-only inspection. The app continues to use the existing local profile, history and Vault directories.

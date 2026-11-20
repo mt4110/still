@@ -1,3 +1,24 @@
+#[cfg(target_os = "macos")]
+mod library;
+#[cfg(all(target_os = "macos", any(test, feature = "desktop")))]
+mod observations;
+
+#[cfg(all(target_os = "macos", feature = "desktop"))]
+pub(super) fn desktop_scan(xcode: bool, include_library: bool) -> anyhow::Result<Report> {
+    let mut report = scan(xcode, include_library)?;
+    if include_library {
+        if let Err(err) = observations::record(&mut report) {
+            report.notes.push(format!(
+                "Library の履歴を保存できませんでした / Library history unavailable: {err:#}"
+            ));
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(all(target_os = "windows", feature = "desktop"))]
+pub(super) use scan as desktop_scan;
+
 use super::{bytes, message::Message};
 use crate::cli::{AppStorageArgs, ListFormat};
 use anyhow::Result;
@@ -11,6 +32,9 @@ pub(super) struct Row {
     pub size_basis: &'static str,
     pub partial: bool,
     pub reason: Message,
+    #[cfg(target_os = "macos")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library: Option<library::Evidence>,
 }
 
 #[derive(Default, Serialize)]
@@ -33,6 +57,10 @@ pub fn run(args: &AppStorageArgs) -> Result<()> {
                     println!("  {path}");
                 }
                 println!("  {}", row.reason);
+                #[cfg(target_os = "macos")]
+                if let Some(evidence) = row.library {
+                    println!("  {}", evidence.activity_text(false));
+                }
             }
             for note in result.notes {
                 println!("{note}");
@@ -54,13 +82,14 @@ pub(super) use mac::{command_output, runtimes, simctl_json, Runtime};
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use super::{Message, Report, Row};
+    use super::{library, Message, Report, Row};
     use crate::review::inventory;
     use anyhow::{bail, Context, Result};
     use serde::Deserialize;
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{Read, Seek, SeekFrom};
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -112,6 +141,11 @@ mod mac {
         let mut report = scan_home(&home);
         if include_library {
             scan_library(&home, &mut report);
+            if let Err(err) = library::match_bundles(&mut report.rows) {
+                report
+                    .notes
+                    .push(format!("App registration lookup: {err:#}"));
+            }
             report.notes.push("Library inventory can overlap known locations; do not add the displayed sizes together.".into());
         }
         if include_xcode {
@@ -178,14 +212,14 @@ mod mac {
     }
 
     fn scan_library(home: &Path, report: &mut Report) {
-        const AREAS: &[&str] = &[
-            "Caches",
-            "Logs",
-            "Application Support",
-            "Containers",
-            "Group Containers",
-        ];
-        for area in AREAS {
+        let home_device = match fs::metadata(home) {
+            Ok(meta) => meta.dev(),
+            Err(err) => {
+                report.notes.push(format!("Library: {err}"));
+                return;
+            }
+        };
+        for (kind, area) in library::Area::ALL {
             let base = home.join("Library").join(area);
             let Some(base) = known_directory(home, &base, &mut report.notes) else {
                 continue;
@@ -214,10 +248,26 @@ mod mac {
                     Ok(meta) if meta.is_dir() && !inventory::is_link(&meta) => {
                         let label =
                             format!("Library/{area}/{}", entry.file_name().to_string_lossy());
-                        measure(home, &path, label, (
-                            "Owner and contents are not verified. May contain shared or persistent data; review only.",
-                            "所有元とデータの用途は未確認です。共有データや永続データを含む可能性があるため、確認専用です。",
-                        ), report);
+                        let Some(path) = known_directory(home, &path, &mut report.notes) else {
+                            continue;
+                        };
+                        match library::measure(&path, home_device) {
+                            Ok((size, activity)) => {
+                                let partial = activity.skipped > 0;
+                                let evidence =
+                                    library::Evidence::new(kind, &entry.file_name(), activity);
+                                report.rows.push(Row {
+                                    label,
+                                    path: Some(inventory::display(&path)),
+                                    size_bytes: Some(size),
+                                    size_basis: "allocated",
+                                    partial,
+                                    reason: evidence.describe(),
+                                    library: Some(evidence),
+                                });
+                            }
+                            Err(err) => report.notes.push(format!("{label} · {err}")),
+                        }
                     }
                     Ok(meta) if inventory::is_link(&meta) => report
                         .notes
@@ -266,6 +316,7 @@ mod mac {
                         } else {
                             "logical"
                         },
+                        library: None,
                         partial: root.usage.skipped > 0,
                         reason: Message::new(reason.0, reason.1),
                     });
@@ -375,6 +426,7 @@ mod mac {
                 size_bytes: runtime.size_bytes,
                 size_basis: "reported by Xcode",
                 partial: false,
+                library: None,
                 reason: if runtime.deletable == Some(true) {
                     Message::new(
                         "Xcode allows removal in Settings → Components. Check the versions you still test.",
