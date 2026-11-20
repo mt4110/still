@@ -111,7 +111,7 @@ pub(super) fn scan(
     scan_scope(root, older_than_days, min_mib, sort, false)
 }
 
-#[cfg(feature = "desktop")]
+#[cfg(all(feature = "desktop", any(target_os = "windows", target_os = "macos")))]
 pub(super) fn scan_personal(
     root: Option<&Path>,
     days: u16,
@@ -399,14 +399,13 @@ mod tests {
         fs::write(home.join("web/package.json"), b"{}")?;
         let cutoff = SystemTime::now() + Duration::from_secs(60);
         let report = scan_under(&home, &home, cutoff, 0, StaleSort::Size, true)?;
-        let paths: Vec<_> = report.candidates.iter().map(|c| c.path.as_str()).collect();
-        assert!(paths
+        let files: Vec<_> = report
+            .candidates
             .iter()
-            .any(|p| p.ends_with("docs/target/old.bin")
-                || p.contains("docs") && p.ends_with("old.bin")));
-        assert!(!paths
-            .iter()
-            .any(|p| p.ends_with("old.bin") && !p.contains("docs")));
+            .filter(|row| row.path.ends_with("old.bin"))
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert!(Path::new(&files[0].path).ends_with("docs/target/old.bin"));
         assert!(scan_under(
             &home,
             &home.join("crate/target"),
