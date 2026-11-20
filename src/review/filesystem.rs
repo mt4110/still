@@ -44,11 +44,40 @@ fn windows_identity(handle: &std::fs::File) -> Result<Identity> {
 
 pub fn stamp(path: &Path, metadata: &Metadata) -> Result<artifacts::Stamp> {
     #[cfg(unix)]
-    let (identity, changed) = {
+    let (identity, changed, contents) = {
         use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let contents = if metadata.is_file() {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)?;
+            let before = file.metadata()?;
+            if !before.is_file()
+                || identity(path, &before)? != identity(path, metadata)?
+                || before.len() != metadata.len()
+                || before.modified()? != metadata.modified()?
+                || (before.ctime(), before.ctime_nsec())
+                    != (metadata.ctime(), metadata.ctime_nsec())
+            {
+                bail!("File changed during inspection: {path:?}");
+            }
+            let hash = contents_hash(&mut file, before.len())?;
+            let after = file.metadata()?;
+            if after.len() != before.len()
+                || after.modified()? != before.modified()?
+                || (after.ctime(), after.ctime_nsec()) != (before.ctime(), before.ctime_nsec())
+            {
+                bail!("File changed during inspection: {path:?}");
+            }
+            Some(hash)
+        } else {
+            None
+        };
         (
             identity(path, metadata)?,
             (metadata.ctime(), metadata.ctime_nsec()),
+            contents,
         )
     };
 
@@ -81,7 +110,7 @@ pub fn stamp(path: &Path, metadata: &Metadata) -> Result<artifacts::Stamp> {
         // NTFS can report identical timestamps for successive same-size writes.
         // Hash regular files only when reviewing or applying a selection.
         let contents = if current.is_file() {
-            Some(windows_contents(&mut handle, current.len())?)
+            Some(contents_hash(&mut handle, current.len())?)
         } else {
             None
         };
@@ -99,13 +128,11 @@ pub fn stamp(path: &Path, metadata: &Metadata) -> Result<artifacts::Stamp> {
         len: metadata.len(),
         modified: metadata.modified()?,
         changed,
-        #[cfg(windows)]
         contents,
     })
 }
 
-#[cfg(windows)]
-fn windows_contents(file: &mut std::fs::File, mut len: u64) -> Result<u64> {
+fn contents_hash(file: &mut std::fs::File, mut len: u64) -> Result<u64> {
     use std::hash::{BuildHasher, Hasher, RandomState};
     use std::io::Read;
     use std::sync::LazyLock;
@@ -285,7 +312,7 @@ fn remove_tree(
     flags: rustix::fs::OFlags,
     unlinked: &mut std::collections::HashSet<Identity>,
 ) -> Result<()> {
-    use rustix::fs::{self, AtFlags, FileType, Mode};
+    use rustix::fs::{self, AtFlags, FileType, Mode, OFlags};
     use std::os::unix::ffi::OsStrExt;
 
     let expected = tree
@@ -342,6 +369,29 @@ fn remove_tree(
             || (changed != expected.changed && !unlinked.contains(&expected.identity))
         {
             bail!("Staged file was modified: {relative:?}");
+        }
+        let file = fs::openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        if stat_identity(&fs::fstat(&file)?) != expected.identity {
+            bail!("Staged file was replaced: {relative:?}");
+        }
+        let mut file = std::fs::File::from(file);
+        if Some(contents_hash(&mut file, expected.len)?) != expected.contents {
+            bail!("Staged file contents changed: {relative:?}");
+        }
+        let after = fs::fstat(&file)?;
+        if stat_identity(&after) != expected.identity
+            || after.st_size != stat.st_size
+            || after.st_mtime != stat.st_mtime
+            || after.st_mtime_nsec != stat.st_mtime_nsec
+            || after.st_ctime != stat.st_ctime
+            || after.st_ctime_nsec != stat.st_ctime_nsec
+        {
+            bail!("Staged file changed during inspection: {relative:?}");
         }
         fs::unlinkat(parent, name, AtFlags::empty())?;
         if stat.st_nlink > 1 {

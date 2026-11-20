@@ -20,7 +20,7 @@ pub(super) struct Report {
 }
 
 pub fn run(args: &AppStorageArgs) -> Result<()> {
-    let result = scan(args.xcode_runtimes)?;
+    let result = scan(args.xcode_runtimes, args.library)?;
     match args.format {
         ListFormat::Json => println!("{}", serde_json::to_string(&result)?),
         ListFormat::Text => {
@@ -43,7 +43,7 @@ pub fn run(args: &AppStorageArgs) -> Result<()> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(super) fn scan(_: bool) -> Result<Report> {
+pub(super) fn scan(_: bool, _: bool) -> Result<Report> {
     anyhow::bail!("App storage review is currently available on macOS")
 }
 
@@ -106,10 +106,14 @@ mod mac {
         )),
     ];
 
-    pub(in crate::review) fn scan(include_xcode: bool) -> Result<Report> {
+    pub(in crate::review) fn scan(include_xcode: bool, include_library: bool) -> Result<Report> {
         let dirs = directories::BaseDirs::new().context("Could not locate your home directory")?;
         let home = dirs.home_dir().canonicalize()?;
         let mut report = scan_home(&home);
+        if include_library {
+            scan_library(&home, &mut report);
+            report.notes.push("Library inventory can overlap known locations; do not add the displayed sizes together.".into());
+        }
         if include_xcode {
             match xcode_runtimes() {
                 Ok(mut rows) => report.rows.append(&mut rows),
@@ -171,6 +175,60 @@ mod mac {
             }
         }
         report
+    }
+
+    fn scan_library(home: &Path, report: &mut Report) {
+        const AREAS: &[&str] = &[
+            "Caches",
+            "Logs",
+            "Application Support",
+            "Containers",
+            "Group Containers",
+        ];
+        for area in AREAS {
+            let base = home.join("Library").join(area);
+            let Some(base) = known_directory(home, &base, &mut report.notes) else {
+                continue;
+            };
+            let entries = match fs::read_dir(&base) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    report
+                        .notes
+                        .push(format!("{} · {err}", inventory::display(&base)));
+                    continue;
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        report
+                            .notes
+                            .push(format!("{} · {err}", inventory::display(&base)));
+                        continue;
+                    }
+                };
+                let path = entry.path();
+                match fs::symlink_metadata(&path) {
+                    Ok(meta) if meta.is_dir() && !inventory::is_link(&meta) => {
+                        let label =
+                            format!("Library/{area}/{}", entry.file_name().to_string_lossy());
+                        measure(home, &path, label, (
+                            "Owner and contents are not verified. May contain shared or persistent data; review only.",
+                            "所有元とデータの用途は未確認です。共有データや永続データを含む可能性があるため、確認専用です。",
+                        ), report);
+                    }
+                    Ok(meta) if inventory::is_link(&meta) => report
+                        .notes
+                        .push(format!("Skipped link: {}", inventory::display(&path))),
+                    Ok(_) => {}
+                    Err(err) => report
+                        .notes
+                        .push(format!("{} · {err}", inventory::display(&path))),
+                }
+            }
+        }
     }
 
     fn known_directory(home: &Path, path: &Path, notes: &mut Vec<String>) -> Option<PathBuf> {
@@ -330,6 +388,30 @@ mod mac {
                 },
             }
         }).collect())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn library_inventory_reports_unknown_owners_and_skips_links() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let base = fixture.path().canonicalize()?;
+        let home = base.join("home");
+        let cache = home.join("Library/Caches/unknown.application");
+        let outside = base.join("outside");
+        fs::create_dir_all(&cache)?;
+        fs::create_dir_all(&outside)?;
+        fs::write(cache.join("data"), b"local data")?;
+        std::os::unix::fs::symlink(&outside, home.join("Library/Caches/link"))?;
+        let mut report = Report::default();
+        scan_library(&home, &mut report);
+        assert_eq!(report.rows.len(), 1);
+        assert!(report.rows[0].reason.to_string().contains("not verified"));
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("Skipped link")));
+        assert!(cache.join("data").exists());
+        Ok(())
     }
 
     #[cfg(test)]

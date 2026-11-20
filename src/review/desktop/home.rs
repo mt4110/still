@@ -144,6 +144,62 @@ impl App {
                 "Could not read free space",
             ));
         }
+        ui.add_space(24.0);
+        ui.label(
+            RichText::new(text(
+                self.japanese_reasons,
+                "容量の大きい場所を探す",
+                "Find large folders",
+            ))
+            .size(17.0)
+            .strong(),
+        );
+        ui.label(text(self.japanese_reasons, "選んだ範囲を読み取り専用で調べ、容量順に開けます。権限のない場所や別ボリュームは対象外になります。", "Scan a selected area read-only and browse by size. Inaccessible paths and other volumes are excluded."));
+        let mut chosen = None;
+        ui.horizontal(|ui| {
+            if super::controls::button(
+                ui,
+                text(
+                    self.japanese_reasons,
+                    "ホーム全体を調べる",
+                    "Scan entire home",
+                ),
+                true,
+                self.job.is_none(),
+            )
+            .clicked()
+            {
+                chosen = self.home.directory.clone();
+            }
+            if super::controls::button(
+                ui,
+                text(
+                    self.japanese_reasons,
+                    "システム領域を調べる",
+                    "Scan system volume",
+                ),
+                false,
+                self.job.is_none(),
+            )
+            .clicked()
+            {
+                chosen = Some(PathBuf::from("/"));
+            }
+            if super::controls::button(
+                ui,
+                text(self.japanese_reasons, "フォルダを選ぶ…", "Choose a folder…"),
+                false,
+                self.job.is_none(),
+            )
+            .clicked()
+            {
+                chosen = rfd::FileDialog::new().pick_folder();
+            }
+        });
+        if let Some(root) = chosen {
+            self.start_browse_scan(ui.ctx(), root);
+            return;
+        }
         ui.add_space(32.0);
         let workspace = self
             .home
@@ -248,7 +304,32 @@ impl App {
         self.kube_context.clear();
         self.kube_namespace.clear();
         self.baseline.clear();
+        self.browse_folders = false;
         self.add_workspace(ctx, path);
+    }
+
+    fn start_browse_scan(&mut self, ctx: &egui::Context, path: PathBuf) {
+        if self.job.is_some() {
+            return;
+        }
+        match super::super::inventory::safe_dir(&path) {
+            Ok(path) => {
+                self.profile = Profile {
+                    roots: vec![path],
+                    ..Profile::default()
+                };
+                self.profile_name = None;
+                self.index = 0;
+                self.baseline.clear();
+                self.browse_folders = true;
+                self.read_only_browse = true;
+                self.view = super::View::Folders;
+                self.cleanup_receipt = None;
+                self.navigate(super::shell::Screen::Workspace);
+                self.refresh(ctx, false);
+            }
+            Err(error) => self.status = super::display_error(&error, self.japanese_reasons),
+        }
     }
 
     fn resume_scan(&mut self, ctx: &egui::Context, path: PathBuf) -> Result<()> {
@@ -271,6 +352,7 @@ impl App {
             text(self.japanese_reasons, "前回の場所がプロファイルから外れています。Open profile から調査先を選んでください。", "The previous workspace is no longer in the profile. Choose a workspace from Open profile."),
         )?;
         self.profile = profile;
+        self.read_only_browse = false;
         self.profile_name = last.name.clone();
         self.index = index;
         self.docker_input = self.profile.docker_context.clone().unwrap_or_default();
@@ -288,6 +370,42 @@ impl App {
             .unwrap_or_default();
         self.baseline.clear();
         self.refresh(ctx, true);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_only_scan_switches_from_candidates_to_folders() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        std::fs::create_dir(root.join("large-folder"))?;
+        let mut app = App {
+            view: super::super::View::Candidates,
+            ..App::default()
+        };
+        app.start_browse_scan(&egui::Context::default(), root.clone());
+        assert!(matches!(app.view, super::super::View::Folders));
+        assert!(app.read_only_browse);
+        let result = app
+            .job
+            .take()
+            .context("scan did not start")?
+            .result
+            .recv_timeout(std::time::Duration::from_secs(10))?;
+        let super::super::Outcome::Scan(scan) = result else {
+            anyhow::bail!("unexpected operation")
+        };
+        let scan = scan?;
+        assert!(scan
+            .inventory
+            .directories
+            .iter()
+            .any(|row| row.path == root.join("large-folder")));
+        assert!(scan.files.is_empty());
         Ok(())
     }
 }

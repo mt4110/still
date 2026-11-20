@@ -1,6 +1,6 @@
 use super::super::{artifacts::Producer, history::Delta};
 use super::{bytes, display, egui, open_in_finder, App, Confirmation, Message, Outcome, Scan};
-use super::{text, ACCENT, LINE, MUTED, PAPER};
+use super::{text, ACCENT, LINE, MUTED};
 use egui::{Align, RichText, Stroke};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -59,13 +59,6 @@ fn virtual_row(
     );
     row.set_clip_rect(row.clip_rect().intersect(rect));
     (row, response)
-}
-
-fn primary(text: impl Into<String>) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.into()).color(PAPER))
-        .fill(ACCENT)
-        .corner_radius(7.)
-        .min_size(egui::vec2(0., super::controls::HEIGHT))
 }
 
 #[derive(Default)]
@@ -156,14 +149,9 @@ fn candidate_header(ui: &mut egui::Ui, japanese: bool) {
             (text(japanese, "サイズ", "Size"), 82., Align::Max),
             (text(japanese, "状態", "Status"), status_width, Align::Min),
         ] {
-            ui.allocate_ui_with_layout(
-                egui::vec2(width, 28.),
-                egui::Layout::top_down(align),
-                |ui| {
-                    ui.set_width(width);
-                    ui.label(RichText::new(label).size(12.).color(MUTED));
-                },
-            );
+            super::controls::cell(ui, width, 28., align, |ui| {
+                super::controls::label(ui, label, 12., MUTED, align, egui::Sense::hover());
+            });
         }
     });
 }
@@ -218,10 +206,10 @@ fn candidate_inspector(
                 "Contents and open files are checked again before removal. Free-space change is measured afterward.",
             )).size(12.).color(MUTED));
             ui.add_space(18.);
-            if ui.button(text(japanese, "Finder で開く ↗", "Open in Finder ↗")).clicked() {
+            if super::controls::button(ui, text(japanese, "Finder で開く ↗", "Open in Finder ↗"), false, true).clicked() {
                 *finder_error = open_in_finder(path).err().map(|error| super::display_error(&error, japanese));
             }
-            if ui.button(text(japanese, "この項目を再確認", "Inspect this item")).clicked() {
+            if super::controls::button(ui, text(japanese, "この項目を再確認", "Inspect this item"), false, true).clicked() {
                 *inspect = Some(path.clone());
             }
         });
@@ -537,11 +525,13 @@ impl App {
                                         || effect(c.producer, japanese),
                                         |reason| reason.text(japanese),
                                     );
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(reason).size(12.).color(MUTED),
-                                        )
-                                        .truncate(),
+                                    super::controls::label(
+                                        ui,
+                                        reason,
+                                        12.,
+                                        MUTED,
+                                        Align::Min,
+                                        egui::Sense::hover(),
                                     );
                                 },
                             );
@@ -550,7 +540,14 @@ impl App {
                                 egui::Layout::right_to_left(Align::Center),
                                 |ui| {
                                     ui.set_width(82.);
-                                    ui.add(egui::Label::new(bytes(c.row.usage.size())).truncate());
+                                    super::controls::label(
+                                        ui,
+                                        &bytes(c.row.usage.size()),
+                                        15.,
+                                        super::INK,
+                                        Align::Max,
+                                        egui::Sense::hover(),
+                                    );
                                 },
                             );
                             ui.allocate_ui_with_layout(
@@ -563,7 +560,14 @@ impl App {
                                     } else {
                                         (text(japanese, "掃除候補", "Candidate"), ACCENT)
                                     };
-                                    ui.label(RichText::new(label).size(12.).color(color));
+                                    super::controls::label(
+                                        ui,
+                                        label,
+                                        12.,
+                                        color,
+                                        Align::Min,
+                                        egui::Sense::hover(),
+                                    );
                                 },
                             );
                         });
@@ -668,16 +672,13 @@ impl App {
                 )
             });
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                review = ui
-                    .add_enabled(
-                        self.job.is_none() && !self.marked.is_empty(),
-                        primary(text(
-                            japanese,
-                            "選択した項目を確認",
-                            "Review selected items",
-                        )),
-                    )
-                    .clicked();
+                review = super::controls::button(
+                    ui,
+                    text(japanese, "選択した項目を確認", "Review selected items"),
+                    true,
+                    self.job.is_none() && !self.marked.is_empty(),
+                )
+                .clicked();
             });
         });
         if let Some(error) = finder_error {
@@ -727,8 +728,8 @@ impl App {
                 ui.ctx(),
                 text(
                     japanese,
-                    "選択した候補を確認中…",
-                    "Checking selected candidates…",
+                    "内容を照合中… 大きなフォルダは時間がかかります",
+                    "Checking contents… Large folders may take time",
                 ),
                 false,
                 move || Outcome::Review(Confirmation::prepare(policy, paths)),

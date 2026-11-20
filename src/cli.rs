@@ -28,6 +28,8 @@ pub enum Commands {
     Stale(StaleArgs),
     #[command(about = "Review Mac app storage, SDK versions, caches, and protected data")]
     AppStorage(AppStorageArgs),
+    #[command(about = "Read locally recorded desktop cleanup results")]
+    CleanupHistory(CleanupHistoryArgs),
     #[command(about = crate::lang::text().tui)]
     Tui(TuiArgs),
     #[command(about = crate::lang::text().apply)]
@@ -39,10 +41,22 @@ pub enum Commands {
 }
 
 #[derive(Args, Debug)]
+pub struct CleanupHistoryArgs {
+    /// Maximum number of recent operations to display.
+    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u16).range(1..=500))]
+    pub limit: u16,
+    #[arg(long, value_enum, default_value_t = ListFormat::Text)]
+    pub format: ListFormat,
+}
+
+#[derive(Args, Debug)]
 pub struct AppStorageArgs {
     /// Also ask Xcode for its installed simulator runtime inventory.
     #[arg(long)]
     pub xcode_runtimes: bool,
+    /// Also inventory immediate folders in selected Library locations (read-only).
+    #[arg(long)]
+    pub library: bool,
     #[arg(long, value_enum, default_value_t = ListFormat::Text)]
     pub format: ListFormat,
 }

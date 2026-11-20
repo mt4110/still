@@ -18,6 +18,7 @@ pub enum Producer {
     CargoDependencies,
     NextJs,
     Vite,
+    NodeModules,
     PythonBytecode,
     UnityLibrary,
     UnityAssets,
@@ -40,6 +41,7 @@ impl Producer {
             Self::CargoRelocated => ("Cargo metadata and compiled profile in a relocated output", "別の場所に置かれた Cargo のビルド出力を検出"),
             Self::NextJs => ("Next.js dependency and build output", "Next.js の依存関係とビルド出力を検出"),
             Self::Vite => ("Vite dependency and bundled assets", "Vite の依存関係とビルド出力を検出"),
+            Self::NodeModules => ("Dependency directory beside package.json; review only because it may contain local changes or linked packages", "package.json の隣にある依存フォルダです。ローカル変更やリンクを含む場合があるため、削除せず確認のみ行います。"),
             Self::PythonBytecode => ("CPython bytecode with matching source files", "対応するソースがある CPython のキャッシュを検出"),
             Self::UnityLibrary => ("Unity asset cache; protected here because regeneration requires a full reimport", "Unity のキャッシュです。削除後に全アセットの再インポートが必要なため保護しています。"),
             Self::UnityAssets => ("Protected Unity source assets", "Unity プロジェクトの元アセットを保護しています。"),
@@ -58,6 +60,7 @@ impl Producer {
         matches!(
             self,
             Self::UnityLibrary
+                | Self::NodeModules
                 | Self::UnityAssets
                 | Self::UnrealCache
                 | Self::UnrealProjectData
@@ -101,6 +104,15 @@ impl Policy {
         if self.outputs.iter().any(|output| path == output) {
             return Some(Producer::DeclaredOutput);
         }
+        // Package contents can contain their own build markers and manifests;
+        // they are part of the installed dependency, not separate project outputs.
+        if path
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir.file_name().is_some_and(|name| name == "node_modules"))
+        {
+            return None;
+        }
         if matches!(
             path.file_name().and_then(|s| s.to_str()),
             Some("incremental" | "deps")
@@ -114,6 +126,14 @@ impl Policy {
         }
         let parent = path.parent()?;
         match path.file_name()?.to_str()? {
+            "node_modules"
+                if regular_file(&parent.join("package.json"))
+                    && !parent
+                        .ancestors()
+                        .any(|dir| dir.file_name().is_some_and(|name| name == "node_modules")) =>
+            {
+                Some(Producer::NodeModules)
+            }
             "target"
                 if regular_file(&parent.join("Cargo.toml"))
                     && (regular_file(&path.join(".rustc_info.json"))
@@ -252,6 +272,7 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
                     "target"
                         | ".next"
                         | "dist"
+                        | "node_modules"
                         | "__pycache__"
                         | "Library"
                         | "Assets"
@@ -407,7 +428,6 @@ pub struct Stamp {
     pub len: u64,
     pub modified: SystemTime,
     pub changed: (i64, i64),
-    #[cfg(windows)]
     pub contents: Option<u64>,
 }
 
@@ -831,6 +851,25 @@ mod tests {
     }
 
     #[test]
+    fn same_size_content_change_is_detected_even_if_timestamps_match() {
+        let (_temporary, output, policy) = fixture();
+        let approved = policy.prepare(&output).unwrap();
+        fs::write(output.join("build.bin"), b"new bytes").unwrap();
+        let mut current = policy.prepare(&output).unwrap();
+        let old = approved.tree.entries.get(Path::new("build.bin")).unwrap();
+        let new = current
+            .tree
+            .entries
+            .get_mut(Path::new("build.bin"))
+            .unwrap();
+        assert_eq!(old.len, new.len);
+        new.modified = old.modified;
+        new.changed = old.changed;
+        assert_ne!(old.contents, new.contents);
+        assert_ne!(approved.tree, current.tree);
+    }
+
+    #[test]
     fn test_evidence_added_after_review_keeps_output_intact() {
         let (_temporary, output, policy) = fixture();
         let approved = policy.prepare(&output).unwrap();
@@ -910,6 +949,40 @@ mod tests {
         assert!(python_bytecode(&cache, &root));
         fs::write(cache.join("orphan.cpython-313.pyc"), b"bytecode")?;
         assert!(!python_bytecode(&cache, &root));
+        Ok(())
+    }
+
+    #[test]
+    fn node_modules_is_visible_but_protected_and_does_not_expose_package_outputs() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let project = root.join("project");
+        let modules = project.join("node_modules");
+        let package = modules.join("some-package");
+        let dist = package.join("dist");
+        fs::create_dir_all(dist.join("assets"))?;
+        fs::write(project.join("package.json"), b"{}")?;
+        fs::write(
+            package.join("package.json"),
+            b"{\"devDependencies\":{\"vite\":\"1\"}}",
+        )?;
+        fs::write(dist.join("index.html"), b"generated")?;
+        let policy = Policy {
+            roots: vec![root.clone()],
+            outputs: vec![],
+            docker_context: None,
+        };
+        let scan = inventory::scan(&root, 2, None)?;
+        let candidates = file_candidates(&scan, &policy);
+        let row = candidates
+            .iter()
+            .find(|candidate| candidate.row.path == modules)
+            .unwrap();
+        assert_eq!(row.producer, Producer::NodeModules);
+        assert!(row.blocked_reason.is_some());
+        assert!(policy.prepare(&modules).is_err());
+        assert!(policy.producer(&dist).is_none());
+        assert!(dist.join("index.html").exists());
         Ok(())
     }
 

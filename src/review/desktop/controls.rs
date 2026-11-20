@@ -13,14 +13,29 @@ pub(super) fn paint_label(
     align: egui::Align,
     color: egui::Color32,
 ) {
+    paint_text(
+        ui,
+        rect,
+        label,
+        egui::TextStyle::Button.resolve(ui.style()),
+        align,
+        color,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn paint_text(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    label: &str,
+    font: egui::FontId,
+    align: egui::Align,
+    color: egui::Color32,
+) {
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
         return;
     }
-    let mut job = egui::text::LayoutJob::simple_singleline(
-        label.to_owned(),
-        egui::TextStyle::Button.resolve(ui.style()),
-        color,
-    );
+    let mut job = egui::text::LayoutJob::simple_singleline(label.to_owned(), font, color);
     job.wrap.max_width = rect.width();
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
@@ -31,6 +46,8 @@ pub(super) fn paint_label(
     }
     let x = if align == egui::Align::Min {
         rect.left() - ink.left()
+    } else if align == egui::Align::Max {
+        rect.right() - ink.right()
     } else {
         rect.center().x - ink.center().x
     };
@@ -47,15 +64,35 @@ pub(super) fn button(
     primary: bool,
     enabled: bool,
 ) -> egui::Response {
+    colored_button(ui, label, primary.then_some(super::ACCENT), enabled)
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn destructive_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    colored_button(
+        ui,
+        label,
+        Some(egui::Color32::from_rgb(180, 48, 42)),
+        enabled,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn colored_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    fill: Option<egui::Color32>,
+    enabled: bool,
+) -> egui::Response {
     let mut button =
         egui::Button::new(egui::RichText::new(label).color(egui::Color32::TRANSPARENT))
             .min_size(egui::vec2(0.0, HEIGHT))
             .truncate();
-    if primary {
-        button = button.fill(super::ACCENT);
+    if let Some(fill) = fill {
+        button = button.fill(fill);
     }
     let response = ui.add_enabled(enabled, button);
-    let color = if primary {
+    let color = if fill.is_some() {
         egui::Color32::WHITE
     } else {
         ui.style().interact(&response).text_color()
@@ -70,6 +107,38 @@ pub(super) fn button(
         response.rect.shrink2(egui::vec2(PADDING_X, 0.0)),
         label,
         egui::Align::Center,
+        color,
+    );
+    response.on_hover_text(label)
+}
+
+/// Keep the semantic label and its interaction region while centering visible ink.
+/// The caller owns the fixed cell or row height; this never expands a virtual row.
+#[cfg(target_os = "macos")]
+pub(super) fn label(
+    ui: &mut egui::Ui,
+    label: &str,
+    size: f32,
+    color: egui::Color32,
+    align: egui::Align,
+    sense: egui::Sense,
+) -> egui::Response {
+    let response = ui.add(
+        egui::Label::new(
+            egui::RichText::new(label)
+                .size(size)
+                .color(egui::Color32::TRANSPARENT),
+        )
+        .selectable(false)
+        .sense(sense)
+        .truncate(),
+    );
+    paint_text(
+        ui,
+        response.rect,
+        label,
+        egui::FontId::proportional(size),
+        align,
         color,
     );
     response.on_hover_text(label)
@@ -218,6 +287,8 @@ mod tests {
                 }
                 let response = menu(ui, "調査先とプロファイル", |_| {});
                 controls.push(("調査先とプロファイル", response.rect, true));
+                let response = destructive_button(ui, "確認した対象を削除", true);
+                controls.push(("確認した対象を削除", response.rect, true));
                 let response = language(ui, &mut japanese);
                 controls.push(("日本語", response.rect, false));
             });
@@ -255,6 +326,58 @@ mod tests {
                     "text must remain inside its control"
                 );
             }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn table_labels_center_ink_and_keep_full_label_semantics() {
+        for scale in [1.0, 2.0] {
+            let ctx = egui::Context::default();
+            super::super::configure_ui(&ctx);
+            ctx.set_pixels_per_point(scale);
+            let title = "Protected SDK 保護中";
+            let mut rect = egui::Rect::NOTHING;
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_max_width(110.0);
+                rect = label(
+                    ui,
+                    title,
+                    15.0,
+                    super::super::INK,
+                    egui::Align::Min,
+                    egui::Sense::click(),
+                )
+                .rect;
+            });
+            let visible = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text)
+                        if text.galley.text() == title
+                            && text.galley.rows.iter().any(|row| {
+                                row.visuals
+                                    .mesh
+                                    .vertices
+                                    .iter()
+                                    .any(|vertex| vertex.color.a() > 0)
+                            }) =>
+                    {
+                        Some((shape, text))
+                    }
+                    _ => None,
+                })
+                .expect("full text remains attached to visible label");
+            let ink = visible
+                .1
+                .galley
+                .mesh_bounds
+                .translate(visible.1.pos.to_vec2());
+            assert!((ink.center().y - rect.center().y).abs() <= 0.5);
+            assert!((ink.left() - rect.left()).abs() <= 0.5);
+            assert!(rect.contains_rect(visible.0.clip_rect));
+            assert!(visible.1.galley.elided);
         }
     }
 

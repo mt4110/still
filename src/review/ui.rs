@@ -322,7 +322,8 @@ impl Explorer {
                 KeyCode::Char('o') => self.input = Some((Input::Root, String::new())),
                 KeyCode::Char('/') => self.input = Some((Input::Search, String::new())),
                 KeyCode::Char(' ') => {
-                    self.message = "Checking selected output…".into();
+                    self.message =
+                        "Checking selected output contents; large folders may take time…".into();
                     self.draw(terminal)?;
                     self.toggle_selection();
                 }

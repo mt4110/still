@@ -27,8 +27,6 @@ const INK: Color32 = Color32::from_rgb(29, 31, 36);
 const ACCENT: Color32 = Color32::from_rgb(0, 102, 222);
 
 #[cfg(target_os = "macos")]
-const PAPER: Color32 = Color32::WHITE;
-#[cfg(target_os = "macos")]
 const MUTED: Color32 = Color32::from_rgb(95, 100, 110);
 #[cfg(target_os = "macos")]
 const LINE: Color32 = Color32::from_rgb(226, 228, 233);
@@ -209,34 +207,28 @@ fn open_in_finder(path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn finder_breadcrumb(ui: &mut egui::Ui, path: &Path, japanese: bool) -> Option<String> {
-    let mut error = None;
+fn folder_breadcrumb(ui: &mut egui::Ui, root: &Path, path: &Path) -> Option<PathBuf> {
+    let mut chosen = None;
     ui.horizontal_wrapped(|ui| {
         let mut ancestors: Vec<_> = path
             .ancestors()
-            .filter(|part| part.file_name().is_some())
+            .take_while(|part| part.starts_with(root))
             .collect();
         ancestors.reverse();
         for (index, part) in ancestors.into_iter().enumerate() {
             if index > 0 {
                 ui.label("/");
             }
-            let name = part.file_name().unwrap_or_default().to_string_lossy();
-            let action = if japanese {
-                "Finder で開く"
-            } else {
-                "Open in Finder"
-            };
-            if ui
-                .link(name)
-                .on_hover_text(format!("{action} · {}", display(part)))
-                .clicked()
-            {
-                error = open_in_finder(part).err().map(|err| err.to_string());
+            let name = part
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| display(part));
+            if ui.link(name).on_hover_text(display(part)).clicked() {
+                chosen = Some(part.to_owned());
             }
         }
     });
-    error
+    chosen
 }
 
 fn modal_frame(ctx: &egui::Context) -> egui::Frame {
@@ -301,6 +293,14 @@ enum Outcome {
     SdkScan(Result<super::sdk_cleanup::Report>),
     #[cfg(target_os = "macos")]
     SdkRemoval(Result<super::sdk_cleanup::Receipt>),
+    #[cfg(target_os = "macos")]
+    DockerReview(Result<super::docker::storage::Review>),
+    #[cfg(target_os = "macos")]
+    DockerRemoval(super::docker::storage::Receipt),
+    #[cfg(target_os = "macos")]
+    DockerCacheReview(Result<super::docker::storage::CacheCleanup>),
+    #[cfg(target_os = "macos")]
+    DockerCacheRemoval(super::docker::storage::CacheCleanupResult),
     Review(Result<Confirmation>),
     Inspection(Vec<String>),
     Removal(scan::CleanupReceipt),
@@ -381,6 +381,10 @@ struct App {
     monitor: monitor::Panel,
     show_app_storage: bool,
     xcode_runtimes: bool,
+    library_inventory: bool,
+    #[cfg(target_os = "macos")]
+    browse_folders: bool,
+    read_only_browse: bool,
     app_storage: Option<Result<app_storage::Report>>,
     #[cfg(target_os = "macos")]
     sdk: sdk::Panel,
@@ -437,23 +441,28 @@ impl App {
                 self.baseline
                     .insert(result.root.clone(), result.previous.clone());
                 #[cfg(target_os = "macos")]
-                if let Err(err) =
-                    self.home
-                        .remember(&result.root, &self.profile, self.profile_name.clone())
-                {
-                    self.status = format!(
-                        "{} · {err:#}",
-                        text(
-                            self.japanese_reasons,
-                            "前回の場所を保存できませんでした",
-                            "Could not save the previous workspace"
-                        )
-                    );
+                if !self.read_only_browse {
+                    if let Err(err) =
+                        self.home
+                            .remember(&result.root, &self.profile, self.profile_name.clone())
+                    {
+                        self.status = format!(
+                            "{} · {err:#}",
+                            text(
+                                self.japanese_reasons,
+                                "前回の場所を保存できませんでした",
+                                "Could not save the previous workspace"
+                            )
+                        );
+                    }
                 }
                 self.location = result.root.clone();
                 #[cfg(target_os = "macos")]
                 {
                     self.projects = projects::Projects::from_scan(&result);
+                    if self.browse_folders {
+                        self.projects.active = false;
+                    }
                 }
                 self.scan = Some(result);
                 self.rebuild();
@@ -480,6 +489,14 @@ impl App {
             Outcome::SdkScan(result) => self.sdk.report = Some(result),
             #[cfg(target_os = "macos")]
             Outcome::SdkRemoval(result) => self.sdk.receipt = Some(result),
+            #[cfg(target_os = "macos")]
+            Outcome::DockerReview(result) => self.monitor.set_review(result),
+            #[cfg(target_os = "macos")]
+            Outcome::DockerRemoval(receipt) => self.monitor.set_receipt(receipt),
+            #[cfg(target_os = "macos")]
+            Outcome::DockerCacheReview(review) => self.monitor.set_cache_review(review),
+            #[cfg(target_os = "macos")]
+            Outcome::DockerCacheRemoval(receipt) => self.monitor.set_cache_receipt(receipt),
             Outcome::Review(Ok(confirmation)) => self.confirmation = Some(confirmation),
             Outcome::Inspection(report) => self.inspection = Some(report),
             Outcome::Removal(results) => {
@@ -526,6 +543,7 @@ impl App {
         }
         match Profile::load(&name).and_then(|p| resolve(p, true)) {
             Ok(scope) => {
+                self.read_only_browse = false;
                 self.profile = profile_for(&scope.roots, &scope.policy, &scope.sources);
                 self.kube_context = self
                     .profile
@@ -554,6 +572,7 @@ impl App {
         }
         match inventory::safe_workspace_dir(&path) {
             Ok(path) => {
+                self.read_only_browse = false;
                 if let Some(index) = self.profile.roots.iter().position(|root| *root == path) {
                     self.index = index;
                 } else {
@@ -592,6 +611,7 @@ impl App {
         let settings = self.profile.clone();
         let index = self.index;
         let name = self.profile_name.clone();
+        let read_only = self.read_only_browse;
         let previous = settings
             .roots
             .get(index)
@@ -614,6 +634,7 @@ impl App {
                     name.as_deref(),
                     previous,
                     record,
+                    read_only,
                     &worker_progress,
                 ))
             },
@@ -630,6 +651,7 @@ impl App {
             return;
         }
         let root = scan.root.clone();
+        let read_only = self.read_only_browse;
         self.marked.clear();
         self.spawn(
             ctx,
@@ -637,8 +659,12 @@ impl App {
             false,
             move || {
                 Outcome::Search(
-                    inventory::workspace_dir(&root)
-                        .and_then(|root| inventory::scan(&root, THREADS, Some(&query))),
+                    (if read_only {
+                        inventory::safe_dir(&root)
+                    } else {
+                        inventory::workspace_dir(&root)
+                    })
+                    .and_then(|root| inventory::scan(&root, THREADS, Some(&query))),
                 )
             },
         );
@@ -706,13 +732,32 @@ impl App {
             }
         };
         match self.view {
-            View::Folders => self.rows.extend(
-                scan.inventory
-                    .directories
-                    .iter()
-                    .filter(|row| row.path.parent() == Some(self.location.as_path()))
-                    .map(from_row),
-            ),
+            View::Folders => {
+                self.rows.extend(
+                    scan.inventory
+                        .directories
+                        .iter()
+                        .filter(|row| row.path.parent() == Some(self.location.as_path()))
+                        .map(from_row),
+                );
+                // The inventory keeps directory totals, not every individual file.
+                // List files only for the folder currently open to avoid retaining
+                // millions of file rows after a whole-volume scan.
+                if let Ok(entries) = std::fs::read_dir(&self.location) {
+                    for entry in entries.flatten() {
+                        if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
+                            if meta.is_file() && !inventory::is_link(&meta) {
+                                let row = inventory::Row {
+                                    path: entry.path(),
+                                    is_dir: false,
+                                    usage: inventory::Usage::file(&meta),
+                                };
+                                self.rows.push(from_row(&row));
+                            }
+                        }
+                    }
+                }
+            }
             View::Search => self.rows.extend(self.matches.iter().map(from_row)),
             View::Candidates => {
                 for candidate in &scan.files {
@@ -1254,10 +1299,26 @@ impl App {
         #[cfg(target_os = "macos")]
         {
             if self.projects.active {
+                if ui
+                    .button(text(
+                        self.japanese_reasons,
+                        "フォルダを容量順に見る",
+                        "Browse folders by size",
+                    ))
+                    .clicked()
+                {
+                    self.projects.active = false;
+                    self.browse_folders = true;
+                    self.location = self.scan.as_ref().unwrap().root.clone();
+                    self.view = View::Folders;
+                    self.rebuild();
+                    return;
+                }
                 self.project_screen(ui);
                 return;
             } else if ui.link("‹ プロジェクト一覧").clicked() {
                 self.marked.clear();
+                self.browse_folders = false;
                 self.projects = projects::Projects::from_scan(self.scan.as_ref().unwrap());
                 return;
             }
@@ -1321,8 +1382,11 @@ impl App {
         });
         #[cfg(target_os = "macos")]
         if self.view == View::Folders {
-            if let Some(error) = finder_breadcrumb(ui, &self.location, self.japanese_reasons) {
-                self.status = error;
+            if let Some(path) =
+                folder_breadcrumb(ui, &self.scan.as_ref().unwrap().root, &self.location)
+            {
+                self.location = path;
+                self.rebuild();
             }
         }
         ui.horizontal_wrapped(|ui| {
@@ -1477,8 +1541,8 @@ impl App {
                 ctx,
                 text(
                     self.japanese_reasons,
-                    "削除対象を再確認中…",
-                    "Checking selected outputs…",
+                    "内容を再照合中… 大きなフォルダは時間がかかります",
+                    "Checking contents again… Large folders may take time",
                 ),
                 false,
                 move || Outcome::Review(Confirmation::prepare(policy, paths)),
@@ -1641,7 +1705,7 @@ impl App {
                         if response.clicked() {
                             self.focused = Some(index);
                         }
-                        if !candidates && row.folder && response.double_clicked() {
+                        if !candidates && row.folder && response.clicked() {
                             enter = row.path.clone();
                         }
                     });
@@ -1721,6 +1785,8 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         self.sdk_dialog(ctx);
+        #[cfg(target_os = "macos")]
+        self.docker_confirmation(ctx);
         if let Some(name) = &mut self.save_as {
             let mut close = false;
             let mut save = false;
@@ -1792,9 +1858,22 @@ impl App {
                             }
                         },
                     );
-                    close = ui
-                        .button(text(self.japanese_reasons, "閉じる", "Close"))
+                    #[cfg(target_os = "macos")]
+                    {
+                        close = controls::button(
+                            ui,
+                            text(self.japanese_reasons, "閉じる", "Close"),
+                            false,
+                            true,
+                        )
                         .clicked();
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        close = ui
+                            .button(text(self.japanese_reasons, "閉じる", "Close"))
+                            .clicked();
+                    }
                 });
             if close || dialog.should_close() {
                 self.inspection = None;
@@ -1855,23 +1934,46 @@ impl App {
                         });
                     ui.add_space(10.0);
                     ui.horizontal(|ui| {
-                        close = ui
-                            .button(text(self.japanese_reasons, "キャンセル", "Cancel"))
-                            .clicked();
-                        delete = ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(text(
-                                        self.japanese_reasons,
-                                        "確認した対象を削除",
-                                        "Delete selected",
-                                    ))
-                                    .color(Color32::WHITE),
-                                )
-                                .fill(Color32::from_rgb(180, 48, 42))
-                                .min_size(egui::vec2(0.0, controls::HEIGHT)),
+                        #[cfg(target_os = "macos")]
+                        {
+                            close = controls::button(
+                                ui,
+                                text(self.japanese_reasons, "キャンセル", "Cancel"),
+                                false,
+                                true,
                             )
                             .clicked();
+                            delete = controls::destructive_button(
+                                ui,
+                                text(
+                                    self.japanese_reasons,
+                                    "確認した対象を削除",
+                                    "Delete selected",
+                                ),
+                                true,
+                            )
+                            .clicked();
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            close = ui
+                                .button(text(self.japanese_reasons, "キャンセル", "Cancel"))
+                                .clicked();
+                            delete = ui
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(text(
+                                            self.japanese_reasons,
+                                            "確認した対象を削除",
+                                            "Delete selected",
+                                        ))
+                                        .color(Color32::WHITE),
+                                    )
+                                    .fill(Color32::from_rgb(180, 48, 42))
+                                    .min_size(egui::vec2(0.0, controls::HEIGHT)),
+                                )
+                                .clicked();
+                        }
                     });
                 });
             if close || dialog.should_close() {
@@ -1929,6 +2031,14 @@ impl App {
                         self.japanese_reasons,
                         "Xcode のインストール済みランタイムも確認する",
                         "Ask Xcode for installed simulator runtimes",
+                    ),
+                );
+                ui.checkbox(
+                    &mut self.library_inventory,
+                    text(
+                        self.japanese_reasons,
+                        "Library の主な保存先を確認する（時間がかかる場合があります）",
+                        "Inventory major Library folders (may take time)",
                     ),
                 );
                 start = ui
@@ -2028,6 +2138,7 @@ impl App {
         if start {
             self.app_storage = None;
             let xcode = self.xcode_runtimes;
+            let library = self.library_inventory;
             self.spawn(
                 ctx,
                 text(
@@ -2036,7 +2147,7 @@ impl App {
                     "Scanning app storage…",
                 ),
                 false,
-                move || Outcome::AppStorage(app_storage::scan(xcode)),
+                move || Outcome::AppStorage(app_storage::scan(xcode, library)),
             );
         }
     }
@@ -2408,12 +2519,22 @@ impl eframe::App for App {
                     ui.label(RichText::new(&self.status).color(Color32::from_rgb(155, 50, 39)));
                 }
                 if let Some(receipt) = &self.cleanup_receipt {
+                    if let Some(error) = &receipt.history_error {
+                        ui.label(format!(
+                            "{} · {error}",
+                            text(
+                                self.japanese_reasons,
+                                "操作履歴を保存できませんでした",
+                                "Could not save cleanup history"
+                            )
+                        ));
+                    }
                     let removed = receipt.outcomes.len() - receipt.held;
                     let japanese = self.japanese_reasons || cfg!(target_os = "macos");
                     let heading = if japanese {
-                        format!("削除 {removed} 件・保留 {} 件", receipt.held)
+                        format!("削除 {removed} 件・未完了 {} 件", receipt.held)
                     } else {
-                        format!("{removed} deleted · {} held", receipt.held)
+                        format!("{removed} deleted · {} incomplete", receipt.held)
                     };
                     ui.strong(heading);
                     let change = match (receipt.before, receipt.after) {
@@ -2470,6 +2591,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn folder_browse_orders_files_and_directories_and_can_enter() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        std::fs::create_dir(root.join("folder"))?;
+        std::fs::write(root.join("folder/inside"), vec![1; 8192])?;
+        std::fs::write(root.join("small"), vec![2; 1024])?;
+        let inventory = inventory::scan(&root, 2, None)?;
+        let scan = Scan {
+            root: root.clone(),
+            policy: Arc::new(super::super::artifacts::Policy {
+                roots: vec![],
+                outputs: vec![],
+                docker_context: None,
+            }),
+            inventory,
+            previous: None,
+            recorded: false,
+            files: vec![],
+            external: vec![],
+            notes: vec![],
+        };
+        let mut app = App {
+            location: root.clone(),
+            scan: Some(scan),
+            ..App::default()
+        };
+        app.rebuild();
+        assert_eq!(app.rows.len(), 2);
+        assert_eq!(app.rows[0].name, "folder");
+        assert_eq!(app.rows[1].name, "small");
+        app.location = root.join("folder");
+        app.rebuild();
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.rows[0].name, "inside");
+        Ok(())
+    }
+
+    #[test]
     fn workspace_changes_and_new_jobs_preserve_an_active_removal_and_its_receipt() {
         let ctx = egui::Context::default();
         let (sender, result) = mpsc::channel();
@@ -2523,6 +2682,7 @@ mod tests {
                 before: Some(100),
                 after: Some(150),
                 held: 0,
+                history_error: None,
             }))
             .unwrap_or_else(|_| panic!("The original result receiver was dropped"));
         let Outcome::Removal(receipt) = job.result.try_recv().unwrap() else {
