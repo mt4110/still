@@ -1,5 +1,5 @@
 use super::super::{artifacts::Producer, history::Delta};
-use super::{bytes, display, egui, open_in_finder, App, Confirmation, Message, Outcome, Scan};
+use super::{bytes, display, egui, open_in_finder, App, Message, Outcome, Scan};
 use super::{text, ACCENT, LINE, MUTED};
 use egui::{Align, RichText, Stroke};
 use std::collections::{BTreeMap, BTreeSet};
@@ -242,10 +242,8 @@ fn candidate_inspector(
 impl Projects {
     pub(super) fn from_scan(scan: &Scan) -> Self {
         let mut projects: BTreeMap<_, _> = scan
-            .inventory
             .directories
-            .iter()
-            .filter(|r| r.path.parent() == Some(scan.root.as_path()))
+            .children(&scan.root)
             .map(|r| {
                 (
                     r.path.clone(),
@@ -253,7 +251,7 @@ impl Projects {
                         path: r.path.clone(),
                         size: r.usage.size(),
                         reclaim: 0,
-                        delta: scan.delta(r),
+                        delta: scan.delta(&r),
                         files: vec![],
                         reviewable_cargo_parts: BTreeMap::new(),
                     },
@@ -806,16 +804,7 @@ impl App {
         } else if review {
             let policy = scan.policy.clone();
             let paths = self.marked.iter().cloned().collect();
-            self.spawn(
-                ui.ctx(),
-                text(
-                    japanese,
-                    "内容を照合中… 大きなフォルダは時間がかかります",
-                    "Checking contents… Large folders may take time",
-                ),
-                false,
-                move || Outcome::Review(Confirmation::prepare(policy, paths)),
-            );
+            self.review_selected(ui.ctx(), policy, paths);
         }
     }
 
@@ -908,16 +897,7 @@ impl App {
         if review {
             let policy = scan.policy.clone();
             let paths = self.marked.iter().cloned().collect();
-            self.spawn(
-                ui.ctx(),
-                text(
-                    japanese,
-                    "選択した候補を照合中…",
-                    "Checking selected candidates…",
-                ),
-                false,
-                move || Outcome::Review(Confirmation::prepare(policy, paths)),
-            );
+            self.review_selected(ui.ctx(), policy, paths);
             return;
         }
         ui.add_space(18.);
@@ -1112,12 +1092,15 @@ mod tests {
         Scan {
             kept: Some(super::super::keep::KeepRules::default()),
             root: root.to_owned(),
-            inventory: Inventory {
-                directories: vec![row("a", 130), row("b", 120), row("b/other", 40)],
-                matches: vec![],
-                omitted_matches: 0,
-                cargo_marker_dirs: Default::default(),
-            },
+            directories: super::super::folder_index::Directories::from_inventory(
+                root,
+                Inventory {
+                    directories: vec![row("a", 130), row("b", 120), row("b/other", 40)],
+                    matches: vec![],
+                    omitted_matches: 0,
+                    cargo_marker_dirs: Default::default(),
+                },
+            ),
             policy: Arc::new(Policy {
                 roots: vec![],
                 outputs: vec![],

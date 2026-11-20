@@ -1,4 +1,5 @@
 mod controls;
+mod folder_index;
 mod help;
 #[cfg(target_os = "macos")]
 mod home;
@@ -6,10 +7,10 @@ mod icons;
 mod instance;
 #[cfg(target_os = "macos")]
 mod keep;
+mod library_ui;
 #[cfg(target_os = "macos")]
 mod monitor;
 mod old_files;
-mod library_ui;
 #[cfg(target_os = "macos")]
 mod projects;
 mod scan;
@@ -330,6 +331,7 @@ struct Job {
     label: &'static str,
     removing: bool,
     progress: Option<Arc<inventory::ScanProgress>>,
+    review_progress: Option<Arc<scan::ReviewProgress>>,
 }
 
 struct StaleFiles {
@@ -432,11 +434,38 @@ impl App {
             label,
             removing,
             progress: None,
+            review_progress: None,
         });
         std::thread::spawn(move || {
             let _ = tx.send(work());
             ctx.request_repaint();
         });
+    }
+
+    fn review_selected(
+        &mut self,
+        ctx: &egui::Context,
+        policy: Arc<super::artifacts::Policy>,
+        paths: Vec<PathBuf>,
+    ) {
+        if self.job.is_some() {
+            return;
+        }
+        let progress = Arc::new(scan::ReviewProgress::default());
+        let worker = Arc::clone(&progress);
+        self.spawn(
+            ctx,
+            text(
+                self.japanese_reasons,
+                "選択した候補を照合中…",
+                "Checking selected candidates…",
+            ),
+            false,
+            move || Outcome::Review(Confirmation::prepare_reporting(policy, paths, &worker)),
+        );
+        if let Some(job) = &mut self.job {
+            job.review_progress = Some(progress);
+        }
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
@@ -748,11 +777,9 @@ impl App {
         let Some(scan) = &self.scan else { return };
         let from_row = |row: &inventory::Row| {
             let delta = if self.view == View::Search && row.is_dir {
-                scan.inventory
-                    .directories
-                    .binary_search_by(|dir| dir.path.cmp(&row.path))
-                    .ok()
-                    .and_then(|i| scan.delta(&scan.inventory.directories[i]))
+                scan.directories
+                    .row(&row.path)
+                    .and_then(|snapshot| scan.delta(&snapshot))
             } else {
                 scan.delta(row)
             };
@@ -806,11 +833,9 @@ impl App {
         match self.view {
             View::Folders => {
                 self.rows.extend(
-                    scan.inventory
-                        .directories
-                        .iter()
-                        .filter(|row| row.path.parent() == Some(self.location.as_path()))
-                        .map(from_row),
+                    scan.directories
+                        .children(&self.location)
+                        .map(|row| from_row(&row)),
                 );
                 // The inventory keeps directory totals, not every individual file.
                 // List files only for the folder currently open to avoid retaining
@@ -1612,16 +1637,7 @@ impl App {
         if ui.add_enabled(!self.marked.is_empty(), review).clicked() {
             let paths = self.marked.iter().cloned().collect();
             let policy = self.scan.as_ref().unwrap().policy.clone();
-            self.spawn(
-                ctx,
-                text(
-                    self.japanese_reasons,
-                    "内容を再照合中… 大きなフォルダは時間がかかります",
-                    "Checking contents again… Large folders may take time",
-                ),
-                false,
-                move || Outcome::Review(Confirmation::prepare(policy, paths)),
-            );
+            self.review_selected(ctx, policy, paths);
         }
     }
 
@@ -2082,8 +2098,6 @@ impl App {
             }
         }
     }
-
-
 }
 
 fn size_basis(basis: &str, japanese: bool) -> &str {
@@ -2162,6 +2176,9 @@ impl eframe::App for App {
                             },
                         );
                     });
+                    if let Some(progress) = &job.review_progress {
+                        ui.small(progress.label(self.japanese_reasons));
+                    }
                     if let Some(progress) = progress {
                         ui.label(if self.japanese_reasons {
                             format!(
@@ -2280,7 +2297,7 @@ mod tests {
                 outputs: vec![],
                 docker_context: None,
             }),
-            inventory,
+            directories: folder_index::Directories::from_inventory(&root, inventory),
             previous: None,
             recorded: false,
             files: vec![],
@@ -2317,6 +2334,7 @@ mod tests {
                 label: "Removing confirmed output",
                 removing: true,
                 progress: None,
+                review_progress: None,
             }),
             query: "keep this search".into(),
             marked: BTreeSet::from([PathBuf::from("confirmed-output")]),

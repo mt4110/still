@@ -362,6 +362,9 @@ impl App {
                             },
                         );
                     });
+                    if let Some(progress) = &job.review_progress {
+                        ui.small(progress.label(self.japanese_reasons));
+                    }
                     if let Some(progress) = &job.progress {
                         let snapshot = progress.snapshot();
                         ui.small(if self.japanese_reasons {

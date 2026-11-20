@@ -10,11 +10,10 @@ pub(super) struct Panel {
 }
 
 fn locations(scan: &Scan) -> Vec<(PathBuf, PathBuf)> {
-    scan.inventory
-        .directories
+    scan.directories
+        .stage_paths
         .iter()
-        .filter_map(|row| {
-            let path = &row.path;
+        .filter_map(|path| {
             let name = path.file_name()?.to_str()?.strip_prefix(".still-stage-")?;
             let id = uuid::Uuid::parse_str(name).ok()?;
             if id.get_version_num() != 4 || id.to_string() != name {

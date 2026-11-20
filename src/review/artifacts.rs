@@ -247,12 +247,34 @@ impl Policy {
     }
 
     pub fn prepare(&self, path: &Path) -> Result<Prepared> {
+        self.prepare_reporting(path, |_| {})
+    }
+
+    pub(super) fn prepare_reporting(
+        &self,
+        path: &Path,
+        mut checked: impl FnMut(u64),
+    ) -> Result<Prepared> {
         let (path, producer) = self.review_path(path)?;
-        let tree = stamp_output(&path, producer)?;
+        let mut files = 0;
+        let mut logical_bytes = 0u64;
+        let tree = stamp_reporting(
+            &path,
+            producer,
+            |_, _, _| Ok(()),
+            |size| {
+                files += 1;
+                logical_bytes = logical_bytes.saturating_add(size);
+                checked(size);
+            },
+        )?;
         Ok(Prepared {
             path,
             producer,
             tree,
+            files,
+            #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+            logical_bytes,
         })
     }
 
@@ -417,7 +439,7 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
                 continue;
             };
             if held_incremental.contains(parent)
-                && cargo_cache::incremental_unit(&row.path).is_some()
+                && policy.producer(&row.path) == Some(Producer::CargoIncremental)
             {
                 files.push(inspect(row, Producer::CargoIncremental, Some(parent)));
             }
@@ -437,24 +459,19 @@ pub struct Prepared {
     pub path: PathBuf,
     pub producer: Producer,
     tree: Tree,
+    files: usize,
+    #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+    logical_bytes: u64,
 }
 
 impl Prepared {
     pub fn files(&self) -> usize {
-        self.tree
-            .entries
-            .values()
-            .filter(|stamp| !stamp.is_dir)
-            .count()
+        self.files
     }
 
     #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
     pub fn logical_bytes(&self) -> u64 {
-        self.tree
-            .entries
-            .values()
-            .filter(|stamp| !stamp.is_dir)
-            .fold(0, |bytes, stamp| bytes.saturating_add(stamp.len))
+        self.logical_bytes
     }
 }
 
@@ -478,7 +495,7 @@ pub struct Stamp {
 
 #[cfg(windows)]
 pub fn stamp_tree(path: &Path, reviewed: &Tree) -> Result<Tree> {
-    stamp_output(path, reviewed.producer)
+    stamp_with(path, reviewed.producer, |_, _, _| Ok(()))
 }
 
 fn verify_cargo_entry(
@@ -496,14 +513,20 @@ fn verify_cargo_entry(
     }
 }
 
-fn stamp_output(path: &Path, producer: Producer) -> Result<Tree> {
-    stamp_with(path, producer, |_, _, _| Ok(()))
-}
-
+#[cfg(any(windows, all(target_os = "macos", feature = "desktop")))]
 pub(super) fn stamp_with(
     path: &Path,
     producer: Producer,
+    inspect: impl FnMut(&Path, &Path, &fs::Metadata) -> Result<()>,
+) -> Result<Tree> {
+    stamp_reporting(path, producer, inspect, |_| {})
+}
+
+fn stamp_reporting(
+    path: &Path,
+    producer: Producer,
     mut inspect: impl FnMut(&Path, &Path, &fs::Metadata) -> Result<()>,
+    mut checked: impl FnMut(u64),
 ) -> Result<Tree> {
     let parent = path.parent().context("Cannot stage a filesystem root")?;
     let parent_identity = filesystem::identity(parent, &fs::symlink_metadata(parent)?)?;
@@ -525,6 +548,9 @@ pub(super) fn stamp_with(
             }
             if let Some(digest) = fixture {
                 fixture_digests.insert(relative.to_owned(), digest);
+            }
+            if !stamp.is_dir {
+                checked(stamp.len);
             }
             entries.insert(relative.to_owned(), stamp);
             Ok(())
@@ -1113,6 +1139,18 @@ mod tests {
             assert!(!eligible(path));
             assert!(policy.prepare(path).is_err());
         }
+        let declared = Policy {
+            roots: vec![root.clone()],
+            outputs: vec![completed.clone()],
+            docker_context: None,
+        };
+        let listed = file_candidates(&scan, &declared);
+        let matches: Vec<_> = listed
+            .iter()
+            .filter(|row| row.row.path == completed)
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].producer, Producer::DeclaredOutput);
         let reviewed = policy.prepare(&completed)?;
         fs::write(target.join(".keep"), b"keep all outputs")?;
         assert!(policy.remove(&reviewed).is_err());

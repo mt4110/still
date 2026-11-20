@@ -481,9 +481,8 @@ mod tests {
         };
         let scan = scan?;
         assert!(scan
-            .inventory
             .directories
-            .iter()
+            .children(&root)
             .any(|row| row.path == root.join("large-folder")));
         assert!(scan.files.is_empty());
         Ok(())
