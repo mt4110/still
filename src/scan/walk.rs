@@ -27,6 +27,34 @@ use crate::scan::classify::determine_entry_type;
 use crate::config::rules::{expand_path, Rule};
 use globset::{Glob, GlobSetBuilder};
 
+// Detect common DOS 8.3 spellings, including glob patterns that could match
+// them. This is deliberately conservative and is not a complete 8.3 detector.
+#[cfg(windows)]
+fn looks_like_short_name(value: &str) -> bool {
+    value.as_bytes().windows(2).any(|pair| {
+        pair[0] == b'~' && (pair[1].is_ascii_digit() || matches!(pair[1], b'[' | b'?' | b'*'))
+    })
+}
+
+#[cfg(windows)]
+fn reject_ambiguous_short_names(base: &Path, rules: &[Rule]) -> Result<(), AppError> {
+    let root_has_short_name = looks_like_short_name(&base.to_string_lossy());
+    let rule_has_short_name = rules.iter().any(|rule| {
+        rule.scopes.iter().any(|scope| {
+            expand_path(scope).is_ok_and(|path| looks_like_short_name(&path.to_string_lossy()))
+        }) || rule
+            .includes
+            .iter()
+            .chain(rule.excludes.iter())
+            .flatten()
+            .any(|pattern| looks_like_short_name(pattern))
+    });
+    if root_has_short_name || rule_has_short_name {
+        return Err(AppError::Scan("A scan path, rule scope, or glob resembles a Windows 8.3 short name. Use the long spelling so exclusions can be checked safely.".into()));
+    }
+    Ok(())
+}
+
 /// Compare scopes lexically. On Windows, a canonicalized local path may have a
 /// verbatim drive prefix while the same path from current_dir does not. Only
 /// bridge those spellings when every component has ordinary Win32 semantics;
@@ -134,6 +162,8 @@ impl Scanner {
     }
 
     pub fn scan(&self) -> Result<Vec<Entry>, AppError> {
+        #[cfg(windows)]
+        reject_ambiguous_short_names(&self.base_path, &self.rules)?;
         if !self.base_path.exists() {
             return Ok(vec![]);
         }

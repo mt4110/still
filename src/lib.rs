@@ -27,6 +27,71 @@ pub fn launch_desktop(profile: Option<String>) -> Result<()> {
     }
 }
 
+fn scan_roots_to_plan(
+    paths: Vec<std::path::PathBuf>,
+    rules: &[config::rules::Rule],
+    started: std::time::SystemTime,
+    output: &std::path::Path,
+    json: bool,
+) -> Result<()> {
+    let mut entries = Vec::new();
+    for path in paths {
+        let exists = path.exists();
+        if !exists {
+            println!("Skipping non-existent path: {:?}", path);
+        } else {
+            println!("Scanning: {:?}", path);
+        }
+        let scanner = scan::walk::Scanner::new(path, rules.to_vec());
+        // Never save a successful partial plan when a scanner returns an error.
+        entries.append(&mut scanner.scan()?);
+    }
+    println!("Found {} entries", entries.len());
+    let plan = plan::Plan {
+        schema_version: "2.0".to_string(),
+        generated_by: "still".to_string(),
+        created_at: started,
+        entries,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    }
+    plan::io::save_plan(&plan, output)?;
+    println!("Plan saved to {:?}", output);
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod scan_safety_tests {
+    use super::*;
+
+    #[test]
+    fn later_root_failure_does_not_overwrite_existing_plan() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let root = fixture.path().canonicalize()?;
+        let first = root.join("first");
+        let second = root.join("ambiguous~1");
+        std::fs::create_dir(&first)?;
+        std::fs::create_dir(&second)?;
+        std::fs::write(first.join("found.dat"), b"fixture")?;
+        let scanner = scan::walk::Scanner::new(first.clone(), vec![]);
+        assert_eq!(scanner.scan()?.len(), 1, "first root must be scannable");
+        let output = root.join("plan.json");
+        std::fs::write(&output, b"original plan")?;
+        let error = scan_roots_to_plan(
+            vec![first, second],
+            &[],
+            std::time::SystemTime::now(),
+            &output,
+            true,
+        )
+        .expect_err("a later ambiguous root must stop plan creation");
+        assert!(error.to_string().contains("8.3 short name"));
+        assert_eq!(std::fs::read(&output)?, b"original plan");
+        Ok(())
+    }
+}
+
 pub fn run_cli() -> Result<()> {
     let cli = Cli::parse();
 
@@ -133,8 +198,6 @@ pub fn run_cli() -> Result<()> {
                 }
             };
 
-            let mut all_entries = Vec::new();
-
             // Load rules
             // Load rules
             let rules_path = if let Some(path) = &args.rules {
@@ -175,34 +238,7 @@ pub fn run_cli() -> Result<()> {
                 vec![]
             };
 
-            for path in target_paths {
-                if !path.exists() {
-                    println!("Skipping non-existent path: {:?}", path);
-                    continue;
-                }
-                println!("Scanning: {:?}", path);
-                let scanner = scan::walk::Scanner::new(path, rules.clone());
-                match scanner.scan() {
-                    Ok(mut entries) => all_entries.append(&mut entries),
-                    Err(e) => eprintln!("Error scanning: {}", e),
-                }
-            }
-
-            println!("Found {} entries", all_entries.len());
-
-            let plan = plan::Plan {
-                schema_version: "2.0".to_string(),
-                generated_by: "still".to_string(),
-                created_at: start,
-                entries: all_entries,
-            };
-
-            if args.json {
-                println!("{}", serde_json::to_string_pretty(&plan)?);
-            }
-
-            plan::io::save_plan(&plan, &args.out)?;
-            println!("Plan saved to {:?}", args.out);
+            scan_roots_to_plan(target_paths, &rules, start, &args.out, args.json)?;
         }
         Some(Commands::Review(args)) => review::run(args)?,
         Some(Commands::Gui(args)) => launch_desktop(args.profile.clone())?,

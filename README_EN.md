@@ -133,6 +133,8 @@ still scan
 still scan --list-scopes
 ```
 
+On Windows, scans stop when a root, rule scope, or glob resembles a known 8.3 short-name spelling such as `RUNNER~1`, because exclusions may otherwise be ambiguous. Specify long names. This check may also reject ordinary names or globs with the same form and does not guarantee detection of every 8.3 spelling. It does not resolve case differences, other aliases, or junctions.
+
 ### 2. Review (TUI)
 Open the generated plan in the TUI to decide actions for each item. Recommendations are informational; every item initially remains set to Keep.
 

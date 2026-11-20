@@ -72,8 +72,15 @@ fn glob_matches_equivalent_drive_paths_without_expanding_unsafe_paths() {
 fn canonical_scope_applies_recommendation_and_excludes_to_ordinary_scan() -> anyhow::Result<()> {
     use crate::scan::walk::Scanner;
     let temp = tempfile::tempdir()?;
-    let ordinary_root = temp.path().to_path_buf();
-    let canonical_root = ordinary_root.canonicalize()?;
+    let canonical_root = temp.path().canonicalize()?;
+    // Change only the prefix: temp_dir itself can contain RUNNER~1 on CI.
+    let ordinary_root = PathBuf::from(
+        canonical_root
+            .to_str()
+            .unwrap()
+            .strip_prefix(r"\\?\")
+            .unwrap(),
+    );
     std::fs::write(ordinary_root.join("candidate.txt"), b"candidate")?;
     std::fs::create_dir(ordinary_root.join("skip"))?;
     std::fs::write(ordinary_root.join("skip").join("secret.txt"), b"secret")?;
@@ -118,6 +125,34 @@ fn canonical_scope_applies_recommendation_and_excludes_to_ordinary_scan() -> any
     assert_eq!(candidate.selected_action, ActionType::Keep);
     assert!(!entries.iter().any(|entry| entry.path.ends_with("skip")));
     Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn scanner_rejects_known_short_names_in_root_scopes_and_globs() {
+    use crate::scan::walk::Scanner;
+    let ordinary = PathBuf::from(r"C:\normal\workspace");
+    let short = PathBuf::from(r"C:\Users\RUNNER~1\workspace");
+    let message = |result: Result<Vec<crate::plan::Entry>, crate::error::AppError>| {
+        let error = result.expect_err("short spelling must be rejected");
+        assert!(error.to_string().contains("8.3 short name"));
+    };
+    message(Scanner::new(short, vec![]).scan());
+    message(
+        Scanner::new(
+            ordinary.clone(),
+            vec![make_rule("short", r"C:\RUNNER~1", None, None)],
+        )
+        .scan(),
+    );
+    for pattern in [r"C:\RUNNER~1\private*", r"**\RUNNER~[1-9]\**"] {
+        let mut rule = make_rule("glob", r"C:\normal", None, None);
+        rule.excludes = Some(vec![pattern.to_owned()]);
+        message(Scanner::new(ordinary.clone(), vec![rule]).scan());
+        let mut rule = make_rule("include", r"C:\normal", None, None);
+        rule.includes = Some(vec![pattern.to_owned()]);
+        message(Scanner::new(ordinary.clone(), vec![rule]).scan());
+    }
 }
 
 // Helper to create a basic rule

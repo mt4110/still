@@ -15,6 +15,15 @@ fn run_still(args: &[&str], cwd: Option<&std::path::Path>) -> std::process::Outp
 
 #[test]
 fn test_workflow_scan_plan_apply_dryrun() {
+    // Use a long-spelled temp directory on Windows; the runner's TEMP may be
+    // an 8.3 alias, which is intentionally rejected for rule-based scanning.
+    #[cfg(windows)]
+    let temp = {
+        let canonical = std::env::temp_dir().canonicalize().unwrap();
+        let long = canonical.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+        tempfile::tempdir_in(long).unwrap()
+    };
+    #[cfg(not(windows))]
     let temp = TempDir::new().unwrap();
     let root = temp.path().canonicalize().unwrap();
     let root = root.as_path(); // Keep it as Path
@@ -128,6 +137,41 @@ recommended_action = "Trash"
         target_file.exists(),
         "Target file should still exist after dry run"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn scan_rejects_ambiguous_short_name_without_overwriting_plan() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().canonicalize().unwrap();
+    let ambiguous = root.join("fixture~1");
+    fs::create_dir(&ambiguous).unwrap();
+    fs::write(ambiguous.join("candidate.dat"), vec![0u8; 200]).unwrap();
+    let rules = root.join("rules.toml");
+    fs::write(
+        &rules,
+        format!(
+            "[[rules]]\nname = \"fixture\"\nscopes = [{:?}]\nmin_size_bytes = 1\nrecommended_action = \"Trash\"\n",
+            root.to_str().unwrap()
+        ),
+    ).unwrap();
+    let plan = root.join("existing-plan.json");
+    fs::write(&plan, b"existing plan must remain").unwrap();
+    let output = run_still(
+        &[
+            "scan",
+            "--scope",
+            "custom",
+            "--rules",
+            rules.to_str().unwrap(),
+            "--out",
+            plan.to_str().unwrap(),
+        ],
+        Some(&ambiguous),
+    );
+    assert!(!output.status.success(), "ambiguous scan should fail");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("8.3 short name"));
+    assert_eq!(fs::read(plan).unwrap(), b"existing plan must remain");
 }
 
 #[test]
