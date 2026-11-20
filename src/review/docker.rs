@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Datelike, TimeDelta, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -73,7 +73,6 @@ const CONTAINER_TEMPLATE: &str = r#"{"Id":{{json .Id}},"Image":{{json .Image}},"
 struct Cache {
     #[serde(rename = "ID")]
     id: String,
-    last_used_at: Option<String>,
     reclaimable: bool,
     shared: bool,
     mutable: bool,
@@ -81,6 +80,19 @@ struct Cache {
     #[serde(rename = "Type")]
     kind: String,
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct EngineCache {
+    #[serde(rename = "ID")]
+    id: String,
+    last_used_at: String,
+    in_use: String,
+    shared: String,
+    cache_type: String,
+}
+
+const ENGINE_CACHE_TEMPLATE: &str = r#"{{range .BuildCache}}{"ID":{{json .ID}},"LastUsedAt":{{json .LastUsedAt}},"InUse":{{json .InUse}},"Shared":{{json .Shared}},"CacheType":{{json .CacheType}}}{{println}}{{end}}"#;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -621,29 +633,54 @@ fn cache_candidates(
     buildx: &tempfile::TempDir,
     cutoff: DateTime<Utc>,
 ) -> Result<Vec<Candidate>> {
+    let engine = engine_cache_records(daemon)?;
     Ok(cache_records(daemon, buildx)?
         .into_iter()
         .filter_map(|cache| {
-            let last_used = cache.last_used_at?;
+            let engine = engine.get(&cache.id)?;
+            let last_used = &engine.last_used_at;
             if cache.reclaimable
                 && !cache.shared
                 && !cache.mutable
                 && cache.kind == "regular"
-                && older(&last_used, cutoff)
+                && engine.in_use == "false"
+                && engine.shared == "false"
+                && engine.cache_type == "regular"
+                && older(last_used, cutoff)
                 && cache_id(&cache.id)
             {
                 Some(Candidate::new(
                     Kind::Cache,
                     cache.id,
-                    cache.size.parse().ok(),
+                    cache_size(&cache.size),
                     "Old, private, immutable BuildKit cache; Docker storage estimate",
-                    vec![last_used],
+                    vec![last_used.clone()],
                 ))
             } else {
                 None
             }
         })
         .collect())
+}
+
+fn engine_cache_records(daemon: &Daemon) -> Result<HashMap<String, EngineCache>> {
+    let raw = execute(
+        command_on(&daemon.endpoint).args([
+            "system",
+            "df",
+            "--verbose",
+            "--format",
+            ENGINE_CACHE_TEMPLATE,
+        ]),
+        "cache metadata",
+    )?;
+    let mut result = HashMap::new();
+    for cache in json_lines::<EngineCache>(&raw)? {
+        if !cache_id(&cache.id) || result.insert(cache.id.clone(), cache).is_some() {
+            bail!("Docker returned an invalid or duplicate cache ID");
+        }
+    }
+    Ok(result)
 }
 
 fn cache_records(daemon: &Daemon, buildx: &tempfile::TempDir) -> Result<Vec<Cache>> {
@@ -655,7 +692,27 @@ fn cache_records(daemon: &Daemon, buildx: &tempfile::TempDir) -> Result<Vec<Cach
 }
 
 fn older(time: &str, cutoff: DateTime<Utc>) -> bool {
-    DateTime::parse_from_rfc3339(time).is_ok_and(|t| t.year_ce().1 > 1 && t < cutoff)
+    DateTime::parse_from_rfc3339(time)
+        .or_else(|_| DateTime::parse_from_str(time, "%Y-%m-%d %H:%M:%S%.f %z %Z"))
+        .is_ok_and(|t| t.year_ce().1 > 1 && t < cutoff)
+}
+
+fn cache_size(value: &str) -> Option<u64> {
+    if let Ok(bytes) = value.parse() {
+        return Some(bytes);
+    }
+    let split = value.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let number: f64 = value[..split].parse().ok()?;
+    let scale = match value[split..].trim() {
+        "B" => 1.0,
+        "kB" | "KB" => 1_000.0,
+        "MB" => 1_000_000.0,
+        "GB" => 1_000_000_000.0,
+        "TB" => 1_000_000_000_000.0,
+        _ => return None,
+    };
+    let bytes = number * scale;
+    (bytes.is_finite() && bytes >= 0.0 && bytes < u64::MAX as f64).then_some(bytes as u64)
 }
 
 fn hex_id(id: &str) -> bool {
@@ -691,6 +748,28 @@ fn remove(
         }
         Kind::Cache => {
             let buildx = buildx.context("Buildx must be explicitly enabled")?;
+            // Confirm this Buildx version accepts the exact selector combination
+            // before issuing a destructive command. Some versions return no
+            // matches for boolean selectors even when metadata says eligible.
+            let id_filter = format!("id~=^{id}$");
+            let age_filter = format!("until={}h", u64::from(days) * 24);
+            let filters = [
+                &id_filter[..],
+                &age_filter[..],
+                "inuse=false",
+                "mutable=false",
+                "shared=false",
+                "type=regular",
+            ];
+            let mut check = buildx_command(daemon, buildx);
+            check.args(["du", "--builder", "default", "--format", "json"]);
+            for filter in filters {
+                check.args(["--filter", filter]);
+            }
+            let matching = json_lines::<Cache>(&execute(&mut check, "Buildx filter check")?)?;
+            if matching.len() != 1 || matching[0].id != *id {
+                bail!("Buildx could not confirm that the exact cache and safety filters match. No removal was attempted.");
+            }
             execute(
                 buildx_command(daemon, buildx).args([
                     "prune",
@@ -698,9 +777,9 @@ fn remove(
                     "default",
                     "--force",
                     "--filter",
-                    &format!("id~=^{id}$"),
+                    &id_filter,
                     "--filter",
-                    &format!("until={}h", u64::from(days) * 24),
+                    &age_filter,
                     "--filter",
                     "inuse=false",
                     "--filter",
@@ -748,9 +827,28 @@ fn buildx_command(daemon: &Daemon, state: &tempfile::TempDir) -> Command {
 fn execute(command: &mut Command, operation: &str) -> Result<Vec<u8>> {
     let output = command.output().context("Could not run the Docker CLI")?;
     if !output.status.success() {
-        bail!("Docker {operation} failed ({})", output.status);
+        let detail = docker_error_detail(&output.stderr);
+        if detail.is_empty() {
+            bail!("Docker {operation} failed ({})", output.status);
+        }
+        bail!("Docker {operation} failed ({}): {detail}", output.status);
     }
     Ok(output.stdout)
+}
+
+fn docker_error_detail(stderr: &[u8]) -> String {
+    const LIMIT: usize = 1024;
+    let text = String::from_utf8_lossy(stderr);
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    let mut detail: String = trimmed.chars().take(LIMIT).collect();
+    if trimmed.chars().count() > LIMIT {
+        detail.push('…');
+    }
+    detail
 }
 
 fn json_lines<T: DeserializeOwned>(bytes: &[u8]) -> Result<Vec<T>> {
@@ -763,7 +861,32 @@ fn json_lines<T: DeserializeOwned>(bytes: &[u8]) -> Result<Vec<T>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Candidate, Kind, ReviewCandidate};
+    use super::{cache_size, docker_error_detail, older, Candidate, Kind, ReviewCandidate};
+
+    #[test]
+    fn cache_metadata_accepts_absolute_times_and_approximate_sizes() {
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-11-19T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        assert!(older("2026-02-12 10:59:42.845633065 +0000 UTC", cutoff));
+        assert!(!older("9 months ago", cutoff));
+        assert!(!older("2026-11-20T00:00:00Z", cutoff));
+        assert_eq!(cache_size("136MB"), Some(136_000_000));
+        assert_eq!(cache_size("829889526"), Some(829_889_526));
+        assert_eq!(cache_size("unknown"), None);
+    }
+
+    #[test]
+    fn docker_error_detail_is_readable_and_bounded() {
+        assert_eq!(
+            docker_error_detail(b"  daemon unavailable\n"),
+            "daemon unavailable"
+        );
+        assert_eq!(docker_error_detail(b"\n"), "");
+        let detail = docker_error_detail("あ".repeat(1025).as_bytes());
+        assert_eq!(detail.chars().count(), 1025);
+        assert!(detail.ends_with('…'));
+    }
 
     #[test]
     fn review_never_treats_shared_image_size_as_reclaimable() {

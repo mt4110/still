@@ -5,6 +5,22 @@ All notable changes to the `still` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Optionally inventory immediate folders in five macOS Library locations for read-only review. Ownership and data purpose remain unverified; results may overlap known locations.
+- Show project `node_modules` as protected, review-only storage, and exclude nested package outputs from automatic cleanup candidates.
+- Record desktop-generated-output cleanup results locally and expose them through `still cleanup-history`.
+- Add read-only home, system-volume and selected-folder scans, with size-ordered folder navigation in the Mac app.
+- Add a Mac Docker screen action to review and prune unused default-builder cache after a user-selected retention period.
+
+### Changed
+
+- Compare regular-file contents as well as metadata during output review on Unix. This reads selected files and can make review slower; it does not guarantee detection of every concurrent change.
+- Include bounded Docker CLI error details when an inspection fails.
+- Match Buildx cache records against Engine metadata when Buildx returns human-readable dates, and verify filter behavior before attempting an exact cache removal.
+
 ## [0.2.0-beta.1] - 2026-11-16
 
 ### Added

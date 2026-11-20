@@ -24,6 +24,7 @@ enum Action {
     None,
     Scan,
     Review,
+    ReviewCache,
 }
 
 fn activity(item: &storage::Resource) -> Option<DateTime<Utc>> {
@@ -67,8 +68,8 @@ fn reason(kind: storage::Kind, item: &storage::Resource, japanese: bool) -> &str
         ),
         storage::Kind::Cache => text(
             japanese,
-            "この一覧では容量確認のみです。削除条件は CLI で確認できます。",
-            "Storage inspection only here. Review removal conditions in the CLI.",
+            "容量を確認できます。上の操作では条件に合う未使用キャッシュをまとめて整理します。",
+            "Review usage here. The action above prunes unused cache matching the retention period.",
         ),
     }
 }
@@ -136,6 +137,26 @@ fn selection_size(
 }
 
 impl Panel {
+    pub(in crate::review::desktop) fn set_cache_review(
+        &mut self,
+        result: Result<storage::CacheCleanup>,
+    ) {
+        match result {
+            Ok(review) => {
+                self.cache_review = Some(review);
+                self.docker_error.clear();
+            }
+            Err(error) => self.docker_error = format!("Cache review unavailable: {error:#}"),
+        }
+    }
+
+    pub(in crate::review::desktop) fn set_cache_receipt(
+        &mut self,
+        receipt: storage::CacheCleanupResult,
+    ) {
+        self.cache_receipt = Some(receipt);
+        self.refresh_pending = true;
+    }
     pub(in crate::review::desktop) fn set_review(&mut self, result: Result<storage::Review>) {
         match result {
             Ok(review) => { self.review = Some(review); self.docker_error.clear(); }
@@ -152,7 +173,10 @@ impl Panel {
     }
 
     fn docker_view(&mut self, ui: &mut egui::Ui, japanese: bool, global_busy: bool) -> Action {
-        let busy = global_busy || self.docker_job.is_some() || self.review.is_some();
+        let busy = global_busy
+            || self.docker_job.is_some()
+            || self.review.is_some()
+            || self.cache_review.is_some();
         let mut action = Action::None;
         ui.horizontal(|ui| {
             ui.heading("Docker");
@@ -166,8 +190,8 @@ impl Panel {
         ui.label(
             RichText::new(text(
                 japanese,
-                "容量と直近の起動・停止を確認し、選んだコンテナだけを整理します。",
-                "Review storage and the last start/stop times, then clean up selected containers.",
+                "容量を確認し、コンテナや未使用ビルドキャッシュを整理します。",
+                "Review storage and clean up containers or unused build cache.",
             ))
             .color(MUTED),
         );
@@ -197,7 +221,51 @@ impl Panel {
             self.marked.clear();
             self.selected = None;
             self.receipt = None;
+            self.cache_receipt = None;
             self.docker_error.clear();
+        }
+        if let Some(receipt) = &self.cache_receipt {
+            ui.group(|ui| {
+                ui.strong(text(
+                    japanese,
+                    "ビルドキャッシュ整理の結果",
+                    "Build cache cleanup result",
+                ));
+                ui.label(format!(
+                    "{} · {} {}",
+                    receipt.context,
+                    receipt.days,
+                    text(japanese, "日以上", "days or older")
+                ));
+                match &receipt.result {
+                    Ok(output) => {
+                        ui.label(text(
+                            japanese,
+                            "Docker の処理が完了しました。",
+                            "Docker cleanup completed.",
+                        ));
+                        ui.label(output);
+                    }
+                    Err(error) => {
+                        ui.label(format!(
+                            "{} · {error:#}",
+                            text(
+                                japanese,
+                                "完了を確認できません。一部削除された可能性があります",
+                                "Completion was not confirmed; some cache may have been removed"
+                            )
+                        ));
+                    }
+                }
+                if let (Some(before), Some(after)) = (receipt.before, receipt.after) {
+                    ui.label(format!(
+                        "{} {}{}",
+                        text(japanese, "Mac の空き容量変化", "Mac free-space change"),
+                        if after >= before { "+" } else { "−" },
+                        bytes(after.abs_diff(before))
+                    ));
+                }
+            });
         }
         if let Some(receipt) = &self.receipt {
             show_receipt(
@@ -283,6 +351,30 @@ impl Panel {
         });
         let (kind, items) = &report.groups[self.kind];
         let container = *kind == storage::Kind::Container;
+        if *kind == storage::Kind::Cache {
+            if self.cache_days == 0 {
+                self.cache_days = 7;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(text(japanese, "未使用期間", "Unused for"));
+                ui.add_enabled(
+                    !busy,
+                    egui::DragValue::new(&mut self.cache_days).range(1..=3650),
+                );
+                ui.label(text(japanese, "日以上", "days or more"));
+                if controls::button(
+                    ui,
+                    text(japanese, "未使用キャッシュを確認…", "Review unused cache…"),
+                    true,
+                    !busy,
+                )
+                .clicked()
+                {
+                    action = Action::ReviewCache;
+                }
+            });
+            ui.small(text(japanese, "Docker の接続先にある該当キャッシュをまとめて整理します。正確な対象と回収量は事前に確定できません。", "Docker selects matching cache on this connection. Exact items and reclaimed space cannot be determined in advance."));
+        }
         let previous = (self.query.clone(), self.filter, self.sort, self.age_days);
         ui.add_enabled_ui(!busy, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -412,7 +504,8 @@ impl Panel {
             }
         });
         ui.add_space(8.0);
-        egui::Panel::bottom("docker-selection-footer").resizable(false).show_separator_line(false)
+        if container {
+            egui::Panel::bottom("docker-selection-footer").resizable(false).show_separator_line(false)
             .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0,12))).show_inside(ui, |ui| {
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -423,6 +516,7 @@ impl Panel {
                 });
                 ui.small(text(japanese,"Mac の空き容量とは異なる見込みです。実行前に対象を再確認します。","Estimates differ from Mac free space. Selected resources are verified again before removal."));
             });
+        }
         let wide = ui.available_width() >= 900.0;
         let focused = self
             .selected
@@ -584,6 +678,9 @@ fn rows(
                 );
                 row.set_clip_rect(row.clip_rect().intersect(rect));
                 controls::cell(&mut row, widths[0], 36.0, Align::Min, |ui| {
+                    if kind != storage::Kind::Container {
+                        return;
+                    }
                     let mut checked = marked.contains(&item.id);
                     let checkbox = ui.add_enabled(
                         enabled && kind == storage::Kind::Container && item.eligible,
@@ -876,11 +973,68 @@ impl App {
                     );
                 }
             }
+            Action::ReviewCache if self.job.is_none() => {
+                if let Some(Ok(report)) = &self.monitor.docker {
+                    let context = report.context.clone();
+                    let days = self.monitor.cache_days;
+                    self.spawn(
+                        &ctx,
+                        text(
+                            self.japanese_reasons,
+                            "Docker の接続先を確認中…",
+                            "Checking Docker connection…",
+                        ),
+                        false,
+                        move || {
+                            Outcome::DockerCacheReview(storage::CacheCleanup::prepare(
+                                &context, days,
+                            ))
+                        },
+                    );
+                }
+            }
             _ => {}
         }
     }
 
     pub(in crate::review::desktop) fn docker_confirmation(&mut self, ctx: &egui::Context) {
+        if let Some(review) = &self.monitor.cache_review {
+            let japanese = self.japanese_reasons;
+            let mut cancel = false;
+            let mut remove = false;
+            let dialog = egui::Modal::new(egui::Id::new("docker-cache-confirmation")).frame(modal_frame(ctx)).show(ctx, |ui| {
+                ui.set_width(520.0);
+                ui.heading(text(japanese, "ビルドキャッシュを整理しますか？", "Clean up build cache?"));
+                ui.strong(format!("{}: {}", text(japanese, "接続先", "Context"), review.context));
+                ui.label(if japanese { format!("この Docker の既定ビルダーで、{} 日以上未使用のキャッシュを Docker の基準でまとめて削除します。", review.days) } else { format!("Docker will prune unused cache older than {} days from this daemon's default builder.", review.days) });
+                ui.label(text(japanese, "対象の全件や回収量は事前に確定できません。次のビルドは遅くなり、キャッシュマウント内のデータが失われる場合があります。ゴミ箱には入りません。", "Exact records and reclaimed space are unknown in advance. Later builds may be slower and cache-mount data may be lost. This bypasses Trash."));
+                ui.horizontal(|ui| {
+                    cancel = controls::button(ui, text(japanese, "キャンセル", "Cancel"), false, self.job.is_none()).clicked();
+                    remove = controls::destructive_button(ui, text(japanese, "確認して整理", "Confirm cleanup"), self.job.is_none()).clicked();
+                });
+            });
+            if cancel || dialog.should_close() {
+                self.monitor.cache_review = None;
+            } else if remove && self.job.is_none() {
+                let review = self
+                    .monitor
+                    .cache_review
+                    .take()
+                    .expect("cache review exists");
+                self.monitor.cache_receipt = None;
+                self.spawn(
+                    ctx,
+                    text(
+                        japanese,
+                        "ビルドキャッシュを整理中…",
+                        "Cleaning build cache…",
+                    ),
+                    true,
+                    move || Outcome::DockerCacheRemoval(review.apply()),
+                );
+            }
+            return;
+        }
         let Some(review) = &self.monitor.review else {
             return;
         };

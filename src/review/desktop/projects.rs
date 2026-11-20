@@ -728,8 +728,8 @@ impl App {
                 ui.ctx(),
                 text(
                     japanese,
-                    "選択した候補を確認中…",
-                    "Checking selected candidates…",
+                    "内容を照合中… 大きなフォルダは時間がかかります",
+                    "Checking contents… Large folders may take time",
                 ),
                 false,
                 move || Outcome::Review(Confirmation::prepare(policy, paths)),

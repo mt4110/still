@@ -82,6 +82,10 @@ scripts/notarize-macos-app.sh target/still-signed.app still-notary target/still-
 
 On macOS, **App storage…** measures known Android NDK, Unity, Unreal, browser cache, Slack and Teams log, and Notion data locations under your home folder. It reads metadata without opening logs or databases. The optional Xcode checkbox queries its simulator runtime inventory. Use `still app-storage` or `still app-storage --xcode-runtimes` in the terminal. The view is read-only. Workspace review also identifies protected game assets, autosaves, engine files, and caches.
 
+The optional Library inventory, also available as `still app-storage --library`, measures immediate folders in Caches, Logs, Application Support, Containers, and Group Containers. It does not establish their ownership or purpose, and it does not follow links. Entries may overlap known locations, so their sizes must not be added together.
+
+Workspace review shows `node_modules` next to a `package.json` as protected, review-only storage. When an output is selected for removal, still reads regular-file contents to compare them again; contents are not stored or transmitted. Reviewing large outputs can take time, and the checks cannot guarantee detection of every concurrent change.
+
 On the Mac, select **App storage… → Review Xcode & NDK versions…** to see each SDK version’s size and the reason it is available for review or protected. Review and confirm individual versions to uninstall them with their management tools. still checks the selected versions again before uninstalling and reports the actual change in free space on the Mac data volume.
 
 After an Xcode uninstall, still also checks the usable runtime inventory and disk images for the selected build. When evidence remains, it shows **Partially remaining** and reports observed image usage separately from the measured change in volume free space.

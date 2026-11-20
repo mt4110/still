@@ -99,7 +99,7 @@ impl Usage {
         self.skipped += other.skipped;
     }
 
-    fn file(metadata: &Metadata) -> Self {
+    pub(super) fn file(metadata: &Metadata) -> Self {
         Self {
             logical_bytes: metadata.len(),
             allocated_bytes: allocated_bytes(metadata),

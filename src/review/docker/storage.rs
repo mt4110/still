@@ -61,6 +61,77 @@ pub(crate) struct Report {
     snapshots: std::collections::BTreeMap<String, actions::Metadata>,
 }
 
+pub(crate) struct CacheCleanup {
+    pub context: String,
+    pub days: u16,
+    endpoint: String,
+    pin: actions::Pin,
+}
+
+pub(crate) struct CacheCleanupResult {
+    pub context: String,
+    pub days: u16,
+    pub result: Result<String>,
+    pub before: Option<u64>,
+    pub after: Option<u64>,
+}
+
+impl CacheCleanup {
+    pub fn prepare(context: &str, days: u16) -> Result<Self> {
+        anyhow::ensure!(
+            (1..=3650).contains(&days),
+            "Choose a retention period between 1 and 3650 days"
+        );
+        let daemon = super::connect(context)?;
+        let pin = actions::capture(&daemon.endpoint)?;
+        Ok(Self {
+            context: context.to_owned(),
+            days,
+            endpoint: daemon.endpoint,
+            pin,
+        })
+    }
+
+    pub fn apply(self) -> CacheCleanupResult {
+        let free = || {
+            directories::BaseDirs::new()
+                .and_then(|d| crate::review::filesystem::available(d.home_dir()))
+        };
+        let before = free();
+        let result = checked_cache_cleanup(
+            || {
+                let current = super::connect(&self.context)?;
+                anyhow::ensure!(
+                    current.endpoint == self.endpoint
+                        && actions::capture(&self.endpoint)? == self.pin,
+                    "Docker context or daemon changed after confirmation"
+                );
+                Ok(())
+            },
+            || {
+                let filter = format!("until={}h", u64::from(self.days) * 24);
+                command_output(command_on(&self.endpoint).args(["builder", "prune", "--force", "--filter", &filter]), Duration::from_secs(300))
+                    .context("Docker cache cleanup did not complete; some records may already have been removed")
+            },
+        );
+        CacheCleanupResult {
+            context: self.context,
+            days: self.days,
+            result,
+            before,
+            after: free(),
+        }
+    }
+}
+
+fn checked_cache_cleanup(
+    verify: impl FnOnce() -> Result<()>,
+    run: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    verify()?;
+    run()
+}
+
 // Project only storage metadata. Container commands, environment variables,
 // credentials, log contents and application data are outside this view.
 const FORMAT: &str = r#"{
@@ -187,6 +258,20 @@ pub(crate) fn size_bytes(size: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_cleanup_never_runs_if_connection_verification_fails() {
+        let called = std::cell::Cell::new(false);
+        let result = checked_cache_cleanup(
+            || anyhow::bail!("daemon changed"),
+            || {
+                called.set(true);
+                Ok(String::new())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!called.get());
+    }
 
     #[test]
     fn storage_inventory_preserves_referenced_data_and_orders_display_sizes() -> Result<()> {

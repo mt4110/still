@@ -1,4 +1,6 @@
-use super::super::{artifacts, bytes, candidates, history, inventory, resolve, Profile, Scope};
+use super::super::{
+    artifacts, bytes, candidates, cleanup_history, history, inventory, resolve, Profile, Scope,
+};
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,13 +26,35 @@ impl Scan {
         profile_name: Option<&str>,
         baseline: Option<Baseline>,
         record: bool,
+        read_only: bool,
         progress: &inventory::ScanProgress,
     ) -> Result<Self> {
         let Scope {
             roots,
             policy,
             sources,
-        } = resolve(profile, true)?;
+        } = if read_only {
+            Scope {
+                roots: profile
+                    .roots
+                    .iter()
+                    .map(|p| inventory::safe_dir(p))
+                    .collect::<Result<_>>()?,
+                policy: artifacts::Policy {
+                    roots: vec![],
+                    outputs: vec![],
+                    docker_context: None,
+                },
+                sources: candidates::Sources {
+                    git_repos: vec![],
+                    git_base: None,
+                    docker_cache: false,
+                    kube: None,
+                },
+            }
+        } else {
+            resolve(profile, true)?
+        };
         let root = roots
             .get(index)
             .context("Workspace is no longer available")?
@@ -92,6 +116,7 @@ pub(super) struct CleanupReceipt {
     pub before: Option<u64>,
     pub after: Option<u64>,
     pub held: usize,
+    pub history_error: Option<String>,
 }
 
 pub(super) struct Confirmation {
@@ -125,6 +150,7 @@ impl Confirmation {
     }
 
     pub fn remove(self, root: &Path) -> CleanupReceipt {
+        let started_at = chrono::Utc::now();
         let before = super::super::filesystem::available(root);
         let outcomes = run_in_pairs(&self.items, |item| {
             let result = self
@@ -138,11 +164,55 @@ impl Confirmation {
             .iter()
             .filter(|(_, result)| result.is_err())
             .count();
+        let items = self
+            .items
+            .iter()
+            .zip(&outcomes)
+            .map(|(item, (_, result))| {
+                let original_path_exists = match std::fs::symlink_metadata(&item.path) {
+                    Ok(_) => Some(true),
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(false),
+                    Err(_) => None,
+                };
+                cleanup_history::Item {
+                    path: item.path.clone(),
+                    producer: item.producer.reason().to_owned(),
+                    logical_bytes: item.logical_bytes(),
+                    status: if result.is_ok() {
+                        "removed"
+                    } else {
+                        "incomplete"
+                    }
+                    .into(),
+                    reason: result.as_ref().err().map(ToString::to_string),
+                    original_path_exists,
+                }
+            })
+            .collect();
+        let record = cleanup_history::Record {
+            version: 1,
+            root: root.to_owned(),
+            started_at,
+            completed_at: chrono::Utc::now(),
+            available_before: before,
+            available_after: after,
+            items,
+        };
+        #[cfg(not(test))]
+        let history_error = cleanup_history::save(&record)
+            .err()
+            .map(|error| format!("{error:#}"));
+        #[cfg(test)]
+        let history_error = {
+            let _ = record;
+            None
+        };
         CleanupReceipt {
             outcomes,
             before,
             after,
             held,
+            history_error,
         }
     }
 }

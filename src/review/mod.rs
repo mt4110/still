@@ -1,6 +1,7 @@
 pub mod app_storage;
 mod artifacts;
 mod candidates;
+pub mod cleanup_history;
 #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
 pub mod desktop;
 pub mod docker;

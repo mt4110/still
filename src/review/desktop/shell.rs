@@ -386,6 +386,16 @@ impl App {
                 .show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     ui.strong(text(self.japanese_reasons, "掃除の結果", "Cleanup result"));
+                    if let Some(error) = &receipt.history_error {
+                        ui.label(format!(
+                            "{} · {error}",
+                            text(
+                                self.japanese_reasons,
+                                "操作履歴を保存できませんでした",
+                                "Could not save cleanup history"
+                            )
+                        ));
+                    }
                     ui.label(RichText::new(&actual).size(26.0).strong().color(ACCENT));
                     ui.small(text(
                         self.japanese_reasons,
@@ -394,13 +404,13 @@ impl App {
                     ));
                     ui.label(if self.japanese_reasons {
                         format!(
-                            "削除 {} 件 · 保留 {} 件",
+                            "削除 {} 件 · 未完了 {} 件",
                             receipt.outcomes.len() - receipt.held,
                             receipt.held
                         )
                     } else {
                         format!(
-                            "{} deleted · {} held",
+                            "{} deleted · {} incomplete",
                             receipt.outcomes.len() - receipt.held,
                             receipt.held
                         )
