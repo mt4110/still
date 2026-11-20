@@ -25,9 +25,12 @@ fn stamp(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(in crate::review) enum Scope {
-    SystemApplications,
-    UserApplications,
-    BothApplications,
+    #[serde(rename = "system_applications")]
+    System,
+    #[serde(rename = "user_applications")]
+    User,
+    #[serde(rename = "both_applications")]
+    Both,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -199,17 +202,26 @@ impl Records {
 mod tests {
     use super::*;
     #[test]
+    fn existing_scope_names_remain_compatible() -> Result<()> {
+        for (json, scope) in [
+            ("\"system_applications\"", Scope::System),
+            ("\"user_applications\"", Scope::User),
+            ("\"both_applications\"", Scope::Both),
+        ] {
+            assert_eq!(serde_json::from_str::<Scope>(json)?, scope);
+            assert_eq!(serde_json::to_string(&scope)?, json);
+        }
+        Ok(())
+    }
+    #[test]
     fn explicit_scopes_confirm_reconfirm_and_revoke_without_other_ids_changing() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("confirmations.json");
-        let first = Records::update(&path, "com.example.one", Some(Scope::SystemApplications))?;
+        let first = Records::update(&path, "com.example.one", Some(Scope::System))?;
         assert!(first.get("com.example.one").unwrap().confirmed());
-        Records::update(&path, "com.example.two", Some(Scope::UserApplications))?;
-        let revised = Records::update(&path, "com.example.one", Some(Scope::BothApplications))?;
-        assert_eq!(
-            revised.get("com.example.one").unwrap().scope,
-            Scope::BothApplications
-        );
+        Records::update(&path, "com.example.two", Some(Scope::User))?;
+        let revised = Records::update(&path, "com.example.one", Some(Scope::Both))?;
+        assert_eq!(revised.get("com.example.one").unwrap().scope, Scope::Both);
         let revoked = Records::update(&path, "com.example.one", None)?;
         assert!(!revoked.get("com.example.one").unwrap().confirmed());
         assert!(revoked.get("com.example.two").unwrap().confirmed());
@@ -217,7 +229,7 @@ mod tests {
             .get("com.example.one")
             .unwrap()
             .confirmed());
-        assert!(Records::update(&path, "../bad", Some(Scope::BothApplications)).is_err());
+        assert!(Records::update(&path, "../bad", Some(Scope::Both)).is_err());
         assert!(Records::update(&path, "com.example.missing", None).is_err());
         Ok(())
     }
@@ -226,23 +238,19 @@ mod tests {
     fn busy_or_invalid_records_never_overwrite_existing_data() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("confirmations.json");
-        Records::update(&path, "com.example.one", Some(Scope::BothApplications))?;
+        Records::update(&path, "com.example.one", Some(Scope::Both))?;
         let original = fs::read(&path)?;
         let lock = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(dir.path().join("user-uninstall-confirmations.lock"))?;
         lock.try_lock()?;
-        assert!(
-            Records::update(&path, "com.example.two", Some(Scope::SystemApplications)).is_err()
-        );
+        assert!(Records::update(&path, "com.example.two", Some(Scope::System)).is_err());
         assert_eq!(fs::read(&path)?, original);
         drop(lock);
         let broken = dir.path().join("broken.json");
         fs::write(&broken, b"not-json")?;
-        assert!(
-            Records::update(&broken, "com.example.two", Some(Scope::UserApplications)).is_err()
-        );
+        assert!(Records::update(&broken, "com.example.two", Some(Scope::User)).is_err());
         assert_eq!(fs::read(&broken)?, b"not-json");
         Ok(())
     }
@@ -276,7 +284,7 @@ mod tests {
         let path = dir.path().join("confirmations.json");
         let record = Record {
             state: State::Confirmed,
-            scope: Scope::BothApplications,
+            scope: Scope::Both,
             confirmed_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -301,7 +309,7 @@ mod tests {
         fs::write(&path, &original)?;
         let oversized_id = format!("com.example.{}", "y".repeat(243));
         assert!(valid_id(&oversized_id));
-        let error = Records::update(&path, &oversized_id, Some(Scope::SystemApplications))
+        let error = Records::update(&path, &oversized_id, Some(Scope::System))
             .err()
             .context("expected size rejection")?;
         assert!(format!("{error:#}").contains("exceed"));

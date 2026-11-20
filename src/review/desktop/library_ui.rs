@@ -280,9 +280,9 @@ mod mac {
 
     fn scope_text(scope: Scope, ja: bool) -> &'static str {
         match scope {
-            Scope::SystemApplications => text(ja, "/Applications のみ", "/Applications only"),
-            Scope::UserApplications => text(ja, "~/Applications のみ", "~/Applications only"),
-            Scope::BothApplications => text(
+            Scope::System => text(ja, "/Applications のみ", "/Applications only"),
+            Scope::User => text(ja, "~/Applications のみ", "~/Applications only"),
+            Scope::Both => text(
                 ja,
                 "/Applications と ~/Applications",
                 "/Applications and ~/Applications",
@@ -567,7 +567,7 @@ mod mac {
                 ui.small(text(ja, "この確認記録からOS登録の有無は分かりません。", "This confirmation does not establish OS registration status."));
                 if draft.registered { ui.label(text(ja, "注意: 今回の調査では、このIDの登録済みアプリも観測しています。", "Note: this scan also observed a registered app with this ID.")); }
                 ui.label(text(ja, "確認した場所を選んでください。ほかの場所は確認範囲に含みません。", "Choose the locations you checked; other locations are outside this record."));
-                for scope in [Scope::SystemApplications, Scope::UserApplications, Scope::BothApplications] {
+                for scope in [Scope::System, Scope::User, Scope::Both] {
                     ui.radio_value(&mut draft.scope, Some(scope), scope_text(scope, ja));
                 }
                 ui.checkbox(&mut draft.acknowledged, text(ja, "このIDのアプリを自分でアンインストールし、選んだ場所を確認しました。", "I uninstalled the app with this ID and checked the selected locations."));
