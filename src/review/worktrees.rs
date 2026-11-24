@@ -778,6 +778,10 @@ mod desktop_tests {
         let home = directories::BaseDirs::new().context("Home unavailable")?;
         let fixture = tempfile::tempdir_in(home.home_dir())?;
         let root = fixture.path().canonicalize()?;
+        let global_config = root.join("fixture.gitconfig");
+        fs::File::create(&global_config)?;
+        git::TEST_GLOBAL_CONFIG
+            .with(|config| config.set(global_config).expect("fresh fixture thread"));
         let repo = root.join("repo");
         fs::create_dir(&repo)?;
         let git = |args: &[&str]| git::check(git::run(&repo, args)?, "worktree test");
