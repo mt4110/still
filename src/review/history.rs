@@ -1,4 +1,4 @@
-use super::{bytes, inventory, profile};
+use super::{bytes, filesystem::FileLock, inventory, profile};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -298,7 +298,7 @@ impl History {
             .create(true)
             .truncate(false)
             .open(path.with_extension("lock"))?;
-        lock.try_lock()
+        let _lock = FileLock::try_acquire(lock)
             .context("Another still session is saving this scan history")?;
         if let Some(current) = read::<HeaderOnly>(&path)? {
             current.header.verify(root)?;

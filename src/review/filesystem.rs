@@ -8,6 +8,28 @@ use anyhow::{bail, Context, Result};
 use std::fs::Metadata;
 use std::path::Path;
 
+// Release explicitly so a child process forked by another thread cannot
+// keep a short-lived lock held until that child finishes exec.
+pub(super) struct FileLock(std::fs::File);
+
+impl FileLock {
+    pub(super) fn try_acquire(file: std::fs::File) -> Result<Self, std::fs::TryLockError> {
+        file.try_lock()?;
+        Ok(Self(file))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn file_mut(&mut self) -> &mut std::fs::File {
+        &mut self.0
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Identity {
     pub device: u64,
