@@ -88,6 +88,7 @@ impl App {
             return;
         }
         self.scan = None;
+        self.browse_root = None;
         self.projects = Default::default();
         self.baseline = Default::default();
         self.matches = Vec::new();
@@ -273,6 +274,7 @@ impl App {
                             ),
                             |ui| {
                                 if self.scan.is_some()
+                                    && self.browse_root.is_none()
                                     && ui
                                         .button(text(
                                             self.japanese_reasons,
@@ -286,6 +288,7 @@ impl App {
                                     ui.close();
                                 }
                                 if self.scan.is_some()
+                                    && self.browse_root.is_none()
                                     && ui
                                         .button(text(
                                             self.japanese_reasons,
@@ -326,7 +329,10 @@ impl App {
                 }
             });
         });
-        if self.screen == Screen::Workspace && self.profile.roots.len() > 1 {
+        if self.screen == Screen::Workspace
+            && self.browse_root.is_none()
+            && self.profile.roots.len() > 1
+        {
             ui.add_enabled_ui(self.job.is_none(), |ui| {
                 let mut index = self.index;
                 egui::ComboBox::from_id_salt("workspace")
@@ -466,7 +472,14 @@ impl App {
                         "ボリューム空き容量の実測変化",
                         "Measured change in volume free space",
                     ));
-                    ui.label(if self.japanese_reasons {
+                    ui.label(if receipt.to_trash {
+                        let count = receipt.outcomes.len() - receipt.held;
+                        if self.japanese_reasons {
+                            format!("ゴミ箱へ移動 {count} 件 · 未完了 {} 件", receipt.held)
+                        } else {
+                            format!("{count} moved to Trash · {} incomplete", receipt.held)
+                        }
+                    } else if self.japanese_reasons {
                         format!(
                             "削除 {} 件 · 未完了 {} 件",
                             receipt.outcomes.len() - receipt.held,

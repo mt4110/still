@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+pub(super) mod live;
+
 #[derive(Default)]
 pub struct ScanProgress {
     files: AtomicU64,
@@ -83,6 +86,8 @@ pub struct Usage {
     pub largest_file_bytes: u64,
     pub files: u64,
     pub skipped: u64,
+    pub modified_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub files_modified_last_7_days: u64,
 }
 
 impl Usage {
@@ -97,6 +102,9 @@ impl Usage {
         self.largest_file_bytes = self.largest_file_bytes.max(other.largest_file_bytes);
         self.files += other.files;
         self.skipped += other.skipped;
+        self.files_modified_last_7_days = self
+            .files_modified_last_7_days
+            .saturating_add(other.files_modified_last_7_days);
     }
 
     pub(super) fn file(metadata: &Metadata) -> Self {
@@ -106,6 +114,8 @@ impl Usage {
             largest_file_bytes: metadata.len(),
             files: 1,
             skipped: 0,
+            modified_at: metadata.modified().ok().map(Into::into),
+            files_modified_last_7_days: 0,
         }
     }
 
@@ -133,13 +143,9 @@ pub struct Inventory {
 
 #[derive(Default)]
 struct Batch {
-    directories: HashMap<PathBuf, Usage>,
+    raw: RawDirectories,
     matches: Vec<Row>,
     match_count: usize,
-    skipped: u64,
-    cargo_marker_dirs: HashSet<PathBuf>,
-    #[cfg(unix)]
-    hardlinks: HashMap<(u64, u64), (PathBuf, u64)>,
 }
 
 const MATCH_LIMIT: usize = 1000;
@@ -154,7 +160,27 @@ pub fn scan_with_progress(
     query: Option<&str>,
     progress: Option<&ScanProgress>,
 ) -> Result<Inventory> {
+    scan_impl(root, threads, query, progress, false).map(|(inventory, _)| inventory)
+}
+
+#[derive(Clone, Default)]
+struct RawDirectories {
+    directories: HashMap<PathBuf, Usage>,
+    cargo_marker_dirs: HashSet<PathBuf>,
+    skipped: u64,
+    #[cfg(unix)]
+    hardlinks: Vec<((u64, u64), PathBuf, u64)>,
+}
+
+fn scan_impl(
+    root: &Path,
+    threads: u16,
+    query: Option<&str>,
+    progress: Option<&ScanProgress>,
+    retain_directories: bool,
+) -> Result<(Inventory, Option<RawDirectories>)> {
     let root_metadata = fs::symlink_metadata(root)?;
+
     if !root_metadata.is_dir() || is_link(&root_metadata) {
         bail!("Scan root must be a directory: {root:?}");
     }
@@ -167,7 +193,15 @@ pub fn scan_with_progress(
     }
 
     let mut merged = Batch::default();
-    merged.directories.insert(root.to_owned(), Usage::default());
+    merged.raw.directories.insert(
+        root.to_owned(),
+        Usage {
+            modified_at: root_metadata.modified().ok().map(Into::into),
+            ..Usage::default()
+        },
+    );
+    let scan_started = chrono::Utc::now();
+    let recent_cutoff = scan_started - chrono::TimeDelta::days(7);
     let result = Mutex::new(merged);
     let query = query.filter(|q| !q.is_empty()).map(str::to_lowercase);
     let mut walker = WalkBuilder::new(root);
@@ -183,6 +217,8 @@ pub fn scan_with_progress(
             batch: Batch::default(),
             progress,
             pending_progress: ProgressBatch::default(),
+            scan_started,
+            recent_cutoff,
         };
         let query = query.as_deref();
         let root_metadata = &root_metadata;
@@ -190,33 +226,12 @@ pub fn scan_with_progress(
     });
 
     let Batch {
-        mut directories,
+        raw,
         mut matches,
         match_count,
-        skipped,
-        cargo_marker_dirs,
-        #[cfg(unix)]
-        hardlinks,
     } = result.into_inner().expect("walker results");
-    directories.entry(root.to_owned()).or_default().skipped += skipped;
-    #[cfg(unix)]
-    for (path, blocks) in hardlinks.into_values() {
-        if let Some(parent) = path.parent() {
-            let usage = directories.entry(parent.to_owned()).or_default();
-            usage.allocated_bytes = Some(usage.allocated_bytes.unwrap_or(0).saturating_add(blocks));
-        }
-    }
-
-    let mut directories: Vec<_> = directories
-        .into_iter()
-        .map(|(path, usage)| Row {
-            path,
-            is_dir: true,
-            usage,
-        })
-        .collect();
-    directories.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-    accumulate_directories(&mut directories);
+    let retained = retain_directories.then(|| raw.clone());
+    let (directories, cargo_marker_dirs) = raw.aggregate(root);
     let mut directory_matches = 0;
     if let Some(query) = query.as_deref() {
         for directory in &directories {
@@ -238,7 +253,45 @@ pub fn scan_with_progress(
     if let Some(progress) = progress {
         progress.inventory_done.store(true, Ordering::Release);
     }
-    Ok(inventory)
+    Ok((inventory, retained))
+}
+
+impl RawDirectories {
+    fn aggregate(self, root: &Path) -> (Vec<Row>, HashSet<PathBuf>) {
+        let Self {
+            mut directories,
+            cargo_marker_dirs,
+            skipped,
+            #[cfg(unix)]
+            hardlinks,
+        } = self;
+        directories.entry(root.to_owned()).or_default().skipped += skipped;
+        #[cfg(unix)]
+        {
+            let mut unique = HashMap::new();
+            for (inode, path, blocks) in hardlinks {
+                remember_hardlink(&mut unique, inode, path, blocks);
+            }
+            for (path, blocks) in unique.into_values() {
+                if let Some(parent) = path.parent() {
+                    let usage = directories.entry(parent.to_owned()).or_default();
+                    usage.allocated_bytes =
+                        Some(usage.allocated_bytes.unwrap_or(0).saturating_add(blocks));
+                }
+            }
+        }
+        let mut directories: Vec<_> = directories
+            .into_iter()
+            .map(|(path, usage)| Row {
+                path,
+                is_dir: true,
+                usage,
+            })
+            .collect();
+        directories.sort_unstable_by(|a, b| a.path.cmp(&b.path));
+        accumulate_directories(&mut directories);
+        (directories, cargo_marker_dirs)
+    }
 }
 
 struct Worker<'a> {
@@ -246,6 +299,8 @@ struct Worker<'a> {
     batch: Batch,
     progress: Option<&'a ScanProgress>,
     pending_progress: ProgressBatch,
+    scan_started: chrono::DateTime<chrono::Utc>,
+    recent_cutoff: chrono::DateTime<chrono::Utc>,
 }
 
 impl Worker<'_> {
@@ -257,7 +312,7 @@ impl Worker<'_> {
         query: Option<&str>,
     ) -> WalkState {
         let Ok(entry) = entry else {
-            self.batch.skipped += 1;
+            self.batch.raw.skipped += 1;
             return WalkState::Continue;
         };
         let path = entry.path();
@@ -266,47 +321,45 @@ impl Worker<'_> {
         }
 
         let parent = path.parent().expect("walker child has a parent");
-        let usage = self.batch.directories.entry(parent.to_owned()).or_default();
         let Ok(metadata) = fs::symlink_metadata(path) else {
-            usage.skipped += 1;
+            self.batch
+                .raw
+                .directories
+                .entry(parent.to_owned())
+                .or_default()
+                .skipped += 1;
             return WalkState::Skip;
         };
         if is_link(&metadata) || !same_device(root_metadata, &metadata) {
-            usage.skipped += 1;
+            self.batch
+                .raw
+                .directories
+                .entry(parent.to_owned())
+                .or_default()
+                .skipped += 1;
             return WalkState::Skip;
         } else if metadata.is_dir() {
-            self.batch.directories.entry(path.to_owned()).or_default();
+            self.batch
+                .raw
+                .directories
+                .entry(path.to_owned())
+                .or_default()
+                .modified_at = metadata.modified().ok().map(Into::into);
             self.pending_progress.directories += 1;
         } else if metadata.is_file() {
-            if matches!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some(".rustc_info.json" | "CACHEDIR.TAG")
-            ) {
-                self.batch.cargo_marker_dirs.insert(parent.to_owned());
-            }
-            let stats = Usage::file(&metadata);
+            let stats = record_file(
+                &mut self.batch.raw,
+                path,
+                parent,
+                &metadata,
+                self.recent_cutoff,
+                self.scan_started,
+            );
             self.pending_progress.files += 1;
             self.pending_progress.logical_bytes = self
                 .pending_progress
                 .logical_bytes
                 .saturating_add(metadata.len());
-            let counted = stats.clone();
-            #[cfg(unix)]
-            let counted = {
-                use std::os::unix::fs::MetadataExt;
-                let mut counted = counted;
-                if metadata.nlink() > 1 {
-                    let blocks = counted.allocated_bytes.replace(0).unwrap_or(0);
-                    remember_hardlink(
-                        &mut self.batch.hardlinks,
-                        (metadata.dev(), metadata.ino()),
-                        path.to_owned(),
-                        blocks,
-                    );
-                }
-                counted
-            };
-            usage.add(&counted);
             if query.is_some_and(|q| matches_query(path, q)) {
                 self.batch.match_count += 1;
                 self.batch.matches.push(Row {
@@ -317,7 +370,12 @@ impl Worker<'_> {
                 trim_matches(&mut self.batch.matches);
             }
         } else {
-            usage.skipped += 1;
+            self.batch
+                .raw
+                .directories
+                .entry(parent.to_owned())
+                .or_default()
+                .skipped += 1;
         }
         if self.pending_progress.files + self.pending_progress.directories >= 128 {
             self.pending_progress.publish(
@@ -329,28 +387,73 @@ impl Worker<'_> {
     }
 }
 
+fn record_file(
+    raw: &mut RawDirectories,
+    path: &Path,
+    parent: &Path,
+    metadata: &Metadata,
+    recent_cutoff: chrono::DateTime<chrono::Utc>,
+    scan_started: chrono::DateTime<chrono::Utc>,
+) -> Usage {
+    if matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".rustc_info.json" | "CACHEDIR.TAG")
+    ) {
+        raw.cargo_marker_dirs.insert(parent.to_owned());
+    }
+    let mut stats = Usage::file(metadata);
+    stats.files_modified_last_7_days = u64::from(
+        stats
+            .modified_at
+            .is_some_and(|time| time >= recent_cutoff && time <= scan_started),
+    );
+    let counted = stats.clone();
+    #[cfg(unix)]
+    let counted = {
+        use std::os::unix::fs::MetadataExt;
+        let mut counted = counted;
+        if metadata.nlink() > 1 {
+            let blocks = counted.allocated_bytes.replace(0).unwrap_or(0);
+            raw.hardlinks
+                .push(((metadata.dev(), metadata.ino()), path.to_owned(), blocks));
+        }
+        counted
+    };
+    raw.directories
+        .entry(parent.to_owned())
+        .or_default()
+        .add(&counted);
+    stats
+}
+
 impl Drop for Worker<'_> {
     fn drop(&mut self) {
         self.pending_progress.publish(self.progress, None);
         let mut results = self.results.lock().expect("walker results");
         // Reuse the larger hash table rather than allocating another table of
         // comparable size while the worker-owned one is still resident.
-        if self.batch.directories.len() > results.directories.len() {
-            std::mem::swap(&mut self.batch.directories, &mut results.directories);
+        if self.batch.raw.directories.len() > results.raw.directories.len() {
+            std::mem::swap(
+                &mut self.batch.raw.directories,
+                &mut results.raw.directories,
+            );
         }
-        for (path, usage) in self.batch.directories.drain() {
-            results.directories.entry(path).or_default().add(&usage);
+        for (path, usage) in self.batch.raw.directories.drain() {
+            let merged = results.raw.directories.entry(path).or_default();
+            // The worker visiting the directory owns its timestamp; another worker
+            // may have accumulated child sizes without inspecting the directory itself.
+            merged.modified_at = merged.modified_at.or(usage.modified_at);
+            merged.add(&usage);
         }
         results.match_count += self.batch.match_count;
-        results.skipped += self.batch.skipped;
+        results.raw.skipped += self.batch.raw.skipped;
         results
+            .raw
             .cargo_marker_dirs
-            .extend(self.batch.cargo_marker_dirs.drain());
+            .extend(self.batch.raw.cargo_marker_dirs.drain());
         results.matches.append(&mut self.batch.matches);
         #[cfg(unix)]
-        for (identity, (path, blocks)) in self.batch.hardlinks.drain() {
-            remember_hardlink(&mut results.hardlinks, identity, path, blocks);
-        }
+        results.raw.hardlinks.append(&mut self.batch.raw.hardlinks);
         trim_matches(&mut results.matches);
     }
 }
@@ -608,5 +711,44 @@ fn scan_progress_finishes_with_the_inventory_counts() -> Result<()> {
         (empty.files, empty.directories, empty.logical_bytes),
         (0, 1, 0)
     );
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn scan_keeps_item_dates_separate_from_the_recent_file_count() -> Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    let folder = root.join("dated-folder");
+    fs::create_dir(&folder)?;
+    let recent = folder.join("dated-recent.txt");
+    let old = folder.join("dated-old.txt");
+    fs::write(&recent, b"recent")?;
+    fs::write(&old, b"old")?;
+    fs::File::options()
+        .write(true)
+        .open(&old)?
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(9 * 86_400))?;
+    let modified = |path: &Path| -> Result<chrono::DateTime<chrono::Utc>> {
+        Ok(fs::metadata(path)?.modified()?.into())
+    };
+    let inventory = scan(&root, 4, Some("dated"))?;
+    for path in [&folder, &recent, &old] {
+        let row = inventory
+            .matches
+            .iter()
+            .find(|row| &row.path == path)
+            .unwrap();
+        assert_eq!(row.usage.modified_at, Some(modified(path)?));
+    }
+    for path in [&root, &folder] {
+        let row = inventory
+            .directories
+            .iter()
+            .find(|row| &row.path == path)
+            .unwrap();
+        assert_eq!(row.usage.modified_at, Some(modified(path)?));
+        assert_eq!(row.usage.files_modified_last_7_days, 1);
+    }
     Ok(())
 }

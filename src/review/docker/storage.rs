@@ -31,6 +31,10 @@ pub(crate) struct Resource {
     pub mounts: String,
     pub last_used: String,
     pub operation: String,
+    #[serde(rename = "CreatedAt", deserialize_with = "image_creation_time")]
+    pub image_created: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    pub image_last_start: Option<DateTime<Utc>>,
     #[serde(skip)]
     pub created: Option<DateTime<Utc>>,
     #[serde(skip)]
@@ -64,116 +68,13 @@ pub(crate) struct Report {
     snapshots: std::collections::BTreeMap<String, actions::Metadata>,
 }
 
-pub(crate) struct CacheCleanup {
-    pub context: String,
-    pub days: u16,
-    endpoint: String,
-    pin: actions::Pin,
-}
-
-pub(crate) struct CacheCleanupResult {
-    pub context: String,
-    pub days: u16,
-    pub result: Result<String>,
-    pub before: Option<u64>,
-    pub after: Option<u64>,
-    pub history_error: Option<String>,
-}
-
-impl CacheCleanup {
-    pub fn prepare(context: &str, days: u16) -> Result<Self> {
-        anyhow::ensure!(
-            (1..=3650).contains(&days),
-            "Choose a retention period between 1 and 3650 days"
-        );
-        let daemon = super::connect(context)?;
-        let pin = actions::capture(&daemon.endpoint)?;
-        Ok(Self {
-            context: context.to_owned(),
-            days,
-            endpoint: daemon.endpoint,
-            pin,
-        })
-    }
-
-    pub fn apply(self) -> CacheCleanupResult {
-        let started = Utc::now();
-        let free = || {
-            directories::BaseDirs::new()
-                .and_then(|d| crate::review::filesystem::available(d.home_dir()))
-        };
-        let before = free();
-        let result = checked_cache_cleanup(
-            || {
-                let current = super::connect(&self.context)?;
-                anyhow::ensure!(
-                    current.endpoint == self.endpoint
-                        && actions::capture(&self.endpoint)? == self.pin,
-                    "Docker context or daemon changed after confirmation"
-                );
-                Ok(())
-            },
-            || {
-                command_output(&mut cache_prune_command(&self.endpoint, self.days), Duration::from_secs(300))
-                    .context("Docker cache cleanup did not complete; some records may already have been removed")
-            },
-        );
-        let receipt = CacheCleanupResult {
-            context: self.context,
-            days: self.days,
-            result,
-            before,
-            after: free(),
-            history_error: None,
-        };
-        #[cfg(not(test))]
-        let mut receipt = receipt;
-        #[cfg(not(test))]
-        {
-            let target = super::super::cleanup_history::OperationTarget {
-                identifier: "default builder cache".into(),
-                status: if receipt.result.is_ok() { "completed" } else { "unverified" }.into(),
-                reason: receipt.result.as_ref().err().map(|_| "Cleanup did not complete or could not be verified; details were not retained".into()),
-                remaining_image_bytes: None,
-            };
-            receipt.history_error = super::super::cleanup_history::save_operation(
-                started,
-                receipt.before,
-                receipt.after,
-                super::super::cleanup_history::Operation {
-                    kind: "docker_builder_cache_cleanup".into(),
-                    retention_days: Some(receipt.days),
-                    targets: vec![target],
-                },
-            )
-            .err()
-            .map(|error| format!("{error:#}"));
-        }
-        #[cfg(test)]
-        let _ = started;
-        receipt
-    }
-}
-
-fn cache_prune_command(endpoint: &str, days: u16) -> std::process::Command {
-    let filter = format!("until={}h", u64::from(days) * 24);
-    let mut command = command_on(endpoint);
-    command.args(["builder", "prune", "--all", "--force", "--filter", &filter]);
-    command
-}
-
-fn checked_cache_cleanup(
-    verify: impl FnOnce() -> Result<()>,
-    run: impl FnOnce() -> Result<String>,
-) -> Result<String> {
-    verify()?;
-    run()
-}
+mod cache_cleanup;
+pub(crate) use cache_cleanup::{CacheCleanup, CacheCleanupResult};
 
 // Project only storage metadata. Container commands, environment variables,
 // credentials, log contents and application data are outside this view.
 const FORMAT: &str = r#"{
-"Images":[{{range $i,$v := .Images}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json (printf "%s:%s" $v.Repository $v.Tag)}},"Size":{{json $v.Size}},"Status":{{json $v.Containers}},"SharedSize":{{json $v.SharedSize}},"UniqueSize":{{json $v.UniqueSize}}}{{end}}],
+"Images":[{{range $i,$v := .Images}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json (printf "%s:%s" $v.Repository $v.Tag)}},"Size":{{json $v.Size}},"Status":{{json $v.Containers}},"CreatedAt":{{json $v.CreatedAt}},"SharedSize":{{json $v.SharedSize}},"UniqueSize":{{json $v.UniqueSize}}}{{end}}],
 "Containers":[{{range $i,$v := .Containers}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json $v.Names}},"Size":{{json $v.Size}},"Status":{{json $v.State}},"Detail":{{json $v.Image}},"Mounts":{{json $v.Mounts}}}{{end}}],
 "Volumes":[{{range $i,$v := .Volumes}}{{if $i}},{{end}}{"ID":{{json $v.Name}},"Name":{{json $v.Name}},"Size":{{json $v.Size}},"Status":{{json $v.Links}},"Detail":{{json $v.Driver}}}{{end}}],
 "BuildCache":[{{range $i,$v := .BuildCache}}{{if $i}},{{end}}{"ID":{{json $v.ID}},"Name":{{json $v.CacheType}},"LastUsed":{{json $v.LastUsedSince}},"Operation":{{ $op := index (split $v.Description " ") 0 }}{{if eq $op "pulled"}}"pull"{{else if eq $op "RUN"}}"run"{{else if eq $op "COPY"}}"copy"{{else if eq $op "ADD"}}"add"{{else}}""{{end}},"Size":{{json $v.Size}},"Status":{{json $v.InUse}},"Detail":{{json $v.Shared}}}{{end}}]
@@ -300,6 +201,14 @@ fn parse(context: String, json: &str) -> Result<Report> {
     })
 }
 
+fn image_creation_time<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<DateTime<Utc>>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?
+        .as_deref()
+        .and_then(super::cache_timestamp))
+}
+
 fn unavailable() -> Message {
     Message::new(
         "Complete container metadata could not be verified",
@@ -320,6 +229,8 @@ impl Default for Resource {
             mounts: String::new(),
             last_used: String::new(),
             operation: String::new(),
+            image_created: None,
+            image_last_start: None,
             created: None,
             started: None,
             finished: None,
@@ -359,38 +270,6 @@ mod tests {
         assert_eq!(parse_contexts(output)?, ["colima", "default"]);
         assert!(parse_contexts("broken").is_err());
         Ok(())
-    }
-
-    #[test]
-    fn cache_cleanup_includes_all_unused_cache_with_the_selected_age() {
-        let command = cache_prune_command("unix:///tmp/docker.sock", 7);
-        let args: Vec<_> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert!(args.windows(6).any(|args| args
-            == [
-                "builder",
-                "prune",
-                "--all",
-                "--force",
-                "--filter",
-                "until=168h"
-            ]));
-    }
-
-    #[test]
-    fn cache_cleanup_never_runs_if_connection_verification_fails() {
-        let called = std::cell::Cell::new(false);
-        let result = checked_cache_cleanup(
-            || anyhow::bail!("daemon changed"),
-            || {
-                called.set(true);
-                Ok(String::new())
-            },
-        );
-        assert!(result.is_err());
-        assert!(!called.get());
     }
 
     #[test]

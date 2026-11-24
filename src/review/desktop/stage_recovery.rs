@@ -61,6 +61,8 @@ impl App {
     pub(super) fn stage_dialog(&mut self, ctx: &egui::Context) {
         let ja = self.japanese_reasons;
         if let Some(paths) = &self.stages.locations {
+            let mut check_path = None;
+            let mut finder_error = None;
             let mut selected = None;
             let mut close = false;
             let modal = egui::Modal::new("stage-list".into()).show(ctx, |ui| {
@@ -83,7 +85,41 @@ impl App {
                         .show(ui, |ui| {
                             for (root, path) in paths {
                                 ui.vertical(|ui| {
-                                    ui.add(egui::Label::new(display(path)).wrap());
+                                    let time = std::fs::symlink_metadata(path)
+                                        .ok()
+                                        .and_then(|m| m.modified().ok())
+                                        .map(Into::into);
+                                    let caption = format!(
+                                        "{} · {}",
+                                        display(path),
+                                        super::modified_caption(time, ja)
+                                    );
+                                    let item = ui.add(
+                                        egui::Label::new(caption)
+                                            .wrap()
+                                            .sense(egui::Sense::click()),
+                                    );
+                                    if let Some(action) = super::item_menu::show(
+                                        &item,
+                                        ja,
+                                        true,
+                                        true,
+                                        self.job.is_some(),
+                                    ) {
+                                        match action {
+                                            super::item_menu::Action::Finder => {
+                                                finder_error = super::item_menu::reveal(path)
+                                                    .err()
+                                                    .map(|error| super::display_error(&error, ja));
+                                            }
+                                            super::item_menu::Action::Check => {
+                                                check_path = Some(path.clone())
+                                            }
+                                            super::item_menu::Action::Remove => {
+                                                selected = Some((root.clone(), path.clone(), false))
+                                            }
+                                        }
+                                    }
                                     ui.horizontal_wrapped(|ui| {
                                         if ui.button(text(ja, "後片付け", "Clean up")).clicked()
                                         {
@@ -103,8 +139,14 @@ impl App {
                 }
                 close = ui.button(text(ja, "閉じる", "Close")).clicked();
             });
-            if close || modal.should_close() || selected.is_some() {
+            if close || modal.should_close() || selected.is_some() || check_path.is_some() {
                 self.stages.locations = None;
+            }
+            if let Some(error) = finder_error {
+                self.status = error;
+            }
+            if let Some(path) = check_path {
+                self.inspect_path_status(ctx, path, String::new());
             }
             if let Some((root, path, restore)) = selected {
                 self.spawn(
@@ -130,11 +172,11 @@ impl App {
                 ui.heading(text(ja, "残存データの復元", "Restore remaining data"));
                 match review {
                     Ok(stage) => {
-                        ui.label(format!("{}: {}", text(ja, "移動元", "From"), display(&stage.path.join("payload"))));
+                        ui.label(format!("{}: {}", text(ja, "移動元", "From"), display(&stage.payload_path())));
                         ui.label(format!("{}: {}", text(ja, "記録された移動先", "Recorded destination"), display(&stage.original)));
                         ui.label(text(ja, "記録は由来や完全性の証明ではありません。整理中に一部が削除済みの可能性があります。内容と移動先を確認してください。既存の移動先は上書きしません。", "The record does not prove origin or completeness; some data may already have been removed. Check the contents and destination. An existing destination will not be overwritten."));
                         if ui.button(text(ja, "残存データを Finder で開く", "Open remaining data in Finder")).clicked() {
-                            finder_error = super::open_in_finder(&stage.path.join("payload")).err();
+                            finder_error = super::open_in_finder(&stage.payload_path()).err();
                         }
                         restore = ui.button(text(ja, "残存データをこの場所に復元", "Restore remaining data here")).clicked();
                     }

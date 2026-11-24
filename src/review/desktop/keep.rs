@@ -8,7 +8,7 @@ use std::fs;
 use std::io::BufReader;
 use std::path::{Component, Path, PathBuf};
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub(super) struct KeepRules {
     paths: BTreeSet<PathBuf>,
 }

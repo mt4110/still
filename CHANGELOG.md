@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0-beta.2] - 2026-11-24
+
+### Added
+
+- Update macOS workspace sizes and cleanup candidates when Finder changes files or folders.
+- Open the largest eligible workspace cleanup candidate directly. Review its path, generator, and size, then choose Trash or permanent deletion.
+- Show item modification dates, recent file activity in folders, and contextual Finder and review actions.
+- Open individually confirmed cleanup actions for eligible linked Git worktrees, Docker images, and selected BuildKit cache records.
+
+### Changed
+
+- Increase macOS scan and candidate review concurrency up to eight workers.
+- Make read-only folder browsing available from the workspace and improve candidate status details across Library, SDK, and Docker screens.
+- Recheck exact BuildKit IDs and eligibility before deletion. Shared, mutable, referenced, in-use, and cache-mount records remain protected.
+
 ## [0.3.0-beta.1] - 2026-11-20
 
 ### Added

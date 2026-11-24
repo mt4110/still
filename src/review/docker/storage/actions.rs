@@ -354,6 +354,24 @@ pub(super) fn enrich(report: &mut Report, pin: Pin) -> Result<()> {
             meta.update(&mut rows[index]);
         }
     }
+    let mut image_starts = BTreeMap::new();
+    for meta in inspected.values() {
+        if let Some(start) = timestamp(&meta.started) {
+            let id = meta.image.strip_prefix("sha256:").unwrap_or(&meta.image);
+            let latest = image_starts.entry(id).or_insert(start);
+            *latest = (*latest).max(start);
+        }
+    }
+    if let Some((_, rows)) = report
+        .groups
+        .iter_mut()
+        .find(|(kind, _)| *kind == Kind::Image)
+    {
+        for row in rows {
+            let id = row.id.strip_prefix("sha256:").unwrap_or(&row.id);
+            row.image_last_start = image_starts.get(id).copied();
+        }
+    }
     report.daemon = Some(pin);
     report.snapshots = inspected;
     Ok(())

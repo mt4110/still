@@ -8,12 +8,20 @@ use std::sync::{
     Arc,
 };
 
-pub(super) const THREADS: u16 = 4;
+pub(super) fn threads() -> u16 {
+    if cfg!(target_os = "macos") {
+        std::thread::available_parallelism().map_or(4, |count| count.get().min(8) as u16)
+    } else {
+        4
+    }
+}
 pub(super) type Baseline = Option<Arc<history::Snapshot>>;
 
 pub(super) struct Scan {
     #[cfg(target_os = "macos")]
     pub kept: Option<super::keep::KeepRules>,
+    #[cfg(target_os = "macos")]
+    pub snapshot: Option<Arc<inventory::live::Snapshot>>,
     pub root: PathBuf,
     pub policy: Arc<artifacts::Policy>,
     pub directories: super::folder_index::Directories,
@@ -64,8 +72,23 @@ impl Scan {
             .get(index)
             .context("Workspace is no longer available")?
             .clone();
-        let inventory = inventory::scan_with_progress(&root, THREADS, None, Some(progress))?;
-        let findings = sources.collect(&policy);
+        let (scan_data, findings) = std::thread::scope(|scope| {
+            let external = sources
+                .configured(&policy)
+                .then(|| scope.spawn(|| sources.collect(&policy)));
+            #[cfg(target_os = "macos")]
+            let data = inventory::live::Snapshot::scan(&root, threads(), Some(progress))?;
+            #[cfg(not(target_os = "macos"))]
+            let data = inventory::scan_with_progress(&root, threads(), None, Some(progress))?;
+            let findings = external.map_or_else(candidates::Findings::default, |job| {
+                job.join().expect("candidate sources")
+            });
+            Ok::<_, anyhow::Error>((data, findings))
+        })?;
+        #[cfg(target_os = "macos")]
+        let (inventory, snapshot) = scan_data;
+        #[cfg(not(target_os = "macos"))]
+        let inventory = scan_data;
         let external = candidates::deduplicate(findings.rows(&inventory));
         let mut notes = findings.notes;
         let mut recorded = false;
@@ -132,6 +155,8 @@ impl Scan {
         Ok(Self {
             #[cfg(target_os = "macos")]
             kept,
+            #[cfg(target_os = "macos")]
+            snapshot: Some(Arc::new(snapshot)),
             directories: super::folder_index::Directories::from_inventory(&root, inventory),
             root,
             policy: Arc::new(policy),
@@ -143,12 +168,74 @@ impl Scan {
         })
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn reconcile(
+        snapshot: &inventory::live::Snapshot,
+        root: &Path,
+        changes: &super::workspace_events::Changes,
+        policy: &artifacts::Policy,
+        previous: &[artifacts::FileCandidate],
+        kept: Option<&super::keep::KeepRules>,
+        mut matches: Vec<inventory::Row>,
+    ) -> Result<WorkspaceUpdate> {
+        let changed = &changes.directories;
+        let (inventory, snapshot) =
+            snapshot.reconcile(root, changed, &changes.renamed_or_created)?;
+        let mut files = artifacts::refresh_file_candidates(&inventory, policy, previous, changed);
+        for item in &mut files {
+            if item.blocked_reason.is_none() && !policy.roots.is_empty() {
+                item.blocked_reason = match kept {
+                    Some(rules) => rules.reason(&item.row.path),
+                    None => Some(super::Message::new(
+                        "Keep settings unavailable",
+                        "「残す」設定を読み取れません",
+                    )),
+                };
+            }
+        }
+        matches.retain_mut(|row| {
+            if row.is_dir {
+                return inventory
+                    .directories
+                    .binary_search_by(|dir| dir.path.cmp(&row.path))
+                    .is_ok();
+            }
+            if !row.path.ancestors().any(|path| changed.contains(path)) {
+                return true;
+            }
+            match std::fs::symlink_metadata(&row.path) {
+                Ok(metadata) if metadata.is_file() && !inventory::is_link(&metadata) => {
+                    row.usage = inventory::Usage::file(&metadata);
+                    true
+                }
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => true,
+                _ => false,
+            }
+        });
+        Ok(WorkspaceUpdate {
+            directories: super::folder_index::Directories::from_inventory(root, inventory),
+            snapshot: Arc::new(snapshot),
+            files,
+            matches,
+        })
+    }
+
     pub fn delta(&self, row: &inventory::Row) -> Option<history::Delta> {
         self.previous.as_ref()?.delta(row)
     }
 }
 
+#[cfg(target_os = "macos")]
+pub(super) struct WorkspaceUpdate {
+    pub directories: super::folder_index::Directories,
+    pub snapshot: Arc<inventory::live::Snapshot>,
+    pub files: Vec<artifacts::FileCandidate>,
+    pub matches: Vec<inventory::Row>,
+}
+
 pub(super) struct CleanupReceipt {
+    #[cfg(target_os = "macos")]
+    pub to_trash: bool,
     pub outcomes: Vec<(String, Result<(), super::Message>)>,
     pub before: Option<u64>,
     pub after: Option<u64>,
@@ -267,13 +354,18 @@ impl Confirmation {
         self.items.iter().zip(&self.totals)
     }
 
-    fn remove_reviewed(&self, item: &artifacts::Prepared) -> Result<()> {
+    fn remove_reviewed(&self, item: &artifacts::Prepared, to_trash: bool) -> Result<()> {
         #[cfg(target_os = "macos")]
         super::keep::KeepRules::load()?.check(&item.path)?;
+        #[cfg(target_os = "macos")]
+        if to_trash {
+            return self.policy.trash(item);
+        }
+        let _ = to_trash;
         self.policy.remove(item)
     }
 
-    pub fn remove(self, root: &Path) -> CleanupReceipt {
+    pub fn remove(self, root: &Path, to_trash: bool) -> CleanupReceipt {
         let started_at = chrono::Utc::now();
         #[cfg(target_os = "macos")]
         let kept_paths_at_start = super::keep::KeepRules::load()
@@ -284,7 +376,7 @@ impl Confirmation {
         let before = super::super::filesystem::available(root);
         let outcomes = run_in_pairs(&self.items, |item| {
             let result = self
-                .remove_reviewed(item)
+                .remove_reviewed(item, to_trash)
                 .map_err(|err| super::Message::from_error(&err));
             (display(&item.path), result)
         });
@@ -342,6 +434,8 @@ impl Confirmation {
             None
         };
         CleanupReceipt {
+            #[cfg(target_os = "macos")]
+            to_trash,
             outcomes,
             before,
             after,
@@ -409,7 +503,7 @@ mod tests {
         });
         let confirmation = Confirmation::prepare(policy, outputs.to_vec())?;
         fs::write(outputs[1].join("artifact.bin"), b"changed after approval")?;
-        let receipt = confirmation.remove(&root);
+        let receipt = confirmation.remove(&root, false);
         assert_eq!(receipt.held, 1);
         let results = receipt.outcomes;
         assert!(results[0].1.is_ok());
@@ -448,7 +542,7 @@ mod tests {
 
         let preview = Confirmation::prepare(policy, vec![output])?;
         fs::write(&file, b"after")?;
-        assert!(preview.remove(&root).outcomes[0]
+        assert!(preview.remove(&root, false).outcomes[0]
             .1
             .as_ref()
             .unwrap_err()

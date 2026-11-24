@@ -8,6 +8,7 @@ pub(super) enum Order {
     #[default]
     Stopped,
     Created,
+    ImageLastStart,
     Size,
 }
 
@@ -25,6 +26,10 @@ enum Action {
     Scan,
     Review,
     ReviewCache,
+    ReviewImage(String),
+    ReviewContainer(String),
+    ReviewCacheItem(String),
+    CheckResource(storage::Kind, String, String),
 }
 
 fn activity(item: &storage::Resource) -> Option<DateTime<Utc>> {
@@ -102,8 +107,8 @@ fn reason(kind: storage::Kind, item: &storage::Resource, japanese: bool) -> &str
         storage::Kind::Container => item.reason.text(japanese),
         storage::Kind::Image => text(
             japanese,
-            "参照と共有レイヤーを確認する対象です。個別削除は CLI で確認できます。",
-            "Review references and shared layers. Individual removal is available through the CLI.",
+            "参照と共有レイヤーを表示します。選んだイメージが削除できるか個別に確認できます。",
+            "Review references and shared layers. Check whether the selected image can be removed.",
         ),
         storage::Kind::Volume => text(
             japanese,
@@ -112,8 +117,8 @@ fn reason(kind: storage::Kind, item: &storage::Resource, japanese: bool) -> &str
         ),
         storage::Kind::Cache => text(
             japanese,
-            "容量を確認できます。上の操作では条件に合う未使用キャッシュをまとめて整理します。",
-            "Review usage here. The action above prunes unused cache matching the retention period.",
+            "容量を確認できます。削除する項目は「未使用キャッシュを確認…」から選べます。",
+            "Review usage here. Open Review unused cache to select records for deletion.",
         ),
     }
 }
@@ -142,15 +147,21 @@ fn matches(
 }
 
 fn ordered(a: &storage::Resource, b: &storage::Resource, order: Order) -> std::cmp::Ordering {
-    let dates = |a: Option<DateTime<Utc>>, b: Option<DateTime<Utc>>| match (a, b) {
-        (Some(a), Some(b)) => a.cmp(&b),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => std::cmp::Ordering::Equal,
-    };
+    fn dates<T: Ord>(a: Option<T>, b: Option<T>) -> std::cmp::Ordering {
+        match (a, b) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    }
     match order {
         Order::Stopped => dates(activity(a), activity(b)),
-        Order::Created => dates(a.created, b.created),
+        Order::Created => dates(a.created.or(a.image_created), b.created.or(b.image_created)),
+        Order::ImageLastStart => dates(
+            a.image_last_start.map(std::cmp::Reverse),
+            b.image_last_start.map(std::cmp::Reverse),
+        ),
         Order::Size => b
             .estimated_bytes
             .or_else(|| storage::size_bytes(&b.size))
@@ -300,6 +311,10 @@ fn cache_output_table(ui: &mut egui::Ui, output: &str, parsed: &ParsedOutput, ja
 }
 
 impl Panel {
+    pub(in crate::review::desktop) fn refresh_images(&mut self) {
+        self.selected = None;
+        self.refresh_pending = true;
+    }
     pub(in crate::review::desktop) fn set_cache_review(
         &mut self,
         result: Result<storage::CacheCleanup>,
@@ -457,24 +472,42 @@ impl Panel {
                     receipt.days,
                     text(japanese, "日以上", "days or older")
                 ));
+                if let Some(remaining) = receipt.remaining {
+                    ui.label(if japanese {
+                        format!(
+                            "選択 {} 件のうち、再確認時に残っていた項目: {} 件",
+                            receipt.selected, remaining
+                        )
+                    } else {
+                        format!(
+                            "Still listed after recheck: {remaining} of {} selected",
+                            receipt.selected
+                        )
+                    });
+                } else if receipt.attempted {
+                    ui.label(text(
+                        japanese,
+                        "削除後の一覧を確認できませんでした。",
+                        "Could not verify the inventory after the deletion attempt.",
+                    ));
+                }
                 match &receipt.result {
-                    Ok(output) => {
-                        ui.label(text(
-                            japanese,
-                            "Docker の処理が完了しました。",
-                            "Docker cleanup completed.",
-                        ));
-                        cache_output_table(ui, output, &result.parsed, japanese);
-                    }
+                    Ok(output) => cache_output_table(ui, output, &result.parsed, japanese),
                     Err(error) => {
-                        ui.label(format!(
-                            "{} · {error:#}",
+                        let label = if receipt.attempted {
                             text(
                                 japanese,
-                                "完了を確認できません。一部削除された可能性があります",
-                                "Completion was not confirmed; some cache may have been removed"
+                                "Docker の削除処理が完了しませんでした",
+                                "Docker did not complete the deletion",
                             )
-                        ));
+                        } else {
+                            text(
+                                japanese,
+                                "削除を開始できませんでした。対象を確認し直してください",
+                                "Deletion did not start. Review the candidates again",
+                            )
+                        };
+                        ui.label(format!("{label} · {error:#}"));
                     }
                 }
                 ui.small(vm_space_note(japanese));
@@ -610,7 +643,11 @@ impl Panel {
                     action = Action::ReviewCache;
                 }
             });
-            ui.small(text(japanese, "Docker の既定ビルダーが対象を判定します。使用中などの理由で行が残ることがあり、表示容量と回収量も一致するとは限りません。", "Docker's default builder selects the records. Some may remain, for example if in use, and reported size may differ from reclaimed space."));
+            ui.small(text(
+                japanese,
+                "既定ビルダーの削除候補を確認して、ID ごとに選べます。",
+                "Review the default builder’s candidates and choose which IDs to delete.",
+            ));
         }
         let previous = (self.query.clone(), self.filter, self.sort, self.age_days);
         ui.add_enabled_ui(!busy, |ui| {
@@ -628,6 +665,9 @@ impl Panel {
                     .selected_text(match self.sort {
                         Order::Stopped => text(japanese, "最終停止が古い順", "Oldest last stop"),
                         Order::Created => text(japanese, "作成が古い順", "Oldest created"),
+                        Order::ImageLastStart => {
+                            text(japanese, "最終起動が新しい順", "Latest container start")
+                        }
                         Order::Size => text(japanese, "容量が大きい順", "Largest size"),
                     })
                     .show_ui(ui, |ui| {
@@ -636,6 +676,18 @@ impl Panel {
                                 &mut self.sort,
                                 Order::Stopped,
                                 text(japanese, "最終停止が古い順", "Oldest last stop"),
+                            );
+                            ui.selectable_value(
+                                &mut self.sort,
+                                Order::Created,
+                                text(japanese, "作成が古い順", "Oldest created"),
+                            );
+                        }
+                        if *kind == storage::Kind::Image {
+                            ui.selectable_value(
+                                &mut self.sort,
+                                Order::ImageLastStart,
+                                text(japanese, "最終起動が新しい順", "Latest container start"),
                             );
                             ui.selectable_value(
                                 &mut self.sort,
@@ -766,6 +818,28 @@ impl Panel {
             })
             .copied()
             .or_else(|| visible.first().copied());
+        if *kind == storage::Kind::Image {
+            self.selected = focused.map(|item| (item.id.clone(), item.name.clone()));
+            if let Some(item) = focused {
+                ui.horizontal_wrapped(|ui| {
+                    if controls::button(
+                        ui,
+                        text(
+                            japanese,
+                            "選んだイメージの削除を確認…",
+                            "Review selected image for removal…",
+                        ),
+                        true,
+                        !busy,
+                    )
+                    .clicked()
+                    {
+                        action = Action::ReviewImage(item.id.clone());
+                    }
+                    ui.label(name(item)).on_hover_text(&item.id);
+                });
+            }
+        }
         if wide {
             egui::Panel::right("docker-inspector")
                 .exact_size(280.0)
@@ -786,7 +860,7 @@ impl Panel {
             egui::vec2(ui.available_width(), table_height),
             egui::Layout::top_down(Align::Min),
             |ui| {
-                rows(
+                let row_action = rows(
                     ui,
                     *kind,
                     &visible,
@@ -795,6 +869,9 @@ impl Panel {
                     japanese,
                     !busy,
                 );
+                if !matches!(row_action, Action::None) {
+                    action = row_action;
+                }
             },
         );
         if !wide {
@@ -824,11 +901,17 @@ fn rows(
     selected: &mut Option<(String, String)>,
     japanese: bool,
     enabled: bool,
-) {
+) -> Action {
+    let mut action = Action::None;
     let height = ui.available_height();
+    let select_width = if kind == storage::Kind::Container {
+        36.0
+    } else {
+        0.0
+    };
     let widths = [
-        36.0,
-        (ui.available_width() - 16.0 - 36.0 - 90.0 - 148.0 - 72.0 - 32.0).max(80.0),
+        select_width,
+        (ui.available_width() - 16.0 - select_width - 90.0 - 148.0 - 72.0 - 32.0).max(80.0),
         90.0,
         148.0,
         72.0,
@@ -852,6 +935,8 @@ fn rows(
             text(japanese, "最終停止／作成", "Stopped / created")
         } else if kind == storage::Kind::Cache {
             text(japanese, "最終使用", "Last used")
+        } else if kind == storage::Kind::Image {
+            text(japanese, "最終起動／作成", "Last start / created")
         } else {
             text(japanese, "参照・共有", "References / shared")
         },
@@ -860,6 +945,9 @@ fn rows(
     .iter()
     .enumerate()
     {
+        if widths[index] == 0.0 {
+            continue;
+        }
         controls::cell(
             &mut header,
             widths[index],
@@ -891,7 +979,7 @@ fn rows(
                     .as_ref()
                     .is_some_and(|key| key == &(item.id.clone(), item.name.clone()));
                 let amount = ui.ctx().animate_bool_with_time(
-                    egui::Id::new(("docker-row", &item.id)),
+                    egui::Id::new(("docker-row", &item.id, &item.name)),
                     focused || marked.contains(&item.id) || response.hovered(),
                     ui.style().animation_time.min(0.12),
                 );
@@ -912,41 +1000,43 @@ fn rows(
                 );
                 let mut row = ui.new_child(
                     egui::UiBuilder::new()
-                        .id_salt((&item.id, "docker-cells"))
+                        .id_salt((&item.id, &item.name, "docker-cells"))
                         .max_rect(rect.shrink2(egui::vec2(8.0, 6.0)))
                         .layout(egui::Layout::left_to_right(Align::Center)),
                 );
                 row.set_clip_rect(row.clip_rect().intersect(rect));
-                controls::cell(&mut row, widths[0], 36.0, Align::Min, |ui| {
-                    if kind != storage::Kind::Container {
-                        return;
-                    }
-                    let mut checked = marked.contains(&item.id);
-                    let checkbox = ui.add_enabled(
-                        enabled && kind == storage::Kind::Container && item.eligible,
-                        egui::Checkbox::without_text(&mut checked),
-                    );
-                    checkbox.widget_info(|| {
-                        egui::WidgetInfo::selected(
-                            egui::WidgetType::Checkbox,
-                            enabled && item.eligible,
-                            checked,
-                            format!(
-                                "{} {}",
-                                text(japanese, "削除確認に含める", "Include in removal review"),
-                                name(item)
-                            ),
-                        )
-                    });
-                    if checkbox.changed() {
-                        if checked {
-                            marked.insert(item.id.clone());
-                        } else {
-                            marked.remove(&item.id);
+                if kind == storage::Kind::Container {
+                    controls::cell(&mut row, widths[0], 36.0, Align::Min, |ui| {
+                        if kind != storage::Kind::Container {
+                            return;
                         }
-                    }
-                });
-                controls::cell(&mut row, widths[1], 44.0, Align::Min, |ui| {
+                        let mut checked = marked.contains(&item.id);
+                        let checkbox = ui.add_enabled(
+                            enabled && kind == storage::Kind::Container && item.eligible,
+                            egui::Checkbox::without_text(&mut checked),
+                        );
+                        checkbox.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::Checkbox,
+                                enabled && item.eligible,
+                                checked,
+                                format!(
+                                    "{} {}",
+                                    text(japanese, "削除確認に含める", "Include in removal review"),
+                                    name(item)
+                                ),
+                            )
+                        });
+                        if checkbox.changed() {
+                            if checked {
+                                marked.insert(item.id.clone());
+                            } else {
+                                marked.remove(&item.id);
+                            }
+                        }
+                    });
+                }
+                let name_response = controls::cell(&mut row, widths[1], 44.0, Align::Min, |ui| {
                     ui.vertical(|ui| {
                         ui.set_width(widths[1]);
                         ui.spacing_mut().item_spacing.y = 2.0;
@@ -955,21 +1045,20 @@ fn rows(
                         } else {
                             name(item)
                         };
-                        if controls::label(
+                        let response = controls::label(
                             ui,
                             &title,
                             15.0,
                             super::super::INK,
                             Align::Min,
                             Sense::click(),
-                        )
-                        .clicked()
-                        {
+                        );
+                        if response.clicked() {
                             *selected = Some((item.id.clone(), item.name.clone()));
                         }
                         controls::label(
                             ui,
-                            if kind == storage::Kind::Cache {
+                            if matches!(kind, storage::Kind::Cache | storage::Kind::Image) {
                                 &item.id
                             } else {
                                 reason(kind, item, japanese)
@@ -979,7 +1068,9 @@ fn rows(
                             Align::Min,
                             Sense::hover(),
                         );
-                    });
+                        response
+                    })
+                    .inner
                 });
                 controls::cell(&mut row, widths[2], 36.0, Align::Max, |ui| {
                     controls::label(
@@ -1005,6 +1096,18 @@ fn rows(
                             } else {
                                 relative_time(&item.last_used, japanese)
                             }
+                        } else if kind == storage::Kind::Image {
+                            if let Some(last) = item.image_last_start {
+                                date(Some(last), japanese)
+                            } else if let Some(created) = item.image_created {
+                                format!(
+                                    "{} {}",
+                                    text(japanese, "作成", "Created"),
+                                    date(Some(created), japanese)
+                                )
+                            } else {
+                                date(None, japanese)
+                            }
                         } else if !item.mounts.is_empty() {
                             item.mounts.clone()
                         } else {
@@ -1026,8 +1129,35 @@ fn rows(
                         Sense::hover(),
                     );
                 });
-                if response.clicked() {
+                if response.clicked()
+                    || response.secondary_clicked()
+                    || name_response.secondary_clicked()
+                {
                     *selected = Some((item.id.clone(), item.name.clone()));
+                }
+                let menu = response.union(name_response);
+                let may_remove = match kind {
+                    storage::Kind::Image => true,
+                    storage::Kind::Container => item.eligible,
+                    storage::Kind::Cache => item.name == "regular" && item.status == "false",
+                    storage::Kind::Volume => false,
+                };
+                if let Some(choice) =
+                    super::super::item_menu::show(&menu, japanese, false, may_remove, !enabled)
+                {
+                    *selected = Some((item.id.clone(), item.name.clone()));
+                    action = match choice {
+                        super::super::item_menu::Action::Remove => match kind {
+                            storage::Kind::Image => Action::ReviewImage(item.id.clone()),
+                            storage::Kind::Container => Action::ReviewContainer(item.id.clone()),
+                            storage::Kind::Cache => Action::ReviewCacheItem(item.id.clone()),
+                            storage::Kind::Volume => Action::None,
+                        },
+                        super::super::item_menu::Action::Check => {
+                            Action::CheckResource(kind, item.id.clone(), item.name.clone())
+                        }
+                        super::super::item_menu::Action::Finder => Action::None,
+                    };
                 }
             }
         });
@@ -1038,6 +1168,7 @@ fn rows(
             "No matching resources.",
         ));
     }
+    action
 }
 
 fn inspector(
@@ -1104,6 +1235,21 @@ fn inspector(
         );
         ui.small(text(japanese,"削除すると書込層と Docker 管理ログを失います。マウント先・ボリューム・イメージは残します。","Removal loses writable data and Docker-managed logs. Mounts, volumes and images remain."));
     } else if kind == storage::Kind::Image {
+        ui.label(format!(
+            "{} {}",
+            text(japanese, "作成日時", "Created"),
+            date(item.image_created, japanese),
+        ));
+        ui.label(format!(
+            "{} {}",
+            text(japanese, "最終起動（観測）", "Last observed start"),
+            date(item.image_last_start, japanese),
+        ));
+        ui.small(text(
+            japanese,
+            "現在残っているコンテナの起動日時から集計しています。",
+            "Based on start times of containers still present.",
+        ));
         ui.label(format!(
             "{} {} · {} {}",
             text(japanese, "共有", "Shared"),
@@ -1272,6 +1418,98 @@ impl App {
                     );
                 }
             }
+            Action::ReviewImage(id) if self.job.is_none() => {
+                if let Some(Ok(report)) = &self.monitor.docker {
+                    self.review_docker_image(&ctx, report.context.clone(), id);
+                }
+            }
+            Action::ReviewContainer(id) if self.job.is_none() => {
+                if let Some(Ok(report)) = &self.monitor.docker {
+                    let report = Arc::clone(report);
+                    self.spawn(
+                        &ctx,
+                        text(
+                            self.japanese_reasons,
+                            "コンテナを再確認中…",
+                            "Verifying container…",
+                        ),
+                        false,
+                        move || {
+                            Outcome::DockerReview(storage::Review::prepare(
+                                &report,
+                                &BTreeSet::from([id]),
+                            ))
+                        },
+                    );
+                }
+            }
+            Action::ReviewCacheItem(id) if self.job.is_none() => {
+                if let Some(Ok(report)) = &self.monitor.docker {
+                    let context = report.context.clone();
+                    let days = self.monitor.cache_days;
+                    self.spawn(
+                        &ctx,
+                        text(
+                            self.japanese_reasons,
+                            "キャッシュを再確認中…",
+                            "Verifying cache…",
+                        ),
+                        false,
+                        move || {
+                            Outcome::DockerCacheReview(storage::CacheCleanup::prepare_one(
+                                &context, days, &id,
+                            ))
+                        },
+                    );
+                }
+            }
+            Action::CheckResource(kind, id, label) if self.job.is_none() => {
+                if let Some(Ok(report)) = &self.monitor.docker {
+                    let context = report.context.clone();
+                    let ja = self.japanese_reasons;
+                    self.spawn(
+                        &ctx,
+                        text(ja, "Docker の状態を確認中…", "Checking Docker state…"),
+                        false,
+                        move || {
+                            let current = storage::inspect(&context).and_then(|report| {
+                                report
+                                    .groups
+                                    .into_iter()
+                                    .find(|(group, _)| *group == kind)
+                                    .and_then(|(_, rows)| {
+                                        rows.into_iter()
+                                            .find(|item| item.id == id && item.name == label)
+                                    })
+                                    .with_context(|| {
+                                        text(
+                                            ja,
+                                            "現在の一覧にこの項目がありません。",
+                                            "The item is absent from the current inventory.",
+                                        )
+                                    })
+                            });
+                            let mut lines = vec![
+                                context,
+                                if label.is_empty() { id.clone() } else { label },
+                                id,
+                            ];
+                            match current {
+                                Ok(item) => {
+                                    lines.push(format!(
+                                        "{} · {}",
+                                        docker_size(&item.size),
+                                        super::resource_state(kind, &item, ja)
+                                    ));
+                                    lines.push(reason(kind, &item, ja).into());
+                                }
+                                Err(error) => lines.push(format!("{error:#}")),
+                            }
+                            Outcome::Inspection(lines)
+                        },
+                    );
+                }
+            }
             Action::ReviewCache if self.job.is_none() => {
                 if let Some(Ok(report)) = &self.monitor.docker {
                     let context = report.context.clone();
@@ -1297,19 +1535,47 @@ impl App {
     }
 
     pub(in crate::review::desktop) fn docker_confirmation(&mut self, ctx: &egui::Context) {
-        if let Some(review) = &self.monitor.cache_review {
+        if let Some(review) = &mut self.monitor.cache_review {
             let japanese = self.japanese_reasons;
             let mut cancel = false;
             let mut remove = false;
             let dialog = egui::Modal::new(egui::Id::new("docker-cache-confirmation")).frame(modal_frame(ctx)).show(ctx, |ui| {
                 ui.set_width(520.0);
-                ui.heading(text(japanese, "ビルドキャッシュを整理しますか？", "Clean up build cache?"));
-                ui.strong(format!("{}: {}", text(japanese, "接続先", "Context"), review.context));
-                ui.label(if japanese { format!("この Docker の既定ビルダーで、{} 日以上未使用のキャッシュを Docker の基準で削除します。通常は残る内部・フロントエンドのキャッシュも対象です。", review.days) } else { format!("Docker will prune unused cache older than {} days from this daemon's default builder, including internal and frontend cache.", review.days) });
-                ui.label(text(japanese, "対象の全件や回収量は事前に確定できません。次のビルドは遅くなり、キャッシュマウント内のデータが失われる場合があります。ゴミ箱には入りません。", "Exact records and reclaimed space are unknown in advance. Later builds may be slower and cache-mount data may be lost. This bypasses Trash."));
+                ui.heading(text(japanese, "削除するビルドキャッシュを確認", "Review build cache to delete"));
+                ui.strong(format!("{}: {} · {} {}", text(japanese, "接続先", "Context"), review.context, review.days, text(japanese, "日以上未使用", "days unused or more")));
+                ui.label(text(japanese, "既定ビルダーの通常キャッシュが対象です。使用中・共有・変更可能なキャッシュとキャッシュマウントは対象外です。", "Only regular cache on the default builder is eligible. In-use, shared and mutable cache and cache mounts are excluded."));
+                if review.referenced_count > 0 {
+                    ui.label(if japanese {
+                        format!("別のキャッシュから参照されているため除外: {} 件", review.referenced_count)
+                    } else {
+                        format!("Excluded because another cache record depends on them: {}", review.referenced_count)
+                    });
+                }
+                if review.targets.is_empty() {
+                    ui.label(text(japanese, "条件を満たすキャッシュはありません。", "No cache records meet these conditions."));
+                } else {
+                    if review.eligible_count > review.targets.len() {
+                        ui.label(if japanese {
+                            format!("候補 {} 件のうち、容量が大きい {} 件を表示しています。", review.eligible_count, review.targets.len())
+                        } else {
+                            format!("Showing the {} largest of {} candidates.", review.targets.len(), review.eligible_count)
+                        });
+                    }
+                    ui.label(text(japanese, "ID ／ Docker 内の容量 ／ 最終使用", "ID / Docker size / Last used"));
+                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        for item in &mut review.targets {
+                            ui.checkbox(&mut item.selected, format!("{}  ·  {}  ·  {}", item.id, docker_size(&item.size), date(Some(item.last_used), japanese)));
+                        }
+                    });
+                    ui.small(text(japanese, "削除後はビルドが遅くなることがあります。表示容量は Mac で回収できる容量とは異なります。", "Later builds may be slower. Listed sizes differ from the space recoverable on this Mac."));
+                }
+                let selected = review.targets.iter().filter(|item| item.selected).count();
                 ui.horizontal(|ui| {
-                    cancel = controls::button(ui, text(japanese, "キャンセル", "Cancel"), false, self.job.is_none()).clicked();
-                    remove = controls::destructive_button(ui, text(japanese, "確認して整理", "Confirm cleanup"), self.job.is_none()).clicked();
+                    cancel = controls::button(ui, text(japanese, "閉じる", "Close"), false, self.job.is_none()).clicked();
+                    if selected > 0 {
+                        let label = if japanese { format!("選択した {selected} 件を削除") } else { format!("Delete {selected} selected records") };
+                        remove = controls::destructive_button(ui, &label, self.job.is_none()).clicked();
+                    }
                 });
             });
             if cancel || dialog.should_close() {

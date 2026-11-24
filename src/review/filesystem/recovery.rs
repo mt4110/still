@@ -78,39 +78,49 @@ impl Stage {
     }
 
     fn review(&self, stage_path: &Path) -> Result<BTreeMap<OsString, Entry>> {
+        let note = match fs::statat(&self.dir, "original-path.txt", AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Some(self.read_note(stage_path)?),
+            Err(rustix::io::Errno::NOENT) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let named_payload = note.as_ref().and_then(|(path, _)| path.file_name());
         let mut tree = BTreeMap::new();
         let mut count = 0;
         for name in finder::children(&self.dir)? {
             let item = if name == "original-path.txt" {
-                let mut note = finder::open_regular(&self.dir, &name, 16 * 1024)?;
-                let mut value = String::new();
-                (&mut note).take(16 * 1024 + 1).read_to_string(&mut value)?;
-                let original = Path::new(
-                    value
-                        .strip_suffix('\n')
-                        .context("Unrecognized stage note")?,
-                );
+                // Recheck the note entry before the reviewed stage is applied.
+                self.read_note(stage_path)?.1
+            } else if name == "payload" || named_payload == Some(name.as_os_str()) {
                 ensure!(
-                    original.parent() == stage_path.parent()
-                        && original.file_name().is_some()
-                        && !artifacts::protected(original)
-                        && inventory::display(original) == original.to_string_lossy(),
-                    "Original path in stage note does not name a sibling"
+                    note.is_some(),
+                    "Original path note missing from payload stage"
                 );
-                Entry::file(&fs::fstat(note)?)
-            } else if name == "payload" {
                 inspect_directory(&self.dir, &name, &mut count, 0)?
             } else {
                 Entry::file(&finder::inspect(&self.dir, &name)?)
             };
             tree.insert(name, item);
         }
-        ensure!(
-            !tree.contains_key(OsStr::new("payload"))
-                || tree.contains_key(OsStr::new("original-path.txt")),
-            "Original path note missing from payload stage"
-        );
         Ok(tree)
+    }
+
+    fn read_note(&self, stage_path: &Path) -> Result<(PathBuf, Entry)> {
+        let mut note = finder::open_regular(&self.dir, OsStr::new("original-path.txt"), 16 * 1024)?;
+        let mut value = String::new();
+        (&mut note).take(16 * 1024 + 1).read_to_string(&mut value)?;
+        let original = PathBuf::from(
+            value
+                .strip_suffix('\n')
+                .context("Unrecognized stage note")?,
+        );
+        ensure!(
+            original.parent() == stage_path.parent()
+                && original.file_name().is_some()
+                && !artifacts::protected(&original)
+                && inventory::display(&original) == original.to_string_lossy(),
+            "Original path in stage note does not name an unprotected sibling"
+        );
+        Ok((original, Entry::file(&fs::fstat(note)?)))
     }
 
     fn remove(&self, mut review: BTreeMap<OsString, Entry>) -> Result<()> {
@@ -132,6 +142,7 @@ pub(crate) struct RestoreStage {
     pub(crate) original: PathBuf,
     stage_id: Identity,
     payload_id: Identity,
+    payload_name: OsString,
     note: Entry,
 }
 
@@ -139,23 +150,20 @@ impl RestoreStage {
     pub(crate) fn inspect(root: &Path, path: &Path) -> Result<Self> {
         let path = inventory::safe_dir(path)?;
         let stage = Stage::open(root, &path)?;
-        let mut note =
-            finder::open_regular(&stage.dir, OsStr::new("original-path.txt"), 16 * 1024)?;
-        let mut value = String::new();
-        (&mut note).take(16 * 1024 + 1).read_to_string(&mut value)?;
-        let original = PathBuf::from(
-            value
-                .strip_suffix('\n')
-                .context("Unrecognized stage note")?,
-        );
-        ensure!(
-            original.parent() == path.parent()
-                && original.file_name().is_some()
-                && !artifacts::protected(&original)
-                && inventory::display(&original) == original.to_string_lossy(),
-            "Original path in stage note does not name an unprotected sibling"
-        );
-        let payload = fs::openat(&stage.dir, "payload", finder::DIRECTORY, Mode::empty())?;
+        let (original, note) = stage.read_note(&path)?;
+        let mut payload_name = OsString::from("payload");
+        let payload = match fs::openat(&stage.dir, &payload_name, finder::DIRECTORY, Mode::empty())
+        {
+            Ok(payload) => payload,
+            Err(rustix::io::Errno::NOENT) => {
+                payload_name = original
+                    .file_name()
+                    .context("Missing payload name")?
+                    .to_owned();
+                fs::openat(&stage.dir, &payload_name, finder::DIRECTORY, Mode::empty())?
+            }
+            Err(error) => return Err(error.into()),
+        };
         let payload_stat = fs::fstat(&payload)?;
         ensure!(
             payload_stat.st_dev == fs::fstat(&stage.dir)?.st_dev,
@@ -167,8 +175,13 @@ impl RestoreStage {
             original,
             stage_id: stat_identity(&fs::fstat(&stage.dir)?),
             payload_id: stat_identity(&payload_stat),
-            note: Entry::file(&fs::fstat(note)?),
+            note,
+            payload_name,
         })
+    }
+
+    pub(crate) fn payload_path(&self) -> PathBuf {
+        self.path.join(&self.payload_name)
     }
 
     pub(crate) fn restore(self) -> Result<()> {
@@ -177,6 +190,7 @@ impl RestoreStage {
         ensure!(
             current.stage_id == self.stage_id
                 && current.payload_id == self.payload_id
+                && current.payload_name == self.payload_name
                 && current.note == self.note
                 && current.original == self.original,
             "Stage or recorded destination changed during review"
@@ -186,12 +200,18 @@ impl RestoreStage {
             stat_identity(&fs::fstat(&stage.dir)?) == self.stage_id,
             "Stage changed during review"
         );
-        let payload = fs::openat(&stage.dir, "payload", finder::DIRECTORY, Mode::empty())?;
+        let payload = fs::openat(
+            &stage.dir,
+            &self.payload_name,
+            finder::DIRECTORY,
+            Mode::empty(),
+        )?;
         ensure!(
             stat_identity(&fs::fstat(&payload)?) == self.payload_id,
             "Payload changed during review"
         );
-        let payload_path_stat = fs::statat(&stage.dir, "payload", AtFlags::SYMLINK_NOFOLLOW)?;
+        let payload_path_stat =
+            fs::statat(&stage.dir, &self.payload_name, AtFlags::SYMLINK_NOFOLLOW)?;
         ensure!(
             FileType::from_raw_mode(payload_path_stat.st_mode) == FileType::Directory
                 && stat_identity(&payload_path_stat) == self.payload_id,
@@ -199,7 +219,7 @@ impl RestoreStage {
         );
         fs::renameat_with(
             &stage.dir,
-            "payload",
+            &self.payload_name,
             &stage.parent,
             self.original.file_name().context("Missing destination")?,
             fs::RenameFlags::NOREPLACE,
@@ -323,7 +343,7 @@ fn run_review(args: &crate::cli::StageCleanupArgs) -> Result<()> {
         Err(metadata_error) if !args.apply => {
             let restore = RestoreStage::inspect(&args.cleanup_root, &args.stage)
                 .context(format!("Metadata cleanup unavailable: {metadata_error:#}"))?;
-            println!("Remaining payload: {}\nRecorded destination: {}\nThe stage record does not prove origin or completeness. Verify both paths and contents before running with --restore; an existing destination will not be overwritten.", inventory::display(&restore.path.join("payload")), inventory::display(&restore.original));
+            println!("Remaining payload: {}\nRecorded destination: {}\nThe stage record does not prove origin or completeness. Verify both paths and contents before running with --restore; an existing destination will not be overwritten.", inventory::display(&restore.payload_path()), inventory::display(&restore.original));
             return Ok(());
         }
         Err(error) => return Err(error),
@@ -335,7 +355,7 @@ fn run_review(args: &crate::cli::StageCleanupArgs) -> Result<()> {
     } else {
         println!("Metadata-only stage: {label}\nRun this command with --apply to remove it.");
         if let Ok(restore) = RestoreStage::inspect(&args.cleanup_root, &args.stage) {
-            println!("Alternatively, inspect {} and recorded destination {} before using --restore. The record does not prove origin or completeness; an existing destination will not be overwritten.", inventory::display(&restore.path.join("payload")), inventory::display(&restore.original));
+            println!("Alternatively, inspect {} and recorded destination {} before using --restore. The record does not prove origin or completeness; an existing destination will not be overwritten.", inventory::display(&restore.payload_path()), inventory::display(&restore.original));
         }
     }
     Ok(())
@@ -455,6 +475,21 @@ mod tests {
         assert_eq!(fs::read(destination.join("remaining.txt"))?, b"remaining");
         assert!(args.stage.join("original-path.txt").is_file());
         assert!(!payload.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn restores_named_payload_from_interrupted_trash_move() -> Result<()> {
+        let (_fixture, payload, args) = fixture()?;
+        fs::write(payload.join("remaining.txt"), b"remaining")?;
+        let named = args.stage.join("target");
+        fs::rename(&payload, &named)?;
+        let review = RestoreStage::inspect(&args.cleanup_root, &args.stage)?;
+        assert_eq!(review.payload_path(), named);
+        let destination = review.original.clone();
+        review.restore()?;
+        assert_eq!(fs::read(destination.join("remaining.txt"))?, b"remaining");
+        assert!(!named.exists());
         Ok(())
     }
 

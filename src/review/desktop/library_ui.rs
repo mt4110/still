@@ -11,6 +11,8 @@ impl App {
         #[cfg(target_os = "macos")]
         let mut cache_action = None;
         #[cfg(target_os = "macos")]
+        let mut row_status = None;
+        #[cfg(target_os = "macos")]
         let mut group_check = None;
         let render = |ui: &mut egui::Ui| {
             if !as_page {
@@ -28,8 +30,8 @@ impl App {
             ));
             ui.label(text(
                 self.japanese_reasons,
-                "所有元と再生成方法を確認できたキャッシュは、内容を確認してから整理できます。",
-                "Review an eligible cache separately before removing it.",
+                "この一覧は調査用です。整理できるキャッシュや SDK には、専用の確認操作が表示されます。",
+                "This list is for inspection. Supported caches and SDKs have separate review actions.",
             ));
             #[cfg(target_os = "macos")]
             {
@@ -105,6 +107,14 @@ impl App {
                                 #[cfg(target_os = "macos")]
                                 let title =
                                     format!("{title}{}", access.label(self.japanese_reasons));
+                                let title = if row.path.is_some() {
+                                    format!(
+                                        "{title} · {}",
+                                        modified_caption(row.modified_at, self.japanese_reasons)
+                                    )
+                                } else {
+                                    title
+                                };
                                 let header = egui::CollapsingHeader::new(title).id_salt((
                                     row.path.as_deref(),
                                     &row.label,
@@ -119,7 +129,7 @@ impl App {
                                         );
                                         icons::paint(ui, rect, icons::Icon::Lock, MUTED);
                                     }
-                                    header.show(ui, |ui| {
+                                    let item = header.show(ui, |ui| {
                                         if let Some(path) = &row.path {
                                             ui.label(path);
                                         }
@@ -151,6 +161,45 @@ impl App {
                                             }
                                         }
                                     });
+                                    #[cfg(target_os = "macos")]
+                                    if let Some(action) = item_menu::show(
+                                        &item.header_response,
+                                        self.japanese_reasons,
+                                        row.native_path.is_some(),
+                                        !access.is_locked(),
+                                        busy,
+                                    ) {
+                                        match action {
+                                            item_menu::Action::Finder => {
+                                                if let Some(path) = &row.native_path {
+                                                    if let Err(error) = item_menu::reveal(path) {
+                                                        self.status = display_error(
+                                                            &error,
+                                                            self.japanese_reasons,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            item_menu::Action::Check => {
+                                                row_status = Some((
+                                                    row.native_path.clone(),
+                                                    row.label.clone(),
+                                                    row.reason
+                                                        .text(self.japanese_reasons)
+                                                        .to_owned(),
+                                                ))
+                                            }
+                                            item_menu::Action::Remove => {
+                                                if let Some(path) = self.library_panel.target(index)
+                                                {
+                                                    cache_action =
+                                                        Some(mac::Action::Review(path.to_owned()));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    #[cfg(not(target_os = "macos"))]
+                                    let _ = item;
                                 });
                                 ui.separator();
                             }
@@ -199,6 +248,14 @@ impl App {
         #[cfg(target_os = "macos")]
         if let Some(action) = cache_action {
             self.cache_action(ctx, action);
+        }
+        #[cfg(target_os = "macos")]
+        if let Some((path, label, detail)) = row_status {
+            if let Some(path) = path {
+                self.inspect_path_status(ctx, path, detail);
+            } else {
+                self.inspection = Some(vec![label, detail]);
+            }
         }
         #[cfg(target_os = "macos")]
         self.library_panel
@@ -591,7 +648,7 @@ mod mac {
             }
         }
 
-        fn target(&self, index: usize) -> Option<&Path> {
+        pub(super) fn target(&self, index: usize) -> Option<&Path> {
             self.cache_row
                 .as_ref()
                 .filter(|(candidate, _)| *candidate == index)
@@ -869,6 +926,7 @@ mod mac {
             let row = Row {
                 label: "Chrome".into(),
                 path: None,
+                modified_at: None,
                 native_path: None,
                 size_bytes: Some(10),
                 size_basis: "allocated",

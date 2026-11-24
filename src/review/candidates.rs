@@ -19,6 +19,13 @@ pub(super) struct Findings {
     pub notes: Vec<String>,
 }
 
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum DesktopTarget {
+    Worktree { repo: PathBuf, path: PathBuf },
+    Image(String),
+}
+
 #[derive(Serialize)]
 pub(super) struct DisplayRow {
     pub kind: &'static str,
@@ -27,6 +34,12 @@ pub(super) struct DisplayRow {
     pub estimated_bytes: Option<u64>,
     pub estimate_basis: &'static str,
     pub eligible: bool,
+    #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+    #[serde(skip)]
+    pub desktop_target: Option<DesktopTarget>,
+    #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+    #[serde(skip)]
+    pub desktop_path: Option<PathBuf>,
 }
 
 impl Sources {
@@ -97,6 +110,13 @@ impl Findings {
                     "Host reclaim estimate unavailable"
                 },
                 eligible: item.removable,
+                #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+                desktop_path: Some(item.path.clone()),
+                #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+                desktop_target: item.removable.then(|| DesktopTarget::Worktree {
+                    repo: item.repo.clone(),
+                    path: item.path.clone(),
+                }),
             }
         });
         let docker = self.docker.iter().map(|item| DisplayRow {
@@ -106,6 +126,14 @@ impl Findings {
             estimated_bytes: item.estimated_bytes,
             estimate_basis: item.estimate_note,
             eligible: item.eligible,
+            #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+            desktop_path: None,
+            #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+            desktop_target: item
+                .key
+                .strip_prefix("image:")
+                .filter(|_| item.eligible)
+                .map(|id| DesktopTarget::Image(id.to_owned())),
         });
         let kube = self.kube.iter().map(|item| DisplayRow {
             kind: "Kubernetes",
@@ -114,6 +142,10 @@ impl Findings {
             estimated_bytes: None,
             estimate_basis: "Cluster reclaim estimate unavailable",
             eligible: item.eligible,
+            #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+            desktop_path: None,
+            #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+            desktop_target: None,
         });
         git.chain(docker).chain(kube).collect()
     }

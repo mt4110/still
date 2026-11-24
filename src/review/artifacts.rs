@@ -70,6 +70,7 @@ impl Producer {
     }
 }
 
+#[derive(Clone)]
 pub struct FileCandidate {
     pub row: inventory::Row,
     pub producer: Producer,
@@ -292,7 +293,19 @@ impl Policy {
     }
 
     pub fn remove(&self, approved: &Prepared) -> Result<()> {
+        let current = self.recheck(approved)?;
+        filesystem::remove_output(&current.path, &current.tree)
+    }
+
+    #[cfg(all(feature = "desktop", target_os = "macos"))]
+    pub(super) fn trash(&self, approved: &Prepared) -> Result<()> {
+        let current = self.recheck(approved)?;
+        filesystem::trash_output(&current.path, &current.tree)
+    }
+
+    fn recheck(&self, approved: &Prepared) -> Result<Prepared> {
         let current = self.prepare(&approved.path)?;
+
         if current.producer != approved.producer || current.tree != approved.tree {
             return Err(Message::new(
                 "The output changed after review. Refresh and review it again.",
@@ -304,11 +317,51 @@ impl Policy {
             super::docker::protect_bind_mounts(context, &current.path)?;
         }
         filesystem::ensure_not_open(&current.path)?;
-        filesystem::remove_output(&current.path, &current.tree)
+        Ok(current)
     }
 }
 
 pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<FileCandidate> {
+    file_candidates_using(scan, policy, |_, _| None)
+}
+
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+pub(super) fn refresh_file_candidates(
+    scan: &inventory::Inventory,
+    policy: &Policy,
+    previous: &[FileCandidate],
+    changed: &std::collections::BTreeSet<PathBuf>,
+) -> Vec<FileCandidate> {
+    let previous: std::collections::HashMap<_, _> = previous
+        .iter()
+        .map(|item| (item.row.path.as_path(), item))
+        .collect();
+    file_candidates_using(scan, policy, |row, producer| {
+        let old = previous
+            .get(row.path.as_path())
+            .filter(|old| old.producer == producer)?;
+        if changed
+            .iter()
+            .any(|dir| dir.starts_with(&row.path) || row.path.starts_with(dir))
+        {
+            return None;
+        }
+        Some(FileCandidate {
+            row: row.clone(),
+            producer,
+            blocked_reason: old.blocked_reason.clone(),
+        })
+    })
+}
+
+fn file_candidates_using(
+    scan: &inventory::Inventory,
+    policy: &Policy,
+    cached: impl Fn(&inventory::Row, Producer) -> Option<FileCandidate> + Sync,
+) -> Vec<FileCandidate> {
+    if policy.roots.is_empty() {
+        return Vec::new();
+    }
     let mut found: Vec<_> = scan
         .directories
         .iter()
@@ -360,6 +413,9 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
         .map(super::docker::bind_mount_paths)
         .transpose();
     let inspect = |row: &inventory::Row, producer: Producer, git_checked_parent: Option<&Path>| {
+        if let Some(candidate) = cached(row, producer) {
+            return candidate;
+        }
         let preflight = (|| -> Result<()> {
             let (path, _) = if git_checked_parent.is_some_and(|parent| {
                 row.path.parent() == Some(parent) && parent.ends_with("incremental")
@@ -388,7 +444,12 @@ pub fn file_candidates(scan: &inventory::Inventory, policy: &Policy) -> Vec<File
             blocked_reason: preflight.err().as_ref().map(Message::from_error),
         }
     };
-    let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
+    let limit = if cfg!(all(feature = "desktop", target_os = "macos")) {
+        8
+    } else {
+        4
+    };
+    let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(limit));
     let mut files: Vec<_> = std::thread::scope(|scope| {
         found
             .chunks(found.len().div_ceil(workers).max(1))

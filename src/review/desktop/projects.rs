@@ -78,6 +78,8 @@ pub(super) struct Projects {
 struct Project {
     path: PathBuf,
     size: u64,
+    modified_at: Option<chrono::DateTime<chrono::Utc>>,
+    recent_files: u64,
     reclaim: u64,
     delta: Option<Delta>,
     files: Vec<usize>,
@@ -163,6 +165,7 @@ fn candidate_header(ui: &mut egui::Ui, japanese: bool) {
 #[derive(Default)]
 struct InspectorActions {
     inspect: Option<PathBuf>,
+    review_one: Option<PathBuf>,
     show_parts: Option<PathBuf>,
     finder_error: Option<String>,
     keep: Option<(PathBuf, bool)>,
@@ -194,6 +197,8 @@ fn candidate_inspector(
             ui.add_space(16.);
             divider(ui);
             ui.add_space(12.);
+            ui.small(super::modified_caption(candidate.row.usage.modified_at, japanese));
+            ui.small(super::recent_updates_caption(candidate.row.usage.files_modified_last_7_days, japanese));
             ui.strong(text(japanese, "判定理由", "Decision"));
             if let Some(reason) = &candidate.blocked_reason {
                 ui.label(RichText::new(text(japanese, "保留", "On hold")).color(MUTED));
@@ -269,6 +274,8 @@ impl Projects {
                     Project {
                         path: r.path.clone(),
                         size: r.usage.size(),
+                        modified_at: r.usage.modified_at,
+                        recent_files: r.usage.files_modified_last_7_days,
                         reclaim: 0,
                         delta: scan.delta(&r),
                         files: vec![],
@@ -441,6 +448,11 @@ impl App {
         ui.label(RichText::new(name(&project.path)).size(28.).strong());
         ui.add(egui::Label::new(RichText::new(display(&project.path)).color(MUTED)).truncate())
             .on_hover_text(display(&project.path));
+        ui.small(super::modified_caption(project.modified_at, japanese));
+        ui.small(super::recent_updates_caption(
+            project.recent_files,
+            japanese,
+        ));
         ui.horizontal_wrapped(|ui| {
             ui.label(format!(
                 "{}  {}",
@@ -487,28 +499,6 @@ impl App {
                     .any(|&i| scan.files[i].row.path == *path)
             })
             .or_else(|| visible.first().map(|&i| scan.files[i].row.path.clone()));
-        let now = std::time::Instant::now();
-        let due = if self.job.is_none()
-            && !self.show_stale_files
-            && !self.show_app_storage
-            && !self.sdk.open
-            && self.save_as.is_none()
-            && self.inspection.is_none()
-            && self.confirmation.is_none()
-            && ui.ctx().input(|i| i.focused)
-        {
-            let deadline = self.next_presence_check.get_or_insert(now);
-            let due = now >= *deadline;
-            if due {
-                *deadline = now + std::time::Duration::from_secs(10);
-            }
-            ui.ctx()
-                .request_repaint_after(deadline.saturating_duration_since(now));
-            due
-        } else {
-            false
-        };
-        let mut missing = BTreeSet::new();
         let mut actions = InspectorActions::default();
         let body_height = (ui.available_height() - 72.).max(160.);
         let wide = ui.available_width() >= 680.;
@@ -523,7 +513,9 @@ impl App {
         } else {
             (body_height * 0.55).max(100.)
         };
-        let mut table = |ui: &mut egui::Ui, focused: &mut Option<PathBuf>| {
+        let mut table = |ui: &mut egui::Ui,
+                         focused: &mut Option<PathBuf>,
+                         actions: &mut InspectorActions| {
             ui.set_min_size(egui::vec2(table_width, table_height));
             ui.set_max_width(table_width);
             candidate_header(ui, japanese);
@@ -544,15 +536,10 @@ impl App {
                     for &i in &visible[range] {
                         let c = &scan.files[i];
                         let path = &c.row.path;
-                        if due
-                            && std::fs::symlink_metadata(path)
-                                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-                        {
-                            missing.insert(path.clone());
-                        }
                         let active = focused.as_ref() == Some(path) || self.marked.contains(path);
                         let (mut row, response) = virtual_row(ui, path, 52., active);
                         let mut clicked = response.clicked();
+                        let mut name_response = None;
                         let width = row.available_width();
                         let status_width = if width >= 460. { 92. } else { 64. };
                         let name_width = (width
@@ -607,7 +594,7 @@ impl App {
                                         .ok()
                                         .filter(|p| !p.as_os_str().is_empty())
                                         .unwrap_or(path);
-                                    clicked |= ui
+                                    let title = ui
                                         .add(
                                             egui::Label::new(
                                                 RichText::new(display(relative)).size(15.0),
@@ -616,20 +603,22 @@ impl App {
                                             .sense(egui::Sense::click())
                                             .truncate(),
                                         )
-                                        .on_hover_text(display(path))
-                                        .clicked();
+                                        .on_hover_text(display(path));
+                                    clicked |= title.clicked();
+                                    name_response = Some(title);
                                     let reason = c.blocked_reason.as_ref().map_or_else(
                                         || effect(c.producer, japanese),
                                         |reason| reason.text(japanese),
                                     );
                                     super::controls::label(
                                         ui,
-                                        reason,
+                                        &super::modified_caption(c.row.usage.modified_at, japanese),
                                         12.,
                                         MUTED,
                                         Align::Min,
                                         egui::Sense::hover(),
-                                    );
+                                    )
+                                    .on_hover_text(reason);
                                 },
                             );
                             ui.allocate_ui_with_layout(
@@ -668,6 +657,33 @@ impl App {
                                 },
                             );
                         });
+                        let response = name_response
+                            .map_or_else(|| response.clone(), |name| response.union(name));
+                        if response.secondary_clicked() {
+                            *focused = Some(path.clone());
+                        }
+                        if let Some(action) = super::item_menu::show(
+                            &response,
+                            japanese,
+                            true,
+                            c.blocked_reason.is_none(),
+                            self.job.is_some(),
+                        ) {
+                            *focused = Some(path.clone());
+                            match action {
+                                super::item_menu::Action::Finder => {
+                                    actions.finder_error = super::item_menu::reveal(path)
+                                        .err()
+                                        .map(|error| super::display_error(&error, japanese));
+                                }
+                                super::item_menu::Action::Check => {
+                                    actions.inspect = Some(path.clone())
+                                }
+                                super::item_menu::Action::Remove => {
+                                    actions.review_one = Some(path.clone())
+                                }
+                            }
+                        }
                         if clicked {
                             *focused = Some(path.clone());
                             if self.job.is_none()
@@ -688,7 +704,7 @@ impl App {
                 ui.allocate_ui_with_layout(
                     egui::vec2(table_width, body_height),
                     egui::Layout::top_down(Align::Min),
-                    |ui| table(ui, &mut focused),
+                    |ui| table(ui, &mut focused, &mut actions),
                 );
                 ui.add_space(4.);
                 let line = ui.cursor().left_top();
@@ -726,7 +742,7 @@ impl App {
             ui.allocate_ui_with_layout(
                 egui::vec2(table_width, table_height),
                 egui::Layout::top_down(Align::Min),
-                |ui| table(ui, &mut focused),
+                |ui| table(ui, &mut focused, &mut actions),
             );
             if let Some(c) = focused.as_ref().and_then(|path| {
                 project
@@ -789,14 +805,6 @@ impl App {
             self.projects.focused = None;
             ui.ctx().request_repaint();
         }
-        if !missing.is_empty() {
-            let scan = self.scan.as_mut().unwrap();
-            scan.files.retain(|c| !missing.contains(&c.row.path));
-            self.marked.retain(|p| !missing.contains(p));
-            self.projects.refresh(scan);
-            ui.ctx().request_repaint();
-            return;
-        }
         if self.job.is_some() {
             return;
         }
@@ -825,6 +833,8 @@ impl App {
                     Outcome::Inspection(vec![format!("{} · {detail}", display(&path))])
                 },
             );
+        } else if let Some(path) = actions.review_one {
+            self.review_selected(ui.ctx(), scan.policy.clone(), vec![path]);
         } else if review {
             let policy = scan.policy.clone();
             let paths = self.marked.iter().cloned().collect();
@@ -923,6 +933,34 @@ impl App {
             "選択だけでは削除されません。確認画面で内容を確認できます。",
             "Selecting items does not delete them. Review the details on the next screen.",
         ));
+        if self.marked.is_empty() {
+            if let Some(candidate) = scan.files.iter().find(|candidate| {
+                self.projects.bulk_paths.contains(&candidate.row.path)
+                    && candidate.row.usage.size() > 0
+            }) {
+                let title = format!(
+                    "{} · {} · {}",
+                    text(
+                        japanese,
+                        "容量の大きい候補を確認",
+                        "Review largest cleanup candidate"
+                    ),
+                    name(&candidate.row.path),
+                    bytes(candidate.row.usage.size()),
+                );
+                if super::controls::button(ui, &title, true, self.job.is_none())
+                    .on_hover_text(effect(candidate.producer, japanese))
+                    .clicked()
+                {
+                    self.review_selected(
+                        ui.ctx(),
+                        scan.policy.clone(),
+                        vec![candidate.row.path.clone()],
+                    );
+                    return;
+                }
+            }
+        }
         if self.projects.confirm_bulk {
             let mut select = false;
             let mut cancel = false;
@@ -1042,7 +1080,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.add_space(6.);
             for (i, label) in [
-                text(self.japanese_reasons, "プロジェクト名", "Project"),
+                text(
+                    self.japanese_reasons,
+                    "プロジェクト名 / 最終更新",
+                    "Project / modified",
+                ),
                 text(self.japanese_reasons, "使用量", "Used"),
                 text(self.japanese_reasons, "候補容量", "Candidates"),
                 text(self.japanese_reasons, "前回比", "Change"),
@@ -1068,6 +1110,7 @@ impl App {
                 "No project folders directly inside this workspace.",
             ));
         }
+        let mut check_path = None;
         egui::ScrollArea::vertical()
             .id_salt(("projects", &self.projects.root))
             .show_rows(ui, 52., self.projects.rows.len(), |ui, range| {
@@ -1078,17 +1121,13 @@ impl App {
                         self.projects.focused = None;
                         self.projects.query.clear();
                     }
+                    let mut name_response = None;
                     row.horizontal(|ui| {
                         ui.allocate_ui_with_layout(
-                            egui::vec2(widths[0], 32.),
-                            egui::Layout::left_to_right(Align::Center),
+                            egui::vec2(widths[0], 42.),
+                            egui::Layout::top_down(Align::Min),
                             |ui| {
                                 ui.set_width(widths[0]);
-                                let (icon, _) = ui.allocate_exact_size(
-                                    egui::vec2(18.0, 18.0),
-                                    egui::Sense::hover(),
-                                );
-                                super::icons::paint(ui, icon, super::icons::Icon::Folder, ACCENT);
                                 let link = egui::Label::new(
                                     RichText::new(format!("{} ›", name(&p.path)))
                                         .size(15.0)
@@ -1097,11 +1136,20 @@ impl App {
                                 .selectable(false)
                                 .sense(egui::Sense::click())
                                 .truncate();
-                                if ui.add(link).on_hover_text(display(&p.path)).clicked() {
+                                let title = ui.add(link).on_hover_text(display(&p.path));
+                                if title.clicked() {
                                     self.projects.selected = Some(p.path.clone());
                                     self.projects.focused = None;
                                     self.projects.query.clear();
                                 }
+                                let caption = super::modified_caption(p.modified_at, japanese);
+                                let _ =
+                                    ui.small(caption)
+                                        .on_hover_text(super::recent_updates_caption(
+                                            p.recent_files,
+                                            japanese,
+                                        ));
+                                name_response = Some(title);
                             },
                         );
                         for (i, label) in [
@@ -1134,8 +1182,26 @@ impl App {
                             );
                         }
                     });
+                    let response =
+                        name_response.map_or_else(|| response.clone(), |name| response.union(name));
+                    if let Some(action) =
+                        super::item_menu::show(&response, japanese, true, false, self.job.is_some())
+                    {
+                        match action {
+                            super::item_menu::Action::Finder => {
+                                if let Err(error) = super::item_menu::reveal(&p.path) {
+                                    self.status = super::display_error(&error, japanese);
+                                }
+                            }
+                            super::item_menu::Action::Check => check_path = Some(p.path.clone()),
+                            super::item_menu::Action::Remove => {}
+                        }
+                    }
                 }
             });
+        if let Some(path) = check_path {
+            self.inspect_path_status(ui.ctx(), path, String::new());
+        }
     }
 }
 
@@ -1163,6 +1229,7 @@ mod tests {
             blocked_reason: blocked.then(|| Message::new("kept", "保留")),
         };
         Scan {
+            snapshot: None,
             kept: Some(super::super::keep::KeepRules::default()),
             root: root.to_owned(),
             directories: super::super::folder_index::Directories::from_inventory(
@@ -1246,9 +1313,6 @@ mod tests {
         let mut app = App {
             projects,
             scan: Some(scan),
-            next_presence_check: Some(
-                std::time::Instant::now() + std::time::Duration::from_secs(60),
-            ),
             ..Default::default()
         };
         let ctx = egui::Context::default();

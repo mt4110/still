@@ -95,8 +95,10 @@ The visual concept informed the sidebar, list, inspector and footer. Its sample
 numbers are not application data. The application deliberately uses its actual
 producer/blocker reason and states that open files are checked again before
 removal. A scan does not prove that a candidate is unused. Disk statistics and
-Docker storage browsing are read-only; separately confirmed actions can remove
-eligible containers or prune unused builder cache on the selected local daemon.
+Docker storage browsing are read-only. Separate confirmations can remove eligible
+containers, images, and selected builder-cache records on the chosen local daemon.
+Workspace candidates can open individual confirmations for eligible linked Git
+worktrees and Docker images.
 Navigation cannot replace an active
 cleanup job. Profiles, SDK checks, partial-removal accounting and the explicit
 confirmation contracts remain authoritative.

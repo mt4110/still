@@ -580,21 +580,82 @@ impl App {
         self.add_workspace(ctx, path);
     }
 
+    pub(super) fn workspace_location_bar(&mut self, ui: &mut egui::Ui) -> bool {
+        let ja = self.japanese_reasons;
+        let busy = self.job.is_some();
+        let mut chosen = None;
+        let mut return_to_workspace = false;
+        ui.horizontal_wrapped(|ui| {
+            if super::controls::button(
+                ui,
+                text(ja, "ホーム (~) を調べる", "Scan home (~)"),
+                false,
+                !busy && self.home.directory.is_some(),
+            )
+            .clicked()
+            {
+                chosen = self.home.directory.clone();
+            }
+            if super::controls::button(
+                ui,
+                text(ja, "場所を選ぶ…", "Choose location…"),
+                false,
+                !busy,
+            )
+            .clicked()
+            {
+                let mut picker = rfd::FileDialog::new();
+                if let Some(home) = &self.home.directory {
+                    picker = picker.set_directory(home);
+                }
+                chosen = picker.pick_folder();
+            }
+            if self.browse_root.is_some() && !self.profile.roots.is_empty() {
+                return_to_workspace = super::controls::button(
+                    ui,
+                    text(ja, "ワークスペースに戻る", "Return to workspace"),
+                    false,
+                    !busy,
+                )
+                .clicked();
+            }
+        });
+        if let Some(root) = self
+            .scan
+            .as_ref()
+            .map(|scan| &scan.root)
+            .or(self.browse_root.as_ref())
+        {
+            ui.small(format!(
+                "{}: {}",
+                text(ja, "調査先", "Location"),
+                super::display(root)
+            ));
+        }
+        ui.small(text(ja, "ホームや別のフォルダの容量は読み取り専用で調査します。フォルダ選択では ⌘⇧G でパスを入力できます。掃除候補に含めるには「調査フォルダを追加…」を使ってください。", "Scanning home or another folder here is read-only. In the folder picker, press Shift-Command-G to enter a path. Use Add workspace to review cleanup candidates there."));
+        if let Some(path) = chosen {
+            self.start_browse_scan(ui.ctx(), path);
+            return true;
+        }
+        if return_to_workspace {
+            self.browse_root = None;
+            self.browse_folders = false;
+            self.view = super::View::Folders;
+            self.refresh(ui.ctx(), false);
+            return true;
+        }
+        false
+    }
+
     fn start_browse_scan(&mut self, ctx: &egui::Context, path: PathBuf) {
         if self.job.is_some() {
             return;
         }
         match super::super::inventory::safe_dir(&path) {
             Ok(path) => {
-                self.profile = Profile {
-                    roots: vec![path],
-                    ..Profile::default()
-                };
-                self.profile_name = None;
-                self.index = 0;
-                self.baseline.clear();
+                self.browse_root = Some(path);
+                self.home.requested_project = None;
                 self.browse_folders = true;
-                self.read_only_browse = true;
                 self.view = super::View::Folders;
                 self.cleanup_receipt = None;
                 self.navigate(super::shell::Screen::Workspace);
@@ -625,7 +686,7 @@ impl App {
         )?;
         self.browse_folders = false;
         self.profile = profile;
-        self.read_only_browse = false;
+        self.browse_root = None;
         self.profile_name = last.name.clone();
         self.index = index;
         self.docker_input = self.profile.docker_context.clone().unwrap_or_default();
@@ -656,13 +717,21 @@ mod tests {
         let fixture = tempfile::tempdir()?;
         let root = fixture.path().canonicalize()?;
         std::fs::create_dir(root.join("large-folder"))?;
+        let workspace = root.join("_workspace");
         let mut app = App {
+            profile: Profile {
+                roots: vec![workspace.clone()],
+                ..Profile::default()
+            },
+            profile_name: Some("saved-workspace".into()),
             view: super::super::View::Candidates,
             ..App::default()
         };
         app.start_browse_scan(&egui::Context::default(), root.clone());
         assert!(matches!(app.view, super::super::View::Folders));
-        assert!(app.read_only_browse);
+        assert_eq!(app.browse_root.as_ref(), Some(&root));
+        assert_eq!(app.profile.roots, [workspace]);
+        assert_eq!(app.profile_name.as_deref(), Some("saved-workspace"));
         let result = app
             .job
             .take()
