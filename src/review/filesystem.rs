@@ -18,7 +18,7 @@ impl FileLock {
         Ok(Self(file))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(feature = "desktop", target_os = "macos"))]
     pub(super) fn file_mut(&mut self) -> &mut std::fs::File {
         &mut self.0
     }
@@ -28,6 +28,22 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn file_lock_releases_even_if_a_duplicate_handle_remains_open() -> Result<()> {
+    let fixture = tempfile::NamedTempFile::new()?;
+    let file = fixture.reopen()?;
+    let duplicate = file.try_clone()?;
+    let competing = fixture.reopen()?;
+    let lock = FileLock::try_acquire(file)?;
+    assert!(competing.try_lock().is_err());
+    drop(lock);
+    competing.try_lock()?;
+    competing.unlock()?;
+    drop(duplicate);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
