@@ -34,6 +34,8 @@ use serde::Serialize;
 pub(super) struct Row {
     pub label: String,
     pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<chrono::DateTime<chrono::Utc>>,
     #[cfg(all(target_os = "macos", feature = "desktop"))]
     #[serde(skip)]
     pub native_path: Option<std::path::PathBuf>,
@@ -64,6 +66,11 @@ pub fn run(args: &AppStorageArgs) -> Result<()> {
                 println!("{}  {size} {}{partial}", row.label, row.size_basis);
                 if let Some(path) = row.path {
                     println!("  {path}");
+                    println!(
+                        "  Last modified: {}",
+                        row.modified_at
+                            .map_or_else(|| "unknown".into(), |time| time.to_rfc3339())
+                    );
                 }
                 println!("  {}", row.reason);
                 #[cfg(target_os = "macos")]
@@ -271,6 +278,10 @@ mod mac {
                                 report.rows.push(Row {
                                     label,
                                     path: Some(inventory::display(&path)),
+                                    modified_at: std::fs::symlink_metadata(&path)
+                                        .ok()
+                                        .and_then(|m| m.modified().ok())
+                                        .map(Into::into),
                                     #[cfg(feature = "desktop")]
                                     native_path: Some(path.clone()),
                                     size_bytes: Some(size),
@@ -324,6 +335,10 @@ mod mac {
                     report.rows.push(Row {
                         label,
                         path: Some(inventory::display(&path)),
+                        modified_at: std::fs::symlink_metadata(&path)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .map(Into::into),
                         #[cfg(feature = "desktop")]
                         native_path: Some(path.clone()),
                         size_bytes: Some(root.usage.size()),
@@ -439,6 +454,7 @@ mod mac {
             Row {
                 label: runtime.label(),
                 path: None,
+                modified_at: None,
                 #[cfg(feature = "desktop")]
                 native_path: None,
                 size_bytes: runtime.size_bytes,

@@ -710,3 +710,125 @@ fn pull_requests(repo: &Path, numbers: &[u64]) -> Result<Vec<PullRequest>> {
         Ok(pr)
     }).collect()
 }
+
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+pub(super) struct RemovalReview {
+    pub path: PathBuf,
+    pub repo: PathBuf,
+    pub base: String,
+    baseline: String,
+    entry: Worktree,
+}
+
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+impl RemovalReview {
+    pub fn prepare(repo: &Path, path: &Path, roots: &[PathBuf], base: &str) -> Result<Self> {
+        let repo = inventory::safe_workspace_dir(repo)?;
+        let path = inventory::safe_workspace_dir(path)?;
+        anyhow::ensure!(
+            strictly_below_root(&path, roots),
+            "Worktree is outside the configured cleanup roots"
+        );
+        let baseline = resolve_baseline(&repo, base)?;
+        let entry = linked_worktrees(&repo)?
+            .into_iter()
+            .find(|entry| entry.path.canonicalize().is_ok_and(|p| p == path))
+            .context("This path is not a linked worktree")?;
+        eligible(&repo, &entry, &path, base, &baseline, &[])?;
+        filesystem::ensure_not_open(&path)?;
+        Ok(Self {
+            path,
+            repo,
+            base: base.into(),
+            baseline,
+            entry,
+        })
+    }
+
+    pub fn head(&self) -> &str {
+        &self.entry.head
+    }
+
+    pub fn apply(self) -> Result<()> {
+        anyhow::ensure!(
+            inventory::safe_workspace_dir(&self.repo)? == self.repo
+                && inventory::safe_workspace_dir(&self.path)? == self.path
+                && resolve_baseline(&self.repo, &self.base)? == self.baseline
+                && linked_worktrees(&self.repo)?.contains(&self.entry),
+            "The worktree or integration baseline changed after review"
+        );
+        eligible(
+            &self.repo,
+            &self.entry,
+            &self.path,
+            &self.base,
+            &self.baseline,
+            &[],
+        )?;
+        remove(&self.repo, &self.entry, &self.path, &self.baseline)
+    }
+}
+
+#[cfg(all(test, feature = "desktop", target_os = "macos"))]
+mod desktop_tests {
+    use super::*;
+
+    #[test]
+    fn review_removes_only_the_unchanged_linked_checkout() -> Result<()> {
+        let home = directories::BaseDirs::new().context("Home unavailable")?;
+        let fixture = tempfile::tempdir_in(home.home_dir())?;
+        let root = fixture.path().canonicalize()?;
+        let global_config = root.join("fixture.gitconfig");
+        fs::File::create(&global_config)?;
+        git::TEST_GLOBAL_CONFIG
+            .with(|config| config.set(global_config).expect("fresh fixture thread"));
+        let repo = root.join("repo");
+        fs::create_dir(&repo)?;
+        let git = |args: &[&str]| git::check(git::run(&repo, args)?, "worktree test");
+        git(&["init", "-b", "main"])?;
+        git(&[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-m",
+            "fixture",
+        ])?;
+        let clean = root.join("merged");
+        let changed = root.join("changed");
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "fixture-merged",
+            clean.to_str().unwrap(),
+        ])?;
+        git(&[
+            "worktree",
+            "add",
+            "-b",
+            "fixture-changed",
+            changed.to_str().unwrap(),
+        ])?;
+        let review = |path: &Path| {
+            RemovalReview::prepare(&repo, path, std::slice::from_ref(&root), "refs/heads/main")
+        };
+        let changed_review = review(&changed)?;
+        fs::write(changed.join("keep.txt"), "created after confirmation")?;
+        assert!(changed_review.apply().is_err());
+        assert!(changed.join("keep.txt").is_file());
+        review(&clean)?.apply()?;
+        assert!(!clean.exists());
+        assert!(!linked_worktrees(&repo)?
+            .iter()
+            .any(|item| item.path == clean));
+        git(&["show-ref", "--verify", "refs/heads/fixture-merged"])?;
+        assert!(repo.join(".git").exists());
+        Ok(())
+    }
+}

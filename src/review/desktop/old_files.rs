@@ -5,6 +5,8 @@ impl App {
         #[cfg(target_os = "macos")]
         let mut workspace_requested = false;
         let mut start = false;
+        #[cfg(target_os = "macos")]
+        let mut check_path = None;
         let mut close = false;
         let as_page = page.is_some();
         let busy = self.job.is_some();
@@ -20,8 +22,8 @@ impl App {
             ));
             ui.label(text(
                 self.japanese_reasons,
-                "ホーム内の古い大容量ファイルを探します。使用中かどうかは確認しません。",
-                "Find old large files in your home folder. Open processes are not checked.",
+                "ホーム内の古い大容量ファイルを読み取り専用で探します。使用中かどうかは確認しません。",
+                "Find old large files in your home folder with a read-only scan. Open processes are not checked.",
             ));
             #[cfg(target_os = "macos")]
             if as_page
@@ -193,9 +195,9 @@ impl App {
                                     "{}  ·  {}  ·  {}",
                                     name,
                                     bytes(row.logical_bytes),
-                                    stale::date(Some(row.last_activity_at))
+                                    modified_caption(row.modified_at, self.japanese_reasons),
                                 );
-                                egui::CollapsingHeader::new(title)
+                                let response = egui::CollapsingHeader::new(title)
                                     .id_salt(&row.path)
                                     .show(ui, |ui| {
                                         ui.label(&row.path);
@@ -259,14 +261,38 @@ impl App {
                                     })
                                     .header_response
                                     .on_hover_text(&row.path);
+                                #[cfg(target_os = "macos")]
+                                if let Some(action) = item_menu::show(
+                                    &response,
+                                    self.japanese_reasons,
+                                    true,
+                                    false,
+                                    busy,
+                                ) {
+                                    match action {
+                                        item_menu::Action::Finder => {
+                                            if let Err(error) = item_menu::reveal(&row.native_path)
+                                            {
+                                                state.error =
+                                                    display_error(&error, self.japanese_reasons);
+                                            }
+                                        }
+                                        item_menu::Action::Check => {
+                                            check_path = Some(row.native_path.clone())
+                                        }
+                                        item_menu::Action::Remove => {}
+                                    }
+                                }
+                                #[cfg(not(target_os = "macos"))]
+                                let _ = response;
                             }
                         });
                 }
             }
             ui.label(text(
                 self.japanese_reasons,
-                "アクセス日時だけでは未使用と断定できません。内容と用途を確認してください。",
-                "Access dates can be incomplete. Check what a file is before removing it.",
+                "アクセス日時だけでは未使用と断定できません。ファイルの場所を開くかパスをコピーして、内容と用途を確認できます。",
+                "Access dates can be incomplete. Locate the file or copy its path to check its contents and purpose.",
             ));
             if !as_page {
                 close = ui
@@ -314,6 +340,10 @@ impl App {
                     ))
                 },
             );
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(path) = check_path {
+            self.inspect_path_status(ctx, path, String::new());
         }
         #[cfg(target_os = "macos")]
         if workspace_requested {

@@ -160,7 +160,7 @@ fn read_latest(file: &mut File, identity: Option<&str>) -> Result<Option<Observa
 fn append(directory: &Path, mut event: Observation) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     fs::create_dir_all(directory)?;
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .append(true)
         .create(true)
@@ -171,11 +171,12 @@ fn append(directory: &Path, mut event: Observation) -> Result<()> {
         file.metadata()?.is_file(),
         "Docker history is not a regular file"
     );
-    file.try_lock()
+    let mut lock = crate::review::filesystem::FileLock::try_acquire(file)
         .map_err(|error| anyhow::anyhow!("Docker history is busy: {error}"))?;
-    let previous = read_latest(&mut file, Some(&event.identity))?;
+    let file = lock.file_mut();
+    let previous = read_latest(file, Some(&event.identity))?;
     file.rewind()?;
-    let last = read_latest(&mut file, None)?;
+    let last = read_latest(file, None)?;
     if let Some(previous) = &previous {
         if previous.measured < event.measured
             && previous.versions == event.versions

@@ -4,6 +4,12 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
 
+#[cfg(all(test, feature = "desktop", target_os = "macos"))]
+thread_local! {
+    // The worktree fixture must behave independently of the runner's Git LFS setup.
+    pub(super) static TEST_GLOBAL_CONFIG: std::cell::OnceCell<PathBuf> = const { std::cell::OnceCell::new() };
+}
+
 pub fn root_for(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .find(|dir| dir.join(".git").symlink_metadata().is_ok())
@@ -17,6 +23,12 @@ pub fn run(root: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Re
             command.env_remove(name);
         }
     }
+    #[cfg(all(test, feature = "desktop", target_os = "macos"))]
+    TEST_GLOBAL_CONFIG.with(|config| {
+        if let Some(config) = config.get() {
+            command.env("GIT_CONFIG_GLOBAL", config);
+        }
+    });
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_NO_LAZY_FETCH", "1")

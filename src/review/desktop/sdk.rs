@@ -47,6 +47,7 @@ impl App {
         let busy = self.job.is_some();
         let mut refresh = false;
         let mut preview = false;
+        let mut row_action = None;
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.heading(text(japanese, "アプリと SDK", "Apps & SDKs"));
@@ -165,7 +166,7 @@ impl App {
                     } else {
                         0.0
                     };
-                    sdk_rows(
+                    row_action = sdk_rows(
                         ui,
                         report,
                         &mut state.marked,
@@ -204,6 +205,45 @@ impl App {
                 }
                 None => {}
             }
+        }
+        if let Some((action, item)) = row_action {
+            match action {
+                super::item_menu::Action::Finder => {
+                    if let Some(path) = sdk_path(&item.target) {
+                        if let Err(error) = super::item_menu::reveal(&path) {
+                            state.error = super::display_error(&error, japanese);
+                        }
+                    }
+                }
+                super::item_menu::Action::Remove => {
+                    if let Some(Ok(report)) = &state.report {
+                        match Review::new(
+                            report,
+                            &BTreeSet::from([item.target]),
+                            self.profile.roots.clone(),
+                        ) {
+                            Ok(review) => state.confirmation = Some(review),
+                            Err(error) => state.error = super::display_error(&error, japanese),
+                        }
+                    }
+                }
+                super::item_menu::Action::Check => {
+                    let roots = self.profile.roots.clone();
+                    let target = item.target;
+                    self.spawn(&ctx, text(japanese, "SDK の状態を確認中…", "Checking SDK status…"), false, move || {
+                        let status = sdk_cleanup::scan(&roots).and_then(|report| {
+                            report.items.into_iter().find(|row| row.target == target)
+                                .ok_or_else(|| anyhow::anyhow!("{}", text(japanese, "現在の一覧に同じ項目を確認できません。", "The same item is absent from the current inventory.")))
+                        });
+                        let detail = match status {
+                            Ok(row) => row.reason.text(japanese).to_owned(),
+                            Err(error) => super::display_error(&error, japanese),
+                        };
+                        Outcome::Inspection(vec![item.label, detail])
+                    });
+                }
+            }
+            return;
         }
         if refresh {
             self.scan_sdks(&ctx);
@@ -300,6 +340,18 @@ impl App {
     }
 }
 
+fn sdk_path(target: &Target) -> Option<std::path::PathBuf> {
+    let Target::Ndk { version, .. } = target else {
+        return None;
+    };
+    let home = directories::BaseDirs::new()?;
+    let path = home
+        .home_dir()
+        .join("Library/Android/sdk/ndk")
+        .join(version);
+    path.exists().then_some(path)
+}
+
 fn sdk_rows(
     ui: &mut egui::Ui,
     report: &Report,
@@ -308,7 +360,8 @@ fn sdk_rows(
     japanese: bool,
     enabled: bool,
     detail_height: f32,
-) {
+) -> Option<(super::item_menu::Action, Item)> {
+    let mut action = None;
     use super::controls::{cell, HEIGHT};
     let name_width =
         (ui.available_width() - 8.0 - HEIGHT - 90.0 - 150.0 - 3.0 * ui.spacing().item_spacing.x)
@@ -452,11 +505,26 @@ fn sdk_rows(
                     )
                     .on_hover_text(format!("{status} · {}", item.reason.text(japanese)));
                 });
-                if response.clicked() {
+                if response.clicked()
+                    || response.secondary_clicked()
+                    || name_response.secondary_clicked()
+                {
                     *focused = Some(item.target.clone());
+                }
+                let menu = response.union(name_response);
+                if let Some(choice) = super::item_menu::show(
+                    &menu,
+                    japanese,
+                    sdk_path(&item.target).is_some(),
+                    item.selectable,
+                    !enabled,
+                ) {
+                    *focused = Some(item.target.clone());
+                    action = Some((choice, item.clone()));
                 }
             }
         });
+    action
 }
 
 fn sdk_inspector(ui: &mut egui::Ui, report: &Report, focused: Option<&Target>, japanese: bool) {
@@ -739,7 +807,9 @@ mod tests {
                     events,
                     ..Default::default()
                 },
-                |ui| sdk_rows(ui, &report, &mut marked, &mut focused, false, true, 0.0),
+                |ui| {
+                    sdk_rows(ui, &report, &mut marked, &mut focused, false, true, 0.0);
+                },
             )
         };
         let first = render(Vec::new());

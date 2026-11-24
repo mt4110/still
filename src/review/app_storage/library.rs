@@ -387,6 +387,7 @@ mod tests {
         Row {
             label: directory.into(),
             path: None,
+            modified_at: None,
             #[cfg(feature = "desktop")]
             native_path: None,
             size_bytes: Some(0),

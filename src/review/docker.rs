@@ -38,6 +38,10 @@ struct Image {
     tags: Option<Vec<String>>,
     digests: Option<Vec<String>>,
     size: u64,
+    #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+    created: Option<String>,
+    #[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+    last_tagged: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +78,8 @@ struct Cache {
     #[serde(rename = "ID")]
     id: String,
     reclaimable: bool,
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    parents: Option<Vec<String>>,
     shared: bool,
     mutable: bool,
     size: String,
@@ -398,16 +404,7 @@ fn candidates(
     buildx: Option<&tempfile::TempDir>,
 ) -> Result<(Vec<Candidate>, Option<String>)> {
     let cutoff = Utc::now() - TimeDelta::days(i64::from(days));
-    let containers = inspect::<Container>(
-        daemon,
-        "container",
-        &["ls", "-aq", "--no-trunc"],
-        CONTAINER_TEMPLATE,
-    )
-    .or_else(|inspect_error| {
-        containers_from_summary(daemon)
-            .with_context(|| format!("{inspect_error}; Engine container summary unavailable"))
-    })?;
+    let containers = container_inventory(daemon)?;
     let images = inspect::<Image>(
         daemon,
         "image",
@@ -449,6 +446,19 @@ fn candidates(
     };
     items.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.key.cmp(&b.key)));
     Ok((items, cache_error))
+}
+
+fn container_inventory(daemon: &Daemon) -> Result<Vec<Container>> {
+    inspect::<Container>(
+        daemon,
+        "container",
+        &["ls", "-aq", "--no-trunc"],
+        CONTAINER_TEMPLATE,
+    )
+    .or_else(|inspect_error| {
+        containers_from_summary(daemon)
+            .with_context(|| format!("{inspect_error}; Engine container summary unavailable"))
+    })
 }
 
 fn container_summary(daemon: &Daemon) -> Result<Vec<ContainerSummary>> {
@@ -591,23 +601,8 @@ fn engine_candidates(
         .collect();
     let mut items = Vec::new();
     for image in images {
-        let mut tags = image.tags.unwrap_or_default();
-        let mut digests = image.digests.unwrap_or_default();
-        if hex_id(image.id.strip_prefix("sha256:").unwrap_or(""))
-            && !referenced.contains(image.id.as_str())
-            && !digests.is_empty()
-            && tags.len() <= 1
-        {
-            tags.sort();
-            digests.sort();
-            let evidence = tags.into_iter().chain(digests).collect();
-            items.push(Candidate::new(
-                Kind::Image,
-                image.id,
-                Some(image.size),
-                "No container reference; registry digest recorded; size includes shared layers",
-                evidence,
-            ));
+        if let Some(candidate) = image_candidate(image, &referenced) {
+            items.push(candidate);
         }
     }
     for container in &containers {
@@ -628,18 +623,149 @@ fn engine_candidates(
     items
 }
 
+fn image_candidate(image: Image, referenced: &HashSet<&str>) -> Option<Candidate> {
+    let mut tags = image.tags.unwrap_or_default();
+    let mut digests = image.digests.unwrap_or_default();
+    if !hex_id(image.id.strip_prefix("sha256:").unwrap_or(""))
+        || referenced.contains(image.id.as_str())
+        || digests.is_empty()
+        || tags.len() > 1
+    {
+        return None;
+    }
+    tags.sort();
+    digests.sort();
+    Some(Candidate::new(
+        Kind::Image,
+        image.id,
+        Some(image.size),
+        "No container reference; registry digest recorded; size includes shared layers",
+        tags.into_iter().chain(digests).collect(),
+    ))
+}
+
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+type InspectedImage = (Candidate, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+pub(super) struct ImageRemovalReview {
+    pub context: String,
+    daemon: Daemon,
+    item: Candidate,
+    pub created: Option<DateTime<Utc>>,
+    pub last_tagged: Option<DateTime<Utc>>,
+}
+
+#[cfg(all(feature = "desktop", any(target_os = "macos", target_os = "windows")))]
+impl ImageRemovalReview {
+    pub fn prepare(context: &str, id: &str) -> Result<Self> {
+        let daemon = connect(context)?;
+        let (item, created, last_tagged) = Self::inspect(&daemon, id)?;
+        Ok(Self {
+            context: context.into(),
+            daemon,
+            item,
+            created,
+            last_tagged,
+        })
+    }
+
+    fn inspect(daemon: &Daemon, id: &str) -> Result<InspectedImage> {
+        anyhow::ensure!(
+            hex_id(id.strip_prefix("sha256:").unwrap_or("")),
+            "The complete image ID is required"
+        );
+        let containers = container_inventory(daemon)?;
+        let referenced = containers
+            .iter()
+            .map(|container| container.image.as_str())
+            .collect();
+        let images = inspect_ids::<Image>(
+            daemon,
+            "image",
+            r#"{"Id":{{json .Id}},"Tags":{{json .RepoTags}},"Digests":{{json .RepoDigests}},"Size":{{json .Size}},"Created":{{json .Created}},"LastTagged":{{with .Metadata}}{{json .LastTagTime}}{{else}}null{{end}}}"#,
+            &[id.to_owned()],
+        )?;
+        let image = images
+            .into_iter()
+            .find(|image| image.id == id)
+            .context("Docker did not return the exact image ID")?;
+        let created = image.created.as_deref().and_then(cache_timestamp);
+        let last_tagged = image.last_tagged.as_deref().and_then(cache_timestamp);
+        let candidate = image_candidate(image, &referenced).context(Message::new(
+            "The image is referenced, has multiple tags, or has no registry digest",
+            "コンテナから参照されているか、複数のタグがあるか、取得元のダイジェストを確認できません。",
+        ))?;
+        Ok((candidate, created, last_tagged))
+    }
+
+    pub fn id(&self) -> &str {
+        &self.item.id
+    }
+
+    pub fn evidence(&self) -> &[String] {
+        &self.item.evidence
+    }
+
+    pub fn apply(self) -> Result<()> {
+        let current = connect(&self.context)?;
+        anyhow::ensure!(
+            current == self.daemon,
+            "Docker context or daemon changed after review"
+        );
+        anyhow::ensure!(
+            Self::inspect(&current, self.id())?.0 == self.item,
+            "Image metadata or references changed. Review it again"
+        );
+        anyhow::ensure!(
+            connect(&self.context)? == current,
+            "Docker daemon changed during recheck"
+        );
+        remove(&current, &self.item, 7, None)?;
+        anyhow::ensure!(
+            connect(&self.context)? == current,
+            "Docker daemon changed after removal"
+        );
+        anyhow::ensure!(
+            !resource_ids(&current, "image", &["ls", "-aq", "--no-trunc"])?
+                .iter()
+                .any(|id| id.trim_start_matches("sha256:")
+                    == self.id().trim_start_matches("sha256:")),
+            "The image is still listed after removal"
+        );
+        Ok(())
+    }
+}
+
+const CACHE_SAFETY_FILTERS: [&str; 3] = ["type=regular", "private=\"\"", "immutable=\"\""];
+
+fn cache_parent_ids<'a>(records: impl Iterator<Item = &'a Cache>) -> Result<HashSet<&'a str>> {
+    // A record can look reclaimable in du while a child still references it.
+    let mut parents = HashSet::new();
+    for record in records {
+        for parent in record.parents.iter().flatten() {
+            anyhow::ensure!(cache_id(parent), "Buildx returned an invalid parent ID");
+            parents.insert(parent.as_str());
+        }
+    }
+    Ok(parents)
+}
+
 fn cache_candidates(
     daemon: &Daemon,
     buildx: &tempfile::TempDir,
     cutoff: DateTime<Utc>,
 ) -> Result<Vec<Candidate>> {
     let engine = engine_cache_records(daemon)?;
-    Ok(cache_records(daemon, buildx)?
-        .into_iter()
+    let records = cache_records(daemon, buildx)?;
+    let parents = cache_parent_ids(records.iter())?;
+    Ok(records
+        .iter()
         .filter_map(|cache| {
             let engine = engine.get(&cache.id)?;
             let last_used = &engine.last_used_at;
             if cache.reclaimable
+                && !parents.contains(cache.id.as_str())
                 && !cache.shared
                 && !cache.mutable
                 && cache.kind == "regular"
@@ -651,7 +777,7 @@ fn cache_candidates(
             {
                 Some(Candidate::new(
                     Kind::Cache,
-                    cache.id,
+                    cache.id.clone(),
                     cache_size(&cache.size),
                     "Old, private, immutable BuildKit cache; Docker storage estimate",
                     vec![last_used.clone()],
@@ -691,10 +817,16 @@ fn cache_records(daemon: &Daemon, buildx: &tempfile::TempDir) -> Result<Vec<Cach
     json_lines::<Cache>(&raw)
 }
 
-fn older(time: &str, cutoff: DateTime<Utc>) -> bool {
+fn cache_timestamp(time: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(time)
         .or_else(|_| DateTime::parse_from_str(time, "%Y-%m-%d %H:%M:%S%.f %z %Z"))
-        .is_ok_and(|t| t.year_ce().1 > 1 && t < cutoff)
+        .ok()
+        .filter(|time| time.year_ce().1 > 1)
+        .map(|time| time.to_utc())
+}
+
+fn older(time: &str, cutoff: DateTime<Utc>) -> bool {
+    cache_timestamp(time).is_some_and(|time| time < cutoff)
 }
 
 fn cache_size(value: &str) -> Option<u64> {
@@ -748,49 +880,48 @@ fn remove(
         }
         Kind::Cache => {
             let buildx = buildx.context("Buildx must be explicitly enabled")?;
-            // Confirm this Buildx version accepts the exact selector combination
-            // before issuing a destructive command. Some versions return no
-            // matches for boolean selectors even when metadata says eligible.
             let id_filter = format!("id~=^{id}$");
             let age_filter = format!("until={}h", u64::from(days) * 24);
-            let filters = [
-                &id_filter[..],
-                &age_filter[..],
-                "inuse=false",
-                "mutable=false",
-                "shared=false",
-                "type=regular",
-            ];
+            // Verify the exact selector before pruning. BuildKit evaluates age during prune,
+            // while eligibility was obtained from Engine's absolute last-use timestamp.
             let mut check = buildx_command(daemon, buildx);
-            check.args(["du", "--builder", "default", "--format", "json"]);
-            for filter in filters {
+            check.args([
+                "du",
+                "--builder",
+                "default",
+                "--format",
+                "json",
+                "--filter",
+                &id_filter,
+            ]);
+            for filter in CACHE_SAFETY_FILTERS {
                 check.args(["--filter", filter]);
             }
             let matching = json_lines::<Cache>(&execute(&mut check, "Buildx filter check")?)?;
-            if matching.len() != 1 || matching[0].id != *id {
-                bail!("Buildx could not confirm that the exact cache and safety filters match. No removal was attempted.");
+            if matching.len() != 1
+                || matching[0].id != *id
+                || !matching[0].reclaimable
+                || matching[0].shared
+                || matching[0].mutable
+                || matching[0].kind != "regular"
+            {
+                bail!("Buildx could not confirm the selected cache ID and safety filters");
             }
-            execute(
-                buildx_command(daemon, buildx).args([
-                    "prune",
-                    "--builder",
-                    "default",
-                    "--force",
-                    "--filter",
-                    &id_filter,
-                    "--filter",
-                    &age_filter,
-                    "--filter",
-                    "inuse=false",
-                    "--filter",
-                    "mutable=false",
-                    "--filter",
-                    "shared=false",
-                    "--filter",
-                    "type=regular",
-                ]),
-                "Buildx prune",
-            )?;
+            let mut prune = buildx_command(daemon, buildx);
+            prune.args([
+                "prune",
+                "--builder",
+                "default",
+                "--force",
+                "--filter",
+                &id_filter,
+                "--filter",
+                &age_filter,
+            ]);
+            for filter in CACHE_SAFETY_FILTERS {
+                prune.args(["--filter", filter]);
+            }
+            execute(&mut prune, "Buildx prune")?;
             if cache_records(daemon, buildx)?
                 .iter()
                 .any(|record| record.id == *id)

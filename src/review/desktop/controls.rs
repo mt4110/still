@@ -57,7 +57,6 @@ fn paint_text(
         .galley(position, galley, color);
 }
 
-#[cfg(target_os = "macos")]
 pub(super) fn button(
     ui: &mut egui::Ui,
     label: &str,
@@ -67,7 +66,6 @@ pub(super) fn button(
     colored_button(ui, label, primary.then_some(super::ACCENT), enabled)
 }
 
-#[cfg(target_os = "macos")]
 pub(super) fn destructive_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
     colored_button(
         ui,
@@ -110,6 +108,26 @@ fn colored_button(
         color,
     );
     response.on_hover_text(label)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn colored_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    fill: Option<egui::Color32>,
+    enabled: bool,
+) -> egui::Response {
+    let mut text = egui::RichText::new(label);
+    if fill.is_some() {
+        text = text.color(egui::Color32::WHITE);
+    }
+    let mut button = egui::Button::new(text)
+        .min_size(egui::vec2(0.0, HEIGHT))
+        .truncate();
+    if let Some(fill) = fill {
+        button = button.fill(fill);
+    }
+    ui.add_enabled(enabled, button).on_hover_text(label)
 }
 
 /// Keep the semantic label and its interaction region while centering visible ink.

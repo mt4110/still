@@ -154,7 +154,7 @@ impl Records {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(parent.join("user-uninstall-confirmations.lock"))?;
         ensure!(lock.metadata()?.is_file(), "Invalid confirmation lock");
-        lock.try_lock()
+        let _lock = crate::review::filesystem::FileLock::try_acquire(lock)
             .map_err(|error| anyhow::anyhow!("Confirmation records are busy: {error}"))?;
         let mut current = Self::read(file)?;
         let now = Utc::now();
@@ -247,7 +247,7 @@ mod tests {
         lock.try_lock()?;
         assert!(Records::update(&path, "com.example.two", Some(Scope::System)).is_err());
         assert_eq!(fs::read(&path)?, original);
-        drop(lock);
+        lock.unlock()?;
         let broken = dir.path().join("broken.json");
         fs::write(&broken, b"not-json")?;
         assert!(Records::update(&broken, "com.example.two", Some(Scope::User)).is_err());

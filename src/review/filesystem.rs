@@ -8,6 +8,44 @@ use anyhow::{bail, Context, Result};
 use std::fs::Metadata;
 use std::path::Path;
 
+// Release explicitly so a child process forked by another thread cannot
+// keep a short-lived lock held until that child finishes exec.
+pub(super) struct FileLock(std::fs::File);
+
+impl FileLock {
+    pub(super) fn try_acquire(file: std::fs::File) -> Result<Self, std::fs::TryLockError> {
+        file.try_lock()?;
+        Ok(Self(file))
+    }
+
+    #[cfg(all(feature = "desktop", target_os = "macos"))]
+    pub(super) fn file_mut(&mut self) -> &mut std::fs::File {
+        &mut self.0
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn file_lock_releases_even_if_a_duplicate_handle_remains_open() -> Result<()> {
+    let fixture = tempfile::NamedTempFile::new()?;
+    let file = fixture.reopen()?;
+    let duplicate = file.try_clone()?;
+    let competing = fixture.reopen()?;
+    let lock = FileLock::try_acquire(file)?;
+    assert!(competing.try_lock().is_err());
+    drop(lock);
+    competing.try_lock()?;
+    competing.unlock()?;
+    drop(duplicate);
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct Identity {
     pub device: u64,
@@ -245,6 +283,16 @@ pub fn available(path: &Path) -> Option<u64> {
 
 #[cfg(unix)]
 pub fn remove_output(path: &Path, tree: &artifacts::Tree) -> Result<()> {
+    finish_output(path, tree, false)
+}
+
+#[cfg(all(feature = "desktop", target_os = "macos"))]
+pub(super) fn trash_output(path: &Path, tree: &artifacts::Tree) -> Result<()> {
+    finish_output(path, tree, true)
+}
+
+#[cfg(unix)]
+fn finish_output(path: &Path, tree: &artifacts::Tree, to_trash: bool) -> Result<()> {
     use rustix::fs::{self, AtFlags, Mode, OFlags};
     use std::io::Write;
     use std::path::Component;
@@ -284,21 +332,50 @@ pub fn remove_output(path: &Path, tree: &artifacts::Tree) -> Result<()> {
     writeln!(note, "{}", inventory::display(path))?;
     note.sync_all()?;
 
+    let payload_name = if to_trash
+        && !name
+            .as_encoded_bytes()
+            .eq_ignore_ascii_case(b"original-path.txt")
+    {
+        name
+    } else {
+        std::ffi::OsStr::new("payload")
+    };
+
     // Keep the payload recoverable if the process is interrupted or a check fails.
-    fs::renameat(&parent, name, &stage, "payload")?;
+    fs::renameat(&parent, name, &stage, payload_name)?;
     let attempt = (|| {
-        let info = fs::statat(&stage, "payload", AtFlags::SYMLINK_NOFOLLOW)?;
+        let info = fs::statat(&stage, payload_name, AtFlags::SYMLINK_NOFOLLOW)?;
         if stat_identity(&info) != tree.entries[Path::new("")].identity {
             bail!("A different directory reached staging");
         }
-        artifacts::verify_staged(tree, &stage_path.join("payload"))?;
-        remove_tree(
-            &stage,
-            std::ffi::OsStr::new("payload"),
-            Path::new(""),
-            tree,
-            flags,
-        )?;
+        let payload = stage_path.join(payload_name);
+        artifacts::verify_staged(tree, &payload)?;
+        if to_trash {
+            #[cfg(all(feature = "desktop", target_os = "macos"))]
+            {
+                use trash::macos::{DeleteMethod, TrashContextExtMacos};
+                // Verify that the absolute path used by NSFileManager still names
+                // the pinned private stage and its reviewed payload.
+                use anyhow::ensure;
+                ensure!(
+                    inventory::safe_dir(&payload)? == payload
+                        && identity(&stage_path, &std::fs::symlink_metadata(&stage_path)?)?
+                            == stat_identity(&fs::fstat(&stage)?)
+                        && identity(&payload, &std::fs::symlink_metadata(&payload)?)?
+                            == stat_identity(&info),
+                    "Staged Trash source changed"
+                );
+                let mut trash = trash::TrashContext::new();
+                trash.set_delete_method(DeleteMethod::NsFileManager);
+                return trash
+                    .delete(&payload)
+                    .context("Could not move the reviewed folder to Trash");
+            }
+            #[cfg(not(all(feature = "desktop", target_os = "macos")))]
+            bail!("Moving reviewed outputs to Trash is unavailable");
+        }
+        remove_tree(&stage, payload_name, Path::new(""), tree, flags)?;
         Ok::<(), anyhow::Error>(())
     })();
     attempt.with_context(|| {
